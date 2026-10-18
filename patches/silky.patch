@@ -1,0 +1,226 @@
+diff --git a/src/silky/contexts.nim b/src/silky/contexts.nim
+index aa6bf25..052f836 100644
+--- a/src/silky/contexts.nim
++++ b/src/silky/contexts.nim
+@@ -80,6 +80,9 @@ type
+     ## Main Silky context shared across rendering backends.
+     inFrame: bool = false
+     uiScale*: float32 = 1.0
++    ## Atlas pixels per UI unit: fonts and images rasterized at this scale
++    ## draw at their unscaled size (crisp when it equals uiScale).
++    atlasScale*: float32 = 1.0
+     ## Multiplies 9-patch borders for a denser atlas.
+     sliceScale*: int = 1
+     layoutStack*: seq[LayoutScope]
+@@ -278,7 +281,11 @@ proc getImageSize*(sk: Silky, image: string): Vec2 =
+     echo "[Warning] Image not found in atlas: " & image
+     return vec2(0, 0)
+   let uv = sk.atlas.entries[image]
+-  vec2(uv.width.float32, uv.height.float32)
++  vec2(uv.width.float32, uv.height.float32) / sk.atlasScale
++
++proc snap(sk: Silky, v: float32): float32 {.inline.} =
++  ## Floors to a whole output pixel.
++  floor(v * sk.uiScale) / sk.uiScale
+ 
+ proc nextRune(text: string, i: var int): Rune {.inline.} =
+   ## Reads one UTF-8 rune and advances the byte index.
+@@ -531,7 +538,8 @@ proc drawText*(
+     layer = sk.drawer.currentLayer
+     needsHAlign = hAlign != LeftAlign
+     needsVAlign = vAlign != TopAlign
+-  var currentPos = pos + vec2(0, fontData.ascent)
++    k = 1 / sk.atlasScale
++  var currentPos = pos + vec2(0, fontData.ascent * k)
+ 
+   if clip:
+     sk.pushClipRect(rect(pos, vec2(maxWidth, maxHeight)))
+@@ -550,9 +558,9 @@ proc drawText*(
+         of LeftAlign:
+           0.0'f
+         of CenterAlign:
+-          floor((maxWidth - lineWidth) * 0.5)
++          sk.snap((maxWidth - lineWidth) * 0.5)
+         of RightAlign:
+-          floor(maxWidth - lineWidth)
++          sk.snap(maxWidth - lineWidth)
+       if dx != 0:
+         for j in lineStartIdx ..< sk.drawer.layers[layer].len:
+           sk.drawer.layers[layer][j].pos.x += dx
+@@ -569,7 +577,7 @@ proc drawText*(
+     if rune == LineFeedRune:
+       alignLine(currentPos.x - pos.x)
+       currentPos.x = pos.x
+-      currentPos.y += fontData.lineHeight
++      currentPos.y += fontData.lineHeight * k
+       hasPreviousRune = false
+       continue
+ 
+@@ -588,15 +596,15 @@ proc drawText*(
+             break
+           var wordEntry: ptr LetterEntry
+           if fontData.lookupLetter(wordRune, 0, wordEntry):
+-            wordW += wordEntry.advance
++            wordW += wordEntry.advance * k
+         if currentPos.x + wordW > pos.x + maxWidth:
+           alignLine(currentPos.x - pos.x)
+           currentPos.x = pos.x
+-          currentPos.y += fontData.lineHeight
++          currentPos.y += fontData.lineHeight * k
+ 
+     let variant =
+       if hasSubpixel:
+-        let frac = currentPos.x - currentPos.x.floor
++        let frac = currentPos.x * sk.atlasScale - floor(currentPos.x * sk.atlasScale)
+         (frac * fontData.subpixelSteps.float32).int mod
+           fontData.subpixelSteps
+       else:
+@@ -612,7 +620,7 @@ proc drawText*(
+       if wordWrap:
+         alignLine(currentPos.x - pos.x)
+         currentPos.x = pos.x
+-        currentPos.y += fontData.lineHeight
++        currentPos.y += fontData.lineHeight * k
+       elif glyphClip:
+         while i < text.len:
+           var next: Rune
+@@ -621,26 +629,26 @@ proc drawText*(
+           discard text.nextRune(i)
+         continue
+ 
+-    if glyphClip and currentPos.y + entry.boundsY >= maxPos.y:
++    if glyphClip and currentPos.y + entry.boundsY * k >= maxPos.y:
+       break
+ 
+     if entry.boundsWidth > 0 and entry.boundsHeight > 0:
+       let glyphPos = vec2(
+-        floor(currentPos.x) + entry.boundsX,
+-        round(currentPos.y + entry.boundsY)
++        sk.snap(currentPos.x) + entry.boundsX * k,
++        round((currentPos.y + entry.boundsY * k) * sk.uiScale) / sk.uiScale
+       )
+       sk.drawQuad(
+         glyphPos,
+-        vec2(entry.boundsWidth, entry.boundsHeight),
++        vec2(entry.boundsWidth, entry.boundsHeight) * k,
+         vec2(entry.x.float32, entry.y.float32),
+         vec2(entry.boundsWidth, entry.boundsHeight),
+         color
+       )
+ 
+-    currentPos.x += entry.advance
++    currentPos.x += entry.advance * k
+     var next: Rune
+     if text.peekRune(i, next):
+-      currentPos.x += fontData.lookupKerning(rune, next)
++      currentPos.x += fontData.lookupKerning(rune, next) * k
+ 
+     previousRune = rune
+     hasPreviousRune = true
+@@ -650,15 +658,15 @@ proc drawText*(
+   if needsVAlign:
+     let
+       textHeight =
+-        currentPos.y - pos.y - fontData.ascent + fontData.lineHeight
++        currentPos.y - pos.y + (fontData.lineHeight - fontData.ascent) * k
+       dy =
+         case vAlign:
+         of TopAlign:
+           0.0'f
+         of MiddleAlign:
+-          floor((maxHeight - textHeight) * 0.5)
++          sk.snap((maxHeight - textHeight) * 0.5)
+         of BottomAlign:
+-          floor(maxHeight - textHeight)
++          sk.snap(maxHeight - textHeight)
+     if dy != 0:
+       for j in textStartIdx ..< sk.drawer.layers[layer].len:
+         sk.drawer.layers[layer][j].pos.y += dy
+@@ -670,10 +678,12 @@ proc getTextSize*(sk: Silky, font: string, text: string): Vec2 {.measure.} =
+   if font notin sk.atlas.fonts:
+     return vec2(0, 0)
+ 
+-  let fontData = sk.atlas.fonts[font]
++  let
++    fontData = sk.atlas.fonts[font]
++    k = 1 / sk.atlasScale
+   var
+     i = 0
+-    currentPos = vec2(0, fontData.lineHeight)
++    currentPos = vec2(0, fontData.lineHeight * k)
+     maxWidth = 0.0'f
+ 
+   while i < text.len:
+@@ -681,17 +691,17 @@ proc getTextSize*(sk: Silky, font: string, text: string): Vec2 {.measure.} =
+     if rune == LineFeedRune:
+       maxWidth = max(maxWidth, currentPos.x)
+       currentPos.x = 0
+-      currentPos.y += fontData.lineHeight
++      currentPos.y += fontData.lineHeight * k
+       continue
+ 
+     var entry: ptr LetterEntry
+     if not fontData.lookupLetter(rune, 0, entry):
+       continue
+ 
+-    currentPos.x += entry.advance
++    currentPos.x += entry.advance * k
+     var next: Rune
+     if text.peekRune(i, next):
+-      currentPos.x += fontData.lookupKerning(rune, next)
++      currentPos.x += fontData.lookupKerning(rune, next) * k
+ 
+   maxWidth = max(maxWidth, currentPos.x)
+   vec2(maxWidth, currentPos.y)
+@@ -763,8 +773,8 @@ proc drawImage*(
+     mPos = vec2(m.x.float32, m.y.float32)
+     mSize = vec2(m.width.float32, m.height.float32)
+   sk.drawQuad(
+-    pos,
+-    vec2(uv.width.float32, uv.height.float32),
++    vec2(sk.snap(pos.x), sk.snap(pos.y)),
++    vec2(uv.width.float32, uv.height.float32) / sk.atlasScale,
+     vec2(uv.x.float32, uv.y.float32),
+     vec2(uv.width.float32, uv.height.float32),
+     color,
+diff --git a/src/silky/drawers/ogl.nim b/src/silky/drawers/ogl.nim
+index 254300f..dc2ff31 100644
+--- a/src/silky/drawers/ogl.nim
++++ b/src/silky/drawers/ogl.nim
+@@ -50,6 +50,11 @@ type
+     layers*: array[2, seq[DrawerVertex]]
+     currentLayer*: int
+     layerStack*: seq[int]
++    tiles*: seq[IVec2]
++      ## When set, endFrame draws the frame once per entry, with the
++      ## viewport's lower left corner there, calling beforeTile and afterTile
++      ## around each: a frame bigger than the framebuffer drawn in pieces.
++    beforeTile*, afterTile*: proc (i: int)
+ 
+ func size(componentType: GLenum): Positive =
+   ## Returns the byte size of a GL component type.
+@@ -611,6 +616,9 @@ proc endFrame*(
+ ) =
+   ## Flushes the queued quads through OpenGL.
+   if quadCount == 0:
++    for i in 0 ..< drawer.tiles.len:
++      if drawer.beforeTile != nil: drawer.beforeTile(i)
++      if drawer.afterTile != nil: drawer.afterTile(i)
+     return
+ 
+   # Own the viewport: the shader maps quads to clip space assuming
+@@ -643,7 +651,13 @@ proc endFrame*(
+   drawer.shader.bindUniforms()
+ 
+   glBindVertexArray(drawer.vao)
+-  glDrawArrays(GL_TRIANGLES, 0, quadCount.GLsizei)
++  if drawer.tiles.len == 0:
++    glDrawArrays(GL_TRIANGLES, 0, quadCount.GLsizei)
++  for i, origin in drawer.tiles:
++    if drawer.beforeTile != nil: drawer.beforeTile(i)
++    glViewport(origin.x, origin.y, GLsizei(size.x), GLsizei(size.y))
++    glDrawArrays(GL_TRIANGLES, 0, quadCount.GLsizei)
++    if drawer.afterTile != nil: drawer.afterTile(i)
+ 
+   glBindVertexArray(0)
+   glUseProgram(0)

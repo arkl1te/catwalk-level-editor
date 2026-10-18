@@ -1,0 +1,32 @@
+== Preparing
+== Reading level 0
+$ mono '/home/arkl1te/Games/oni-x/drive_c/Program Files (x86)/Oni/AE/Tools/OniSplit.exe' -export /home/arkl1te/.local/share/catwalk/library/work/0/oni '/home/arkl1te/Games/oni-x/drive_c/Program Files (x86)/Oni/AE/GameDataFolder/level0_Final.dat'
+/home/arkl1te/Games/oni-x/drive_c/Program Files (x86)/Oni/AE/GameDataFolder/level0_Final.dat
+== Reading level 1
+$ mono '/home/arkl1te/Games/oni-x/drive_c/Program Files (x86)/Oni/AE/Tools/OniSplit.exe' -export /home/arkl1te/.local/share/catwalk/library/work/1/oni '/home/arkl1te/Games/oni-x/drive_c/Program Files (x86)/Oni/AE/GameDataFolder/level1_Final.dat'
+/home/arkl1te/Games/oni-x/drive_c/Program Files (x86)/Oni/AE/GameDataFolder/level1_Final.dat
+== Extracting level 1
+$ mono '/home/arkl1te/Games/oni-x/drive_c/Program Files (x86)/Oni/AE/Tools/OniSplit.exe' -extract:xml /home/arkl1te/.local/share/catwalk/library/work/1/xml /home/arkl1te/.local/share/catwalk/library/work/1/oni/AKEVEnvWarehouse.oni /home/arkl1te/.local/share/catwalk/library/work/1/oni/BINACJBOFurniture.oni /home/arkl1te/.local/share/catwalk/library/work/1/oni/BINACJBOConsole.oni /home/arkl1te/.local/share/catwalk/library/work/1/oni/BINACJBODoor.oni /home/arkl1te/.local/share/catwalk/library/work/1/oni/BINACJBOTrigger.oni
+/home/arkl1te/.local/share/catwalk/library/work/1/oni/AKEVEnvWarehouse.oni
+/home/arkl1te/.local/share/catwalk/library/work/1/oni/BINACJBOFurniture.oni
+/home/arkl1te/.local/share/catwalk/library/work/1/oni/BINACJBOConsole.oni
+/home/arkl1te/.local/share/catwalk/library/work/1/oni/BINACJBODoor.oni
+/home/arkl1te/.local/share/catwalk/library/work/1/oni/BINACJBOTrigger.oni
+== Extracting textures of level 1
+$ mono '/home/arkl1te/Games/oni-x/drive_c/Program Files (x86)/Oni/AE/Tools/OniSplit.exe' -extract:dae /home/arkl1te/.local/share/catwalk/library/work/1/env /home/arkl1te/.local/share/catwalk/library/work/1/oni/AKEVEnvWarehouse.oni
+/home/arkl1te/.local/share/catwalk/library/work/1/oni/AKEVEnvWarehouse.oni
+System.IO.EndOfStreamException: Attempted to read past the end of the stream.
+  at Oni.BinaryReader.FillBuffer (System.Int32 count) [0x0001b] in <3caeb603a1154eeaa9468db84d2170f5>:0 
+  at Oni.BinaryReader.ReadUInt32 () [0x00000] in <3caeb603a1154eeaa9468db84d2170f5>:0 
+  at Oni.BinaryReader.ReadInt32 () [0x00000] in <3caeb603a1154eeaa9468db84d2170f5>:0 
+  at Oni.Akira.AkiraDatReader.ReadGeometry () [0x000ae] in <3caeb603a1154eeaa9468db84d2170f5>:0 
+  at Oni.Akira.AkiraDatReader.Read () [0x000c7] in <3caeb603a1154eeaa9468db84d2170f5>:0 
+  at Oni.Akira.AkiraDatReader.Read (Oni.InstanceDescriptor akev) [0x0001f] in <3caeb603a1154eeaa9468db84d2170f5>:0 
+  at Oni.DaeExporter.ExportInstance (Oni.InstanceDescriptor descriptor) [0x00014] in <3caeb603a1154eeaa9468db84d2170f5>:0 
+  at Oni.Exporter.ExportFile (System.String sourceFilePath) [0x00047] in <3caeb603a1154eeaa9468db84d2170f5>:0 
+  at Oni.DaeExporter.ExportFile (System.String sourceFilePath) [0x0002f] in <3caeb603a1154eeaa9468db84d2170f5>:0 
+  at Oni.Exporter.ExportFiles (System.Collections.Generic.IEnumerable`1[T] sourceFilePaths) [0x0001c] in <3caeb603a1154eeaa9468db84d2170f5>:0 
+  at Oni.Program.ExportGeometry (System.String[] args) [0x00054] in <3caeb603a1154eeaa9468db84d2170f5>:0 
+  at Oni.Program.Execute (System.String[] args) [0x00356] in <3caeb603a1154eeaa9468db84d2170f5>:0 
+  at Oni.Program.Main (System.String[] args) [0x0009d] in <3caeb603a1154eeaa9468db84d2170f5>:0 
+FAILED: Extracting textures of level 1 exited with code 1

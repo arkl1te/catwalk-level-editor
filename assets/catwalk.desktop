@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Catwalk
+GenericName=Oni Level Editor
+Comment=Edit Oni levels' geometry and objects
+Exec=catwalk
+Icon=catwalk
+Terminal=false
+Categories=Development;
+StartupWMClass=catwalk

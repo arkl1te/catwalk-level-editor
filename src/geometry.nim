@@ -7,14 +7,50 @@
 ## per-quad flag), and written back as .dae files plus a level XML that tells
 ## OniSplit each group's flags and script id.
 
-import std/[parsexml, streams, strutils, tables, os, algorithm, sets, json, math, strformat]
+import std/[parsexml, streams, strutils, tables, os, algorithm, sets, json, math, strformat, sequtils]
 import vmath
 
 type
+  AnimMode* = enum amNone, amPulse, amFlicker
+  AnimInterp* = enum aiSmooth, aiLinear, aiStep
+
+  CornerAnim* = object
+    ## A corner's own light settings. Its light going back and forth between
+    ## its baked color and color in the game (Arklite's vertex_light.c, from the
+    ## build's vertexlight.bin), and whether Bake light leaves it alone.
+    manual*: bool                    ## Overrides the lights: the bake keeps this corner's color.
+    mode*: AnimMode
+    interp*: AnimInterp
+    color*: array[3, uint8]          ## The other end, 0..255.
+    period*: float32                 ## Seconds: one pulse there and back, or one flicker step.
+    offset*: float32                 ## Seconds added to the clock. Flickers with the same
+                                     ## period and offset flicker together.
+    unlit*: float32                  ## 0..1: how far the corner ignores its shading (1 = its
+                                     ## color at full brightness, hue kept: fullbright).
+                                     ## Applied on top of its colors and its animations' colors
+                                     ## everywhere they're shown or built (shownColor, liveColor).
+    low*, high*: float32             ## How far toward color it goes (0 the baked color, 1
+                                     ## all the way): Pulse between them, Flicker a random
+                                     ## level between them each step. CornerAnim() has
+                                     ## high 0; a mode's defaults set it (withDefaults).
+    stability*: float32              ## Flicker: share of the time it works normally (at the
+                                     ## baked color), 0 = flickers all the time...
+    faultLen*: float32               ## ...in runs of this many seconds (a failure, or a
+                                     ## stretch working), at least one period.
+
+  LightLayer* = object
+    ## What one animated light does to one corner: anim.color is the corner's
+    ## color with that light at the other end of its animation (the rest of the
+    ## lighting unchanged). Several layers on a corner add up in the game.
+    corner*: int32
+    anim*: CornerAnim
+
   Face* = object
     verts*: seq[int32]               ## Indices into Geometry.points, in order.
     uvs*: seq[Vec2]
     colors*: seq[array[4, uint8]]
+    anims*: seq[CornerAnim]          ## Empty, or per corner (may be shorter than verts: animAt).
+    lightAnims*: seq[LightLayer]     ## Baked from animated lights (lighting.nim), any number per corner.
     texture*: string                 ## Name without the TXMP prefix, e.g. WH_INTWALL.
     flags*: uint32                   ## Gunk flags (authorable ones; see AuthorFlags).
     scriptId*: int32                 ## 0 = none. Used by env_show and friends.
@@ -25,6 +61,7 @@ type
   Piece* = object
     brush*: bool                     ## A convex solid made with Catwalk's tools.
     hidden*: bool
+    group*: int32                    ## Group it belongs to (App.groups id), 0 = none.
 
   Geometry* = ref object
     points*: seq[Vec3]
@@ -56,6 +93,7 @@ const
   gfProjection1* = 0x4000000'u32
   gfSoundTransparent* = 0x8000000'u32
   gfImpassable* = 0x10000000'u32
+  gfNoShadow* = 0x20000000'u32     ## Catwalk only: the light bake's shadow rays pass through it.
 
   FlagNames* = [
     ("DoorFrame", gfDoorFrame), ("Ghost", gfGhost), ("StairsUp", gfStairsUp),
@@ -66,10 +104,14 @@ const
     ("Danger", gfDanger), ("Horizontal", gfHorizontal), ("Vertical", gfVertical),
     ("GridIgnore", gfGridIgnore), ("NoDecals", gfNoDecals), ("Furniture", gfFurniture),
     ("ProjectionBit0", gfProjection0), ("ProjectionBit1", gfProjection1),
-    ("SoundTransparent", gfSoundTransparent), ("Impassable", gfImpassable)]
+    ("SoundTransparent", gfSoundTransparent), ("Impassable", gfImpassable),
+    ("NoShadow", gfNoShadow)]
 
   ## Flags OniSplit computes itself; never stored or written.
   DerivedFlags* = gfTriangle or gfHorizontal or gfVertical or gfProjection0 or gfProjection1
+
+  ## Flags only Catwalk uses; stored, but never written to the level.
+  EditorFlags* = gfNoShadow
 
   ## Flags shown as checkboxes in the Face inspector, with their tooltips.
   EditableFlags* = [
@@ -104,7 +146,10 @@ const
     ("Ghost (room link)", gfGhost,
      "Invisible portal joining two rooms (BNVs) so AI pathfinding can pass between them."),
     ("Door frame", gfDoorFrame,
-     "Room link in a doorway: AI pathfinding passes between the two rooms through the door.")]
+     "Room link in a doorway: AI pathfinding passes between the two rooms through the door."),
+    ("No shadow", gfNoShadow,
+     "Doesn't block light: point and directional lights shine through it when the lighting is baked. " &
+     "Catwalk only; not written to the level.")]
 
 proc parseFlags*(s: string): uint32 =
   for tok in s.splitWhitespace:
@@ -257,6 +302,8 @@ proc weld*(g: Geometry, eps = 0.01'f32) =
         f.verts.delete(j)
         f.uvs.delete(j)
         f.colors.delete(j)
+        if j < f.anims.len: f.anims.delete(j)
+        f.lightAnims.setLen 0   # until the next bake
       else: inc i
   g.compact()
 
@@ -413,6 +460,122 @@ proc importAkevXml*(path: string): Geometry =
       result.pieces.add Piece()
     result.faces[i].piece = pieceOf[r]
 
+# --- corner light animation ------------------------------------------------------------------
+
+proc withDefaults*(m: CornerAnim, mode: AnimMode, color: array[3, uint8]): CornerAnim =
+  ## m switched on from Off: a mode's starting timing toward color.
+  result = m
+  result.mode = mode
+  result.color = color
+  result.period = if mode == amFlicker: 0.1 else: 2.0
+  result.interp = if mode == amFlicker: aiStep else: aiSmooth
+  result.low = 0
+  result.high = 1
+  result.stability = 0
+  result.faultLen = 1
+
+proc animAt*(f: Face, k: int): CornerAnim =
+  if k < f.anims.len: f.anims[k] else: CornerAnim()
+
+proc animated*(f: Face): bool =
+  for m in f.anims:
+    if m.mode != amNone: return true
+
+proc hasCornerData(f: Face): bool =
+  for m in f.anims:
+    if m.mode != amNone or m.manual or m.unlit > 0: return true
+
+proc fullbright*(c: array[3, uint8]): array[3, uint8] =
+  ## c at full brightness: scaled up until its brightest channel is 255, so it
+  ## keeps its hue (255 0 0 stays 255 0 0, a shadowed 100 0 0 becomes it).
+  ## Black has no hue: white, the texture's own colors.
+  let top = max(c[0], max(c[1], c[2]))
+  if top == 0: return [255'u8, 255, 255]
+  for i in 0 .. 2: result[i] = uint8(min(round(c[i].float32 * 255 / top.float32), 255))
+
+proc unlitColor*(c, base: array[3, uint8], unlit: float32): array[3, uint8] =
+  ## c brightened the way base's unlit factor brightens base: base moves unlit
+  ## of the way to its fullbright color, and c (base itself, or an animation's
+  ## other end) is scaled by the same gain, so the animation keeps its contrast
+  ## (a red corner pulsing to black stays a pulse to black). A black base has
+  ## no hue to scale: its colors move toward white instead.
+  if unlit <= 0: return c
+  let u = min(unlit, 1)
+  let top = max(base[0], max(base[1], base[2]))
+  if top == 0:
+    for i in 0 .. 2: result[i] = uint8(round(c[i].float32 + (255 - c[i].float32) * u))
+    return
+  let gain = 1 + (255 / top.float32 - 1) * u
+  for i in 0 .. 2: result[i] = uint8(min(round(c[i].float32 * gain), 255))
+
+proc shownColor*(f: Face, k: int): array[4, uint8] =
+  ## The corner's color as the views draw it and Build writes it: its baked
+  ## color with its unlit factor applied.
+  result = f.colors[k]
+  let u = f.animAt(k).unlit
+  if u > 0:
+    let b = [result[0], result[1], result[2]]
+    let c = unlitColor(b, b, u)
+    result = [c[0], c[1], c[2], result[3]]
+
+proc noise(seed: uint32, step: int): float32 =
+  ## vertex_light.c's noise: 0..1, the same for the same step of the same flicker.
+  var h = seed xor (cast[uint32](step.int32) * 0x9e3779b1'u32)
+  h = h xor (h shr 16); h *= 0x7feb352d'u32
+  h = h xor (h shr 15); h *= 0x846ca68b'u32
+  h = h xor (h shr 16)
+  (h shr 8).float32 * (1'f32 / 16777215'f32)
+
+proc animAmount*(m: CornerAnim, seconds: float32): float32 =
+  ## How far toward m.color at seconds, 0..1: Arklite's vertex_light.c amount(),
+  ## so the views animate the corners the way the game does.
+  proc shape(f: float32, interp: AnimInterp): float32 =
+    case interp
+    of aiStep: (if f < 0.5: 0 else: 1)
+    of aiSmooth: f * f * (3 - 2 * f)
+    of aiLinear: f
+  let period = max(m.period, 0.01'f32)
+  let x = (seconds + m.offset) / period
+  let k = floor(x)
+  let f = x - k
+  if m.mode == amPulse:
+    let t = if m.interp == aiStep: (if f < 0.5: 0'f32 else: 1'f32)
+            else: shape(if f < 0.5: 2 * f else: 2 - 2 * f, m.interp)
+    return m.low + (m.high - m.low) * t
+  let seed = cast[uint32](period) * 31'u32 + cast[uint32](m.offset)
+  proc level(step: int): float32 =
+    ## flicker_level: 0 while the light works (by stability), else between low and high.
+    if m.stability > 0:
+      let run = max(m.faultLen, period)
+      if noise(seed xor 0x5bd1e995'u32, floor(step.float32 * period / run).int) < m.stability: return 0
+    m.low + (m.high - m.low) * noise(seed, step)
+  let v0 = level(k.int)
+  if m.interp == aiStep: return v0
+  v0 + (level(k.int + 1) - v0) * shape(f, m.interp)
+
+proc liveColor*(f: Face, k: int, seconds: float32): array[4, uint8] =
+  ## The corner's shown color at seconds with its own and its lights'
+  ## animations playing (they add up, like vertex_light.c's records).
+  let base = f.shownColor(k)
+  let u = f.animAt(k).unlit
+  let baked = [f.colors[k][0], f.colors[k][1], f.colors[k][2]]
+  var sum = [base[0].float32, base[1].float32, base[2].float32]
+  proc add(m: CornerAnim) =
+    if m.mode == amNone: return
+    let t = m.animAmount(seconds)
+    let b = unlitColor(m.color, baked, u)
+    for i in 0 .. 2: sum[i] += (b[i].float32 - base[i].float32) * t
+  f.animAt(k).add
+  for l in f.lightAnims:
+    if l.corner == k: l.anim.add
+  for i in 0 .. 2: result[i] = uint8(clamp(sum[i] + 0.5, 0, 255))
+  result[3] = base[3]
+
+proc setAnim*(f: var Face, k: int, m: CornerAnim) =
+  while f.anims.len < f.verts.len: f.anims.add CornerAnim()
+  f.anims[k] = m
+  if not f.hasCornerData: f.anims.setLen 0
+
 # --- persistence ------------------------------------------------------------------------------
 
 proc save*(g: Geometry, path: string) =
@@ -435,10 +598,28 @@ proc save*(g: Geometry, path: string) =
       uv.add %f.uvs[i].x; uv.add %f.uvs[i].y
       let c = f.colors[i]
       col.add %((c[0].int shl 16) or (c[1].int shl 8) or c[2].int)
-    faces.add %*{"v": vs, "uv": uv, "c": col, "t": texIndex[f.texture], "f": f.flags.int,
-                 "s": f.scriptId, "o": f.objectId, "p": f.piece}
+    var fj = %*{"v": vs, "uv": uv, "c": col, "t": texIndex[f.texture], "f": f.flags.int,
+                "s": f.scriptId, "o": f.objectId, "p": f.piece}
+    proc animJson(m: CornerAnim): JsonNode =
+      %*[m.mode.ord, m.interp.ord, (m.color[0].int shl 16) or (m.color[1].int shl 8) or m.color[2].int,
+         m.period, m.offset, (if m.manual: 1 else: 0), m.low, m.high, m.stability, m.faultLen, m.unlit]
+    if f.hasCornerData:
+      var an = newJArray()
+      for k in 0 ..< f.verts.len:
+        let m = f.animAt(k)
+        if m.mode == amNone and not m.manual and m.unlit <= 0: an.add newJNull()
+        else: an.add animJson(m)
+      fj["a"] = an
+    if f.lightAnims.len > 0:
+      var la = newJArray()
+      for l in f.lightAnims: la.add %*[l.corner, animJson(l.anim)]
+      fj["la"] = la
+    faces.add fj
   var pcs = newJArray()
-  for p in g.pieces: pcs.add %*{"b": p.brush}
+  for p in g.pieces:
+    let pj = %*{"b": p.brush}
+    if p.group != 0: pj["g"] = %p.group
+    pcs.add pj
   let j = %*{"version": 1, "points": pts, "textures": texNames, "faces": faces, "pieces": pcs}
   let tmp = path & ".tmp"
   writeFile(tmp, $j)
@@ -467,9 +648,28 @@ proc loadGeometry*(path: string): Geometry =
     for c in fj["c"].getElems:
       let n = c.getInt
       f.colors.add [uint8((n shr 16) and 255), uint8((n shr 8) and 255), uint8(n and 255), 255'u8]
+    proc animOf(aj: JsonNode): CornerAnim =
+      let e = aj.getElems
+      if e.len >= 5:
+        let c = e[2].getInt
+        result = CornerAnim(mode: AnimMode(clamp(e[0].getInt, 0, AnimMode.high.ord)),
+                            interp: AnimInterp(clamp(e[1].getInt, 0, AnimInterp.high.ord)),
+                            color: [uint8((c shr 16) and 255), uint8((c shr 8) and 255), uint8(c and 255)],
+                            period: e[3].getFloat.float32, offset: e[4].getFloat.float32,
+                            manual: e.len >= 6 and e[5].getInt != 0, high: 1)
+        if e.len >= 10:
+          result.low = e[6].getFloat.float32
+          result.high = e[7].getFloat.float32
+          result.stability = e[8].getFloat.float32
+          result.faultLen = e[9].getFloat.float32
+        if e.len >= 11: result.unlit = clamp(e[10].getFloat, 0, 1).float32
+    for aj in fj{"a"}.getElems: f.anims.add animOf(aj)
+    for lj in fj{"la"}.getElems:
+      let e = lj.getElems
+      if e.len == 2: f.lightAnims.add LightLayer(corner: e[0].getInt.int32, anim: animOf(e[1]))
     result.faces.add f
   for pj in j["pieces"].getElems:
-    result.pieces.add Piece(brush: pj{"b"}.getBool)
+    result.pieces.add Piece(brush: pj{"b"}.getBool, group: pj{"g"}.getInt.int32)
 
 proc clone*(g: Geometry): Geometry =
   Geometry(points: g.points, faces: g.faces, pieces: g.pieces, version: g.version)
@@ -484,6 +684,107 @@ proc markerMaterial*(f: Face): string =
 
 proc xmlEsc(s: string): string =
   s.multiReplace(("&", "&amp;"), ("<", "&lt;"), (">", "&gt;"), ("\"", "&quot;"))
+
+proc daePieces(g: Geometry, f: Face): seq[seq[int]] =
+  ## Corner lists (indices into f.verts) to write for f. OniSplit drops any
+  ## polygon with more than 4 corners but still files it in the octree, which
+  ## then throws KeyNotFoundException, so larger faces go out as a fan of quads
+  ## (plus a triangle). Pieces of a convex face are convex; slivers made by
+  ## collinear corners are skipped.
+  let n = f.verts.len
+  if n <= 4: return @[toSeq(0 ..< n)]
+  var i = 1
+  while i + 1 < n:
+    let piece = if i + 2 < n: @[0, i, i + 1, i + 2] else: @[0, i, i + 1]
+    var area = vec3(0)
+    let p0 = g.points[f.verts[0]]
+    for k in 1 ..< piece.len - 1:
+      area += cross(g.points[f.verts[piece[k]]] - p0, g.points[f.verts[piece[k + 1]]] - p0)
+    if area.length > 1e-4: result.add piece
+    i += piece.len - 2
+
+type FaceProblem* = object
+  face*: int
+  corner*: int     ## Index into the face's verts of the corner to fix, or -1.
+  text*: string
+
+proc faceProblems*(g: Geometry): seq[FaceProblem] =
+  ## Faces Oni (or OniSplit) can't take as they are: more than 4 corners,
+  ## corners on top of each other, bent (non-planar) or concave faces, and
+  ## faces with no area. Each names the corner most worth moving.
+  const PlanarTol = 0.05'f32   # world units off the face's plane
+  for fi, f in g.faces:
+    let n = f.verts.len
+    if n < 3: continue
+    let ps = f.verts.mapIt(g.points[it])
+    var nrm = vec3(0)
+    for k in 0 ..< n:
+      let (a, b) = (ps[k], ps[(k + 1) mod n])
+      nrm += vec3((a.y - b.y) * (a.z + b.z), (a.z - b.z) * (a.x + b.x), (a.x - b.x) * (a.y + b.y))
+    if nrm.length < 1e-4:
+      result.add FaceProblem(face: fi, corner: -1, text: "has no area")
+      continue
+    nrm = nrm.normalize
+    # Corner turns: cross of the edges in and out, along the normal. Negative =
+    # concave; near zero relative to the edges = a corner on a straight line.
+    var dup, concave, straightest = -1
+    var straightness = Inf.float32
+    for k in 0 ..< n:
+      let ein = ps[k] - ps[(k + n - 1) mod n]
+      let eout = ps[(k + 1) mod n] - ps[k]
+      if eout.length < 1e-3:
+        if dup < 0: dup = (k + 1) mod n
+        continue
+      if ein.length < 1e-3: continue
+      let turn = dot(cross(ein, eout), nrm) / (ein.length * eout.length)
+      if turn < -1e-3 and concave < 0: concave = k
+      if abs(turn) < straightness:
+        straightness = abs(turn)
+        straightest = k
+    if dup >= 0:
+      result.add FaceProblem(face: fi, corner: dup, text: &"corner {dup} is on top of corner {(dup + n - 1) mod n}")
+    if n > 4:
+      result.add FaceProblem(face: fi, corner: straightest,
+        text: &"has {n} corners; Oni quads take at most 4, so the build splits it into {daePieces(g, f).len} pieces")
+    var c = vec3(0)
+    for p in ps: c += p
+    c /= n.float32
+    var far = -1
+    var farDist = PlanarTol
+    for k, p in ps:
+      let d = abs(dot(p - c, nrm))
+      if d > farDist:
+        farDist = d
+        far = k
+    if far >= 0:
+      result.add FaceProblem(face: fi, corner: far,
+        text: &"is bent: corner {far} is {farDist:.2f} off the face's plane")
+    if concave >= 0:
+      result.add FaceProblem(face: fi, corner: concave, text: &"is concave at corner {concave}")
+
+proc faceRef*(fp: FaceProblem): string =
+  ## How build logs and the Issues list name the face; parseFaceRef reads it back.
+  result = &"face {fp.face}"
+  if fp.corner >= 0: result.add &", corner {fp.corner}"
+
+proc parseFaceRef*(s: string): tuple[face, corner: int] =
+  ## (face, corner) from a line naming "face N" or "face N, corner K"; -1 if absent.
+  result = (-1, -1)
+  let low = s.toLowerAscii
+  var at = low.find("face ")
+  while at > 0 and low[at - 1].isAlphaAscii: at = low.find("face ", at + 1)   # "surface"
+  if at < 0: return
+  var i = at + 5
+  var j = i
+  while j < s.len and s[j].isDigit: inc j
+  if j == i: return
+  result.face = parseInt(s[i ..< j])
+  const tag = ", corner "
+  if low.continuesWith(tag, j):
+    i = j + tag.len
+    j = i
+    while j < s.len and s[j].isDigit: inc j
+    if j > i: result.corner = parseInt(s[i ..< j])
 
 proc writeDae(path: string, g: Geometry, faces: seq[int], imageDir, markerDir: string) =
   ## One geometry node; one polylist per material.
@@ -531,14 +832,15 @@ proc writeDae(path: string, g: Geometry, faces: seq[int], imageDir, markerDir: s
     var vcount, p: seq[string]
     for fi in fis:
       let f = g.faces[fi]
-      vcount.add $f.verts.len
-      for k, v in f.verts:
-        let uv = f.uvs[k]
-        uvs.add &"{uv.x:.6f} {1 - uv.y:.6f}"   # OniSplit flips V when reading .dae
-        let c = f.colors[k]
-        cols.add &"{c[0].float / 255:.4f} {c[1].float / 255:.4f} {c[2].float / 255:.4f} 1"
-        p.add &"{pointIndex[v]} {corner} {corner}"
-        inc corner
+      for piece in daePieces(g, f):
+        vcount.add $piece.len
+        for k in piece:
+          let uv = f.uvs[k]
+          uvs.add &"{uv.x:.6f} {1 - uv.y:.6f}"   # OniSplit flips V when reading .dae
+          let c = f.shownColor(k)
+          cols.add &"{c[0].float / 255:.4f} {c[1].float / 255:.4f} {c[2].float / 255:.4f} 1"
+          p.add &"{pointIndex[f.verts[k]]} {corner} {corner}"
+          inc corner
     polys.add &"<polylist count=\"{vcount.len}\" material=\"{xmlEsc(m)}\">" &
       "<input semantic=\"VERTEX\" source=\"#vtx\" offset=\"0\"/>" &
       "<input semantic=\"TEXCOORD\" source=\"#uv\" offset=\"1\" set=\"0\"/>" &
@@ -560,14 +862,15 @@ proc writeDae(path: string, g: Geometry, faces: seq[int], imageDir, markerDir: s
   writeFile(path, o)
 
 proc writeLevelSource*(g: Geometry, dir, envName, sky, imageDir, markerDir: string,
-                       roomDaes: seq[string]): string =
+                       roomDaes: seq[string], objectFiles: seq[string] = @[]): string =
   ## Writes the geometry as .dae files (one per flags/script group) and the
-  ## level XML OniSplit -create:level reads. Returns the XML path.
+  ## level XML OniSplit -create:level reads. Returns the XML path. objectFiles
+  ## are object XMLs OniSplit builds into the level (doors: their geometry).
   createDir(dir)
   var groups: OrderedTable[(uint32, int32), seq[int]]
   for i, f in g.faces:
     if f.verts.len < 3: continue
-    groups.mgetOrPut((f.flags and not DerivedFlags, f.scriptId), @[]).add i
+    groups.mgetOrPut((f.flags and not (DerivedFlags or EditorFlags), f.scriptId), @[]).add i
   var x = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<Oni>\n"
   x.add &"  <Level Name=\"{xmlEsc(envName)}\" SharedPath=\"{xmlEsc(dir / \"shared\")}\">\n"
   x.add "    <Environment>\n      <Model>\n"
@@ -588,7 +891,9 @@ proc writeLevelSource*(g: Geometry, dir, envName, sky, imageDir, markerDir: stri
   # OniSplit always writes an ONSK link and throws on an empty name. Levels
   # without a sky (level 6) get a placeholder; only the AKEV output is used.
   let skyName = if sky.len > 0: sky else: "none"
-  x.add &"      </Rooms>\n    </Environment>\n    <Sky>{xmlEsc(skyName)}</Sky>\n    <Objects></Objects>\n  </Level>\n</Oni>\n"
+  x.add &"      </Rooms>\n    </Environment>\n    <Sky>{xmlEsc(skyName)}</Sky>\n    <Objects>"
+  for f in objectFiles: x.add &"\n      <Import>{xmlEsc(f)}</Import>"
+  x.add (if objectFiles.len > 0: "\n    " else: "") & "</Objects>\n  </Level>\n</Oni>\n"
   result = dir / envName & ".xml"
   createDir(dir / "shared")
   writeFile(result, x)
@@ -652,11 +957,14 @@ proc faceKey(g: Geometry, f: Face): string =
   result = f.texture
   for c in cs: result.add &"|{c[0]},{c[1]},{c[2]}"
 
-proc restoreObjectIds*(model: Geometry, akevXml, akevOni: string):
+proc restoreObjectIds*(model: Geometry, akevXml, akevOni: string,
+                       keep = initTable[int32, int32]()):
     tuple[linked, faces: int, ids: seq[int32], built: Geometry] =
   ## OniSplit can only link geometry to objects when it imports the objects
   ## itself, so after rebuilding the environment from Catwalk's faces the quads'
   ## ObjectId (type << 24 | id) is put back here, matching quads by their corners.
+  ## Quads OniSplit made for objects it imported (doors) keep their link,
+  ## through keep (OniSplit's ObjectId -> Catwalk's).
   ## akevXml is OniSplit's XML dump of akevOni; akevOni is patched in place.
   let built = importAkevXml(akevXml)
   var exact: Table[string, int32]
@@ -669,6 +977,9 @@ proc restoreObjectIds*(model: Geometry, akevXml, akevOni: string):
   var ids = newSeq[int32](built.faces.len)
   for i, f in built.faces:
     ids[i] = -1
+    if f.objectId in keep:
+      ids[i] = keep[f.objectId]
+      continue
     let k = built.faceKey(f)
     if k in exact:
       ids[i] = exact[k]
@@ -723,6 +1034,68 @@ proc restoreObjectIds*(model: Geometry, akevXml, akevOni: string):
     var x = id
     copyMem(data[base + i * 56 + 52].addr, x.addr, 4)
   writeFile(akevOni, data)
+
+proc hasAnims*(g: Geometry): bool =
+  for f in g.faces:
+    if f.animated or f.lightAnims.len > 0: return true
+
+proc writeVertexAnims*(model, built: Geometry, path: string): int =
+  ## vertexlight.bin for Arklite (vertex_light.c): one record per animation
+  ## of a corner of the built quads, by AGQG index, with its baked color: the
+  ## corner's own animation, then one per animated light that reaches it (a
+  ## corner's records are written together; the game adds them up). A built
+  ## quad came from a model face when it has the face's texture and all its
+  ## corners are the face's (OniSplit gets large faces as several quads).
+  ## Returns the record count.
+  type Rec = tuple[quad: int, corner: int, m: CornerAnim]
+  var byCorner: Table[(int, int, int), seq[(int, int)]]   # built (quad, corner)
+  for qi, q in built.faces:
+    for k, v in q.verts: byCorner.mgetOrPut(cornerKey(built.points[v]), @[]).add (qi, k)
+  var recs: seq[Rec]
+  var seen: HashSet[(int, int)]
+  for f in model.faces:
+    if not f.animated and f.lightAnims.len == 0: continue
+    var own: HashSet[(int, int, int)]
+    for v in f.verts: own.incl cornerKey(model.points[v])
+    for k, v in f.verts:
+      var layers: seq[CornerAnim]
+      let unlit = f.animAt(k).unlit
+      let baked = [f.colors[k][0], f.colors[k][1], f.colors[k][2]]
+      if f.animAt(k).mode != amNone: layers.add f.animAt(k)
+      for l in f.lightAnims:
+        if l.corner == k and l.anim.mode != amNone: layers.add l.anim
+      for m in layers.mitems: m.color = unlitColor(m.color, baked, unlit)   # as the built colors
+      if layers.len == 0: continue
+      for (qi, qk) in byCorner.getOrDefault(cornerKey(model.points[v])):
+        let q = built.faces[qi]
+        if q.texture != f.texture or (qi, qk) in seen: continue
+        if not q.verts.allIt(cornerKey(built.points[it]) in own): continue
+        seen.incl (qi, qk)
+        for m in layers: recs.add (qi, qk, m)
+  var data = newStringOfCap(12 + recs.len * 40)
+  proc put32(v: uint32) =
+    for b in 0 .. 3: data.add char((v shr (8 * b)) and 255)
+  put32 0x4c565743'u32   # "CWVL"
+  put32 3
+  put32 recs.len.uint32
+  for r in recs:
+    let m = r.m
+    let c = built.faces[r.quad].colors[r.corner]
+    put32 r.quad.uint32
+    data.add char(r.corner)
+    data.add char(m.mode.ord)
+    data.add char(m.interp.ord)
+    data.add '\0'
+    put32 0xff000000'u32 or (c[0].uint32 shl 16) or (c[1].uint32 shl 8) or c[2].uint32
+    put32 0xff000000'u32 or (m.color[0].uint32 shl 16) or (m.color[1].uint32 shl 8) or m.color[2].uint32
+    put32 cast[uint32](max(m.period, 0.01'f32))
+    put32 cast[uint32](m.offset)
+    put32 cast[uint32](clamp(m.low, 0, 1))
+    put32 cast[uint32](clamp(m.high, 0, 1))
+    put32 cast[uint32](clamp(m.stability, 0, 1))
+    put32 cast[uint32](max(m.faultLen, 0))
+  writeFile(path, data)
+  recs.len
 
 # --- ONLV quad references ------------------------------------------------------------------------
 

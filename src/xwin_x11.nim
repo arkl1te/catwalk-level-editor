@@ -79,7 +79,9 @@ const
   SubstructureNotifyMask = 1.clong shl 19
   SubstructureRedirectMask = 1.clong shl 20
   USPosition = 1.clong shl 0
+  USSize = 1.clong shl 1
   PPosition = 1.clong shl 2
+  PSize = 1.clong shl 3
   PMinSize = 1.clong shl 4
   PMaxSize = 1.clong shl 5
   PAspect = 1.clong shl 7
@@ -183,6 +185,15 @@ proc initMainWindow*(window: Window) =
   ## Replaces Windy's fatal X error handler (it installs it when opening the
   ## display, before the main window exists).
   discard XSetErrorHandler(logXError)
+
+proc XkbSetDetectableAutoRepeat(d: XDisplay, detectable: cint, supported: ptr cint): cint {.importc, cdecl.}
+
+proc detectableAutoRepeat*() =
+  ## A held key's auto-repeat normally arrives as release + press pairs, which
+  ## would confirm a held pie menu (Z) half a second in. Ask the server for
+  ## presses only. Call it with the GL context current (it uses its display).
+  let d = glXGetCurrentDisplay()
+  if d != nil: discard XkbSetDetectableAutoRepeat(d, 1, nil)
 
 proc disableVsync*(window: Window) =
   ## Drivers (NVIDIA in particular) default to swap interval 1 even when Windy
@@ -328,6 +339,23 @@ proc placeDialog*(window: Window, pos, size: IVec2) =
     minWidth: size.x, minHeight: size.y, maxWidth: size.x, maxHeight: size.y)
   XSetWMNormalHints(d, window.xid, hints.addr)
   discard XMoveResizeWindow(d, window.xid, pos.x, pos.y, size.x.cuint, size.y.cuint)
+  discard XFlush(d)
+
+proc placeWindow*(window: Window, pos, size: IVec2, maximized: bool) =
+  ## Restores a saved geometry: outer top-left corner at pos, content size
+  ## size, optionally maximized. The user-position hint makes the WM use it
+  ## instead of its own placement; call while the window is unmapped.
+  let d = glXGetCurrentDisplay()
+  if d == nil: return
+  var hints = XSizeHints(flags: USPosition or PPosition or USSize or PSize,
+    x: pos.x, y: pos.y, width: size.x, height: size.y)
+  XSetWMNormalHints(d, window.xid, hints.addr)
+  discard XMoveResizeWindow(d, window.xid, pos.x, pos.y, size.x.cuint, size.y.cuint)
+  if maximized:
+    var state = [XInternAtom(d, "_NET_WM_STATE_MAXIMIZED_VERT", 0).clong,
+                 XInternAtom(d, "_NET_WM_STATE_MAXIMIZED_HORZ", 0).clong]
+    discard XChangeProperty(d, window.xid, XInternAtom(d, "_NET_WM_STATE", 0),
+      XaAtom, 32, 0, state[0].addr, 2)
   discard XFlush(d)
 
 type XRRMonitorInfo = object

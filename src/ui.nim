@@ -1,6 +1,6 @@
 ## Small immediate-mode widget layer on top of Silky's drawing primitives.
 
-import std/[strformat, strutils, math]
+import std/[strformat, strutils, math, tables]
 from std/times import epochTime
 import silky, vmath, bumpy, chroma, pixie, opengl
 import theme, xwin
@@ -33,18 +33,33 @@ type
     clickId: string          ## on which field
     fieldScroll*: float32    ## horizontal scroll of the focused field's text
     editText*: string        ## numberField: text being typed
+    editUndoId: string       ## text input editUndo/editRedo belong to
+    editUndo: seq[(string, int)]  ## its text (and caret) before each edit: Ctrl+Z
+    editRedo: seq[(string, int)]  ## what Ctrl+Z took back: Ctrl+Shift+Z / Ctrl+Y
+    editTyping: bool         ## the last edit was typing: more typing joins its step
     typed*: string           ## text typed since the previous frame
     typedPending*: string    ## filled by the window's rune callback
     navId*: string           ## widget with keyboard focus (moved with Tab)
     navVisible*: bool        ## keyboard was used last: draw the focus ring
     focusFresh*: bool        ## focusId was just given by Tab, not by a click
+    focusSeen: bool          ## the focused field was drawn this frame
+    focusAtBegin: string     ## focusId when the frame began
     enterUsed*: bool         ## a focused button took Enter this frame
     tabStops*: seq[TabStop]  ## focusable widgets drawn this frame, in order
+    navTaken*: set[Button]   ## keys the focused widget listens to this frame (not the views')
+    tabTaken*: bool          ## the focused widget used Tab this frame (a code editor indents)
+    reveal: bool             ## this frame: scroll revealRect into view (scrollIntoView)
+    revealNext: bool         ## set by Tab or a list's arrow keys, for the next frame
+    revealRect: Rect         ## where it was drawn (in the frame it was focused)
+    revealClip: Rect         ## the scrolled area it was drawn in
+    barContent: Table[string, float32]  ## scrollbar id -> content height last frame
+    barGrab: float32         ## dragged scrollbar: mouse offset from the thumb's top
 
   TabStop* = object
     id*: string
     r*: Rect
     edit*: bool              ## a text input: focusing it starts editing
+    clip*: Rect              ## the hit clip it was drawn in (w = 0: none)
 
   EditEvent* = enum
     eeChanged, eeFocused, eeCommitted
@@ -130,10 +145,33 @@ proc beginFrame*(ui: Ui) =
   ui.typedPending = ""
   ui.enterUsed = false
   ui.tabStops.setLen 0
+  ui.navTaken = {}
+  ui.tabTaken = false
+  ui.reveal = ui.revealNext
+  ui.revealNext = false
+  ui.focusSeen = false
+  ui.focusAtBegin = ui.focusId
+  # A press drops keyboard focus (back to the views) unless the widget under
+  # it takes it.
   for b in [MouseLeft, MouseRight, MouseMiddle]:
-    if ui.window.buttonPressed[b]: ui.navVisible = false
+    if ui.window.buttonPressed[b]:
+      ui.navVisible = false
+      ui.navId = ""
+
+proc interacted(ui: Ui): bool =
+  ## Any mouse button pressed or the wheel turned this frame.
+  ui.window.scrollDelta.y != 0 or ui.window.scrollDelta.x != 0 or
+    ui.window.buttonPressed[MouseLeft] or ui.window.buttonPressed[MouseRight] or
+    ui.window.buttonPressed[MouseMiddle]
 
 proc endFrame*(ui: Ui) =
+  # A field that wasn't drawn this frame (its panel closed or changed) can't
+  # see the click that should end its editing: drop it here so it doesn't
+  # keep the keyboard away from the views. A focus given during this frame
+  # (by this very click) is left alone.
+  if ui.focusId.len > 0 and ui.focusId == ui.focusAtBegin and not ui.focusSeen and
+     ui.interacted():
+    ui.focusId = ""
   if ui.window.buttonReleased[MouseLeft] or not ui.window.buttonDown[MouseLeft]:
     ui.activeId = ""
     ui.pressId = ""
@@ -156,6 +194,11 @@ proc pushClip*(ui: Ui, r: Rect) =
     c = rect(x0, y0, max(0'f32, min(c.x + c.w, p.x + p.w) - x0),
              max(0'f32, min(c.y + c.h, p.y + p.h) - y0))
   ui.hitClips.add c
+
+proc keepFocus*(ui: Ui) =
+  ## A custom text input that owns the keyboard (focusId) was drawn this frame:
+  ## endFrame mustn't drop its focus.
+  ui.focusSeen = true
 
 proc popClip*(ui: Ui) =
   ui.sk.popClipRect()
@@ -186,38 +229,114 @@ proc wheelNotches*(ui: Ui): float32 =
   ui.scroll() / 10
 
 proc shiftDown*(w: Window): bool = w.buttonDown[KeyLeftShift] or w.buttonDown[KeyRightShift]
+proc ctrlDown*(w: Window): bool = w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl]
 
 # --- keyboard focus ----------------------------------------------------------
 
 proc tabStop*(ui: Ui, id: string, r: Rect, edit = false): bool =
   ## Adds a widget to this frame's Tab order; true when it has keyboard focus.
-  ui.tabStops.add TabStop(id: id, r: r, edit: edit)
+  let clip = if ui.hitClips.len > 0: ui.hitClips[^1] else: rect(0, 0, 0, 0)
+  ui.tabStops.add TabStop(id: id, r: r, edit: edit, clip: clip)
   ui.navId == id
 
 proc navKey*(ui: Ui, id: string, key: Button): bool =
   ## key was pressed while widget id has keyboard focus (and no text field does).
-  ui.navId == id and ui.focusId.len == 0 and ui.window.buttonPressed[key]
+  ## Asking claims key for the widget while it has focus: the views' shortcut
+  ## for it stands back (navTaken).
+  if ui.navId != id: return false
+  ui.navTaken.incl key
+  ui.focusId.len == 0 and ui.window.buttonPressed[key]
 
-proc tabNavigate*(ui: Ui): int =
-  ## Moves keyboard focus on Tab / Shift+Tab through this frame's stops.
+proc navActivate*(ui: Ui, id: string): bool =
+  ## Space or Enter pressed while widget id has keyboard focus.
+  result = ui.navKey(id, KeySpace) or ui.navKey(id, KeyEnter) or ui.navKey(id, NumpadEnter)
+  if result: ui.enterUsed = true
+
+proc revealLater(ui: Ui, r, clip: Rect) =
+  if clip.w <= 0: return
+  ui.revealNext = true
+  ui.revealRect = r
+  ui.revealClip = clip
+
+proc scrollIntoView*(ui: Ui, scroll: var float32) =
+  ## Call right after pushClip of a scrolled area, before laying it out: when
+  ## Tab (or a list's arrow keys) last frame went to something drawn there out
+  ## of sight, scrolls to show it. Larger scroll moves the contents up.
+  if not ui.reveal or ui.hitClips.len == 0 or ui.revealClip != ui.hitClips[^1]: return
+  ui.reveal = false
+  let (r, c) = (ui.revealRect, ui.revealClip)
+  if r.y < c.y: scroll -= c.y - r.y + 4
+  elif r.y + r.h > c.y + c.h: scroll += r.y + r.h - c.y - c.h + 4
+
+proc tabNavigate*(ui: Ui, lo = 0, hi = -1): int =
+  ## Moves keyboard focus on Tab / Shift+Tab through this frame's stops
+  ## lo ..< hi (hi -1: all of them; a dialog passes its own).
   ## Returns the index of the newly focused stop, or -1.
   let w = ui.window
   result = -1
-  if not w.buttonPressed[KeyTab] or ui.tabStops.len == 0: return
+  let hi = if hi < 0: ui.tabStops.len else: hi
+  if not w.buttonPressed[KeyTab] or hi <= lo or ui.tabTaken: return
   if w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl] or
      w.buttonDown[KeyLeftAlt] or w.buttonDown[KeyRightAlt]: return
-  let n = ui.tabStops.len
+  let n = hi - lo
   var i = -1
-  for k, s in ui.tabStops:
-    if s.id == ui.navId: i = k
-  result =
+  for k in lo ..< hi:
+    if ui.tabStops[k].id == ui.navId: i = k - lo
+  result = lo + (
     if i < 0: (if w.shiftDown: n - 1 else: 0)
-    else: (i + (if w.shiftDown: n - 1 else: 1)) mod n
+    else: (i + (if w.shiftDown: n - 1 else: 1)) mod n)
   let s = ui.tabStops[result]
   ui.navId = s.id
   ui.navVisible = true
   ui.focusId = if s.edit: s.id else: ""
   ui.focusFresh = s.edit
+  ui.revealLater(s.r, s.clip)
+
+proc listNav*(ui: Ui, id: string, area: Rect, items: openArray[Rect], cursor: var int,
+              horizontal = true): bool =
+  ## A list or grid that is one Tab stop: register it with tabStop(id, area)
+  ## where it belongs in the Tab order, then call this inside its clip with
+  ## every item's rect as laid out this frame (out of sight ones too). A press
+  ## in area focuses it; while focused the arrow keys (Left/Right only when
+  ## horizontal), Home/End and PageUp/PageDown move cursor, scrolling it into
+  ## view next frame. Space/Enter are the caller's (navActivate). Returns true
+  ## when cursor moved.
+  if ui.hover(area) and ui.window.buttonPressed[MouseLeft]: ui.navId = id
+  if ui.navId != id or items.len == 0: return
+  if cursor notin 0 .. items.high: cursor = 0
+  var to = cursor
+  proc row(items: openArray[Rect], k, dir: int): int =
+    ## The item in the next row up (dir -1) or down (1) nearest k's column.
+    let c = items[k]
+    let cx = c.x + c.w / 2
+    var rowY = NaN.float32
+    for it in items:
+      if (dir > 0 and it.y > c.y + 0.5 and not (it.y >= rowY)) or
+         (dir < 0 and it.y < c.y - 0.5 and not (it.y <= rowY)): rowY = it.y
+    if rowY != rowY: return k  # NaN: no row that way
+    result = k
+    var best = Inf.float32
+    for j, it in items:
+      if abs(it.y - rowY) < 0.5 and abs(it.x + it.w / 2 - cx) < best:
+        best = abs(it.x + it.w / 2 - cx)
+        result = j
+  let page = max(1, int(area.h / max(1'f32, items[cursor].h)) - 1)
+  if ui.navKey(id, KeyDown): to = row(items, to, 1)
+  if ui.navKey(id, KeyUp): to = row(items, to, -1)
+  if ui.navKey(id, KeyPageDown):
+    for _ in 1 .. page: to = row(items, to, 1)
+  if ui.navKey(id, KeyPageUp):
+    for _ in 1 .. page: to = row(items, to, -1)
+  if ui.navKey(id, KeyHome): to = 0
+  if ui.navKey(id, KeyEnd): to = items.high
+  if horizontal:
+    if ui.navKey(id, KeyLeft): to = max(0, to - 1)
+    if ui.navKey(id, KeyRight): to = min(items.high, to + 1)
+  if to != cursor:
+    cursor = to
+    result = true
+    ui.navVisible = true
+    ui.revealLater(items[to], if ui.hitClips.len > 0: ui.hitClips[^1] else: rect(0, 0, 0, 0))
 
 # --- drawing helpers -------------------------------------------------------
 
@@ -237,6 +356,86 @@ proc border*(ui: Ui, r: Rect, color: ColorRGBX, t = 1'f32) =
   ui.sk.drawRect(vec2(r.x, r.y + r.h - t), vec2(r.w, t), color)
   ui.sk.drawRect(vec2(r.x, r.y), vec2(t, r.h), color)
   ui.sk.drawRect(vec2(r.x + r.w - t, r.y), vec2(t, r.h), color)
+
+proc roundedOutline(r: Rect, radius: float32): seq[Vec2] =
+  ## r's outline with arcs of radius at the corners, clockwise from the top left.
+  const n = 4
+  let rad = clamp(radius, 0, min(r.w, r.h) / 2)
+  let centers = [vec2(r.x + r.w - rad, r.y + rad), vec2(r.x + r.w - rad, r.y + r.h - rad),
+                 vec2(r.x + rad, r.y + r.h - rad), vec2(r.x + rad, r.y + rad)]
+  for c, ctr in centers:
+    for k in 0 .. n:
+      let t = (c.float32 - 1 + k.float32 / n) * PI / 2
+      result.add ctr + vec2(cos(t), sin(t)) * rad
+
+proc roundedRect*(ui: Ui, r: Rect, color: ColorRGBX, radius: float32) =
+  let e = ui.sk.atlas.entries[WhiteTileKey]
+  let uv = vec2(e.x.float32 + e.width.float32 / 2, e.y.float32 + e.height.float32 / 2)
+  let pts = roundedOutline(r, radius)
+  let c = r.xy + r.wh / 2
+  for k in 0 ..< pts.len:
+    ui.sk.drawTriangle([c, pts[k], pts[(k + 1) mod pts.len]], [uv, uv, uv], [color, color, color])
+
+proc roundedBorder*(ui: Ui, r: Rect, color: ColorRGBX, radius: float32, t = 1'f32) =
+  let e = ui.sk.atlas.entries[WhiteTileKey]
+  let uv = vec2(e.x.float32 + e.width.float32 / 2, e.y.float32 + e.height.float32 / 2)
+  let outer = roundedOutline(r, radius)
+  let inner = roundedOutline(rect(r.x + t, r.y + t, r.w - 2 * t, r.h - 2 * t), max(0, radius - t))
+  for k in 0 ..< outer.len:
+    let j = (k + 1) mod outer.len
+    ui.sk.drawTriangle([outer[k], outer[j], inner[j]], [uv, uv, uv], [color, color, color])
+    ui.sk.drawTriangle([outer[k], inner[j], inner[k]], [uv, uv, uv], [color, color, color])
+
+# --- scrollbars ----------------------------------------------------------------
+
+const
+  BarHit = 10'f32    ## Width of the strip at an area's right edge that takes the mouse.
+  BarThin = 3'f32    ## Thumb width at rest, and while hovered or dragged.
+  BarWide = 6'f32
+  BarMinThumb = 24'f32
+
+proc barThumb(area: Rect, scroll, contentH: float32): Rect =
+  let th = clamp(area.h * area.h / contentH, min(BarMinThumb, area.h), area.h)
+  let room = contentH - area.h
+  let t = if room > 0: clamp(scroll / room, 0, 1) else: 0'f32
+  rect(area.x + area.w - BarHit, area.y + (area.h - th) * t, BarHit, th)
+
+proc scrollArea*(ui: Ui, id: string, area: Rect, scroll: var float32) =
+  ## Call before laying out a scrolled area: lets its scrollbar's thumb be
+  ## dragged (or the track clicked, which jumps there), with the content
+  ## height scrollbar gave last frame. It takes the press before the contents.
+  let contentH = ui.barContent.getOrDefault(id)
+  if contentH <= area.h or area.h <= 0: return
+  let bid = id & "#bar"
+  let track = rect(area.x + area.w - BarHit, area.y, BarHit, area.h)
+  var thumb = barThumb(area, scroll, contentH)
+  if ui.hover(track) and ui.pressed():
+    ui.consumeClick()
+    ui.activeId = bid
+    if not ui.mouse.inside(thumb):
+      # The track: the thumb's middle goes under the mouse.
+      ui.barGrab = thumb.h / 2
+    else:
+      ui.barGrab = ui.mouse.y - thumb.y
+  if ui.activeId == bid and ui.window.buttonDown[MouseLeft]:
+    let room = area.h - thumb.h
+    if room > 0:
+      scroll = clamp((ui.mouse.y - ui.barGrab - area.y) / room, 0, 1) * (contentH - area.h)
+
+proc scrollbar*(ui: Ui, id: string, area: Rect, scroll: float32, contentH: float32) =
+  ## Call after laying out the area (outside its clip): draws a slim thumb over
+  ## the contents' right edge when they're taller than area, so it takes no
+  ## width from them. contentH: the height scroll runs over (its largest value
+  ## is contentH - area.h).
+  ui.barContent[id] = contentH
+  if contentH <= area.h + 0.5 or area.h <= 0: return
+  let bid = id & "#bar"
+  let thumb = barThumb(area, scroll, contentH)
+  let active = ui.activeId == bid
+  let hot = active or ui.hover(rect(area.x + area.w - BarHit, area.y, BarHit, area.h))
+  let w = if hot: BarWide else: BarThin
+  let r = rect(area.x + area.w - w - 2, thumb.y + 2, w, thumb.h - 4)
+  ui.roundedRect(r, (if active: colAccent elif hot: colTextDim else: colTextDisabled), w / 2)
 
 proc dashedBorder*(ui: Ui, r: Rect, color: ColorRGBX, dash, gap: float32, t = 1'f32) =
   var x = r.x
@@ -296,6 +495,11 @@ proc focusRing*(ui: Ui, r: Rect) =
   ## Keyboard focus marker around a widget, shown after Tab was used.
   if ui.navVisible: ui.border(rect(r.x - 3, r.y - 3, r.w + 6, r.h + 6), colAccent)
 
+proc cursorRing*(ui: Ui, r: Rect) =
+  ## A focused list's cursor item (inside it: neighbours would cover a ring
+  ## around it), shown after the keyboard was used.
+  if ui.navVisible: ui.border(r, colAccent)
+
 proc icon*(ui: Ui, name: string, center: Vec2, color = colText) =
   let sz = ui.sk.getImageSize(name)
   ui.sk.drawImage(name, (center - sz / 2).floor, color)
@@ -323,10 +527,14 @@ proc drawTooltip*(ui: Ui) =
 # --- widgets ---------------------------------------------------------------
 
 proc iconButton*(ui: Ui, id: string, r: Rect, iconName: string, tooltip = "",
-                 enabled = true, toggled = false): bool =
+                 enabled = true, toggled = false, focusable = true, clickFocus = true): bool =
+  ## `focusable = false` keeps it out of the Tab order (a row's button in a
+  ## list that is one Tab stop); `clickFocus` as textButton's.
   let hov = enabled and ui.hover(r)
+  let focused = enabled and focusable and ui.tabStop(id, r)
   if hov and ui.pressed():
     ui.pressId = id
+    if focusable and clickFocus: ui.navId = id
     ui.consumeClick()
   let isDown = hov and ui.pressId == id and ui.down()
   if isDown: ui.rect(r, colPressed)
@@ -338,15 +546,21 @@ proc iconButton*(ui: Ui, id: string, r: Rect, iconName: string, tooltip = "",
     else: colText
   ui.icon(iconName, r.xy + r.wh / 2, col)
   if tooltip.len > 0: ui.tip(r, tooltip)
+  if focused: ui.focusRing(r)
   if hov and ui.window.buttonReleased[MouseLeft] and ui.pressId == id:
     result = true
+  if focused and ui.navActivate(id): result = true
 
-proc textButton*(ui: Ui, id: string, r: Rect, label: string, primary = false): bool =
+proc textButton*(ui: Ui, id: string, r: Rect, label: string, primary = false,
+                 clickFocus = true): bool =
+  ## `clickFocus = false` is for toolbar buttons (Qt's TabFocus): Tab reaches
+  ## them, but clicking one doesn't take keyboard focus, so Space/Enter in the
+  ## views can't press it.
   let hov = ui.hover(r)
   let focused = ui.tabStop(id, r)
   if hov and ui.pressed():
     ui.pressId = id
-    ui.navId = id
+    if clickFocus: ui.navId = id
     ui.consumeClick()
   let base = if primary: colAccent else: colPanelRaised
   let col =
@@ -359,11 +573,12 @@ proc textButton*(ui: Ui, id: string, r: Rect, label: string, primary = false): b
   if focused: ui.focusRing(r)
   if hov and ui.window.buttonReleased[MouseLeft] and ui.pressId == id:
     result = true
-  if ui.navKey(id, KeySpace) or ui.navKey(id, KeyEnter) or ui.navKey(id, NumpadEnter):
-    ui.enterUsed = true
-    result = true
+  if ui.navActivate(id): result = true
 
-proc checkbox*(ui: Ui, id: string, pos: Vec2, label: string, value: var bool): bool =
+proc checkbox*(ui: Ui, id: string, pos: Vec2, label: string, value: var bool,
+               mixed = false): bool =
+  ## `mixed` draws the partially checked state (TrenchBroom's FlagsEditor:
+  ## the selection disagrees); clicking it checks the box.
   let box = rect(pos.x, pos.y + 3, 16, 16)
   let r = rect(pos.x, pos.y, 22 + ui.textSize(label).x, 22)
   let hov = ui.hover(r)
@@ -373,13 +588,14 @@ proc checkbox*(ui: Ui, id: string, pos: Vec2, label: string, value: var bool): b
     ui.navId = id
     ui.consumeClick()
   if focused: ui.focusRing(r)
-  ui.rect(box, if value: colAccent else: colPanelRaised)
+  ui.rect(box, if value and not mixed: colAccent else: colPanelRaised)
   ui.border(box, if hov: colAccent else: colBorder)
-  if value: ui.icon("check16", box.xy + box.wh / 2, colOnAccent)
+  if mixed: ui.rect(rect(box.x + 4, box.y + 7, 8, 2), colTextDim)
+  elif value: ui.icon("check16", box.xy + box.wh / 2, colOnAccent)
   ui.textIn(label, rect(pos.x + 24, pos.y, r.w, 22), colText)
   if (hov and ui.window.buttonReleased[MouseLeft] and ui.pressId == id) or
      ui.navKey(id, KeySpace):
-    value = not value
+    value = mixed or not value
     result = true
 
 proc slider*(ui: Ui, id: string, r: Rect, value: var float, lo, hi, step: float): bool =
@@ -503,6 +719,37 @@ proc wordDrag*(cls: openArray[int], fromItem, toItem: int): tuple[anchor, caret:
   let w1 = wordAround(cls, toItem)
   if w1.a >= w0.a: (w0.a, max(w0.b, w1.b)) else: (w0.b, w1.a)
 
+proc editHistory(ui: Ui, id: string, text: var string, before: string, beforeCaret: int,
+                 typing, fresh: bool): bool =
+  ## The focused text input's own undo, like a Qt line edit's: call after its
+  ## edits each frame with the text it started the frame with. Ctrl+Z puts
+  ## back the text before the last edit (a run of typing is one edit),
+  ## Ctrl+Shift+Z or Ctrl+Y does it again. Returns true when it changed text.
+  if fresh or ui.editUndoId != id:
+    ui.editUndoId = id
+    ui.editUndo.setLen 0
+    ui.editRedo.setLen 0
+    ui.editTyping = false
+  if text != before:
+    if not (typing and ui.editTyping): ui.editUndo.add (before, beforeCaret)
+    ui.editTyping = typing
+    ui.editRedo.setLen 0
+  let w = ui.window
+  if not w.ctrlDown: return
+  if w.buttonPressed[KeyZ] and not w.shiftDown:
+    if ui.editUndo.len == 0: return
+    ui.editRedo.add (text, ui.caret)
+    (text, ui.caret) = ui.editUndo.pop
+  elif w.buttonPressed[KeyY] or (w.buttonPressed[KeyZ] and w.shiftDown):
+    if ui.editRedo.len == 0: return
+    ui.editUndo.add (text, ui.caret)
+    (text, ui.caret) = ui.editRedo.pop
+  else: return
+  ui.caret = clamp(ui.caret, 0, text.len)
+  ui.selAnchor = ui.caret
+  ui.editTyping = false
+  true
+
 proc textField*(ui: Ui, id: string, r: Rect, text: var string,
                 placeholder = ""): set[EditEvent] =
   ## Single-line text input. Focusing it (click or Tab) selects all of its
@@ -530,12 +777,15 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
     ui.selAnchor = 0
     ui.caret = text.len
     result.incl eeFocused
-  # A press on the field's dropdown (popupHit) keeps the field focused.
-  if ui.focusId == id and w.buttonPressed[MouseLeft] and not hov and not ui.popupHit:
+  # Any press or wheel turn outside the field ends editing; one on the
+  # field's dropdown (popupHit) keeps it focused.
+  if ui.focusId == id: ui.focusSeen = true
+  if ui.focusId == id and ui.interacted() and not hov and not ui.popupHit:
     ui.focusId = ""
     result.incl eeCommitted
   if hov and ui.pressed():
     ui.consumeClick()
+    ui.editTyping = false
     ui.navId = id
     ui.activeId = id
     ui.dragFrom = hitIndex(text, ui.mouse.x)
@@ -570,6 +820,8 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
     let ctrl = w.buttonDown[KeyLeftControl] or w.buttonDown[KeyRightControl]
     let shift = w.shiftDown
     let (s0, s1) = (min(ui.selAnchor, ui.caret), max(ui.selAnchor, ui.caret))
+    let (start, startCaret) = (text, ui.caret)
+    var typing = false
     proc deleteSelection(text: var string) =
       text.delete(s0 ..< s1)
       ui.caret = s0
@@ -585,8 +837,10 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
     var ins = ""
     for ch in ui.typed:  # drop control characters such as Tab
       if ch.ord >= 0x20 and ch.ord != 0x7f: ins.add ch
+    typing = ins.len > 0 and ui.caret == ui.selAnchor
     if ctrl and w.buttonPressed[KeyV]:
       ins.add getClipboardString().multiReplace(("\r", ""), ("\n", " "))
+      typing = false
     if ins.len > 0:
       if ui.caret != ui.selAnchor: deleteSelection(text)
       text.insert(ins, ui.caret)
@@ -606,6 +860,8 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
     elif w.buttonPressed[KeyDelete] and ui.caret < text.len:
       text.delete(ui.caret ..< nextRune(text, ui.caret))
       result.incl eeChanged
+    if ui.editHistory(id, text, start, startCaret, typing, eeFocused in result):
+      result.incl eeChanged
     # Arrows, Home and End move the caret, Ctrl+arrows by words; with Shift
     # they extend the selection, without it a selection collapses to the
     # side moved toward.
@@ -622,6 +878,7 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
     if move >= 0:
       ui.caret = move
       if not shift: ui.selAnchor = move
+      ui.editTyping = false
     if w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter] or
        w.buttonPressed[KeyTab] or w.buttonPressed[KeyEscape]:
       ui.focusId = ""
@@ -644,6 +901,230 @@ proc textField*(ui: Ui, id: string, r: Rect, text: var string,
     ui.textIn(text, rect(inner.x, r.y, inner.w + 4000, r.h), colText)
   else:
     ui.textIn(placeholder, rect(inner.x, r.y, inner.w + 4000, r.h), colTextDisabled)
+  ui.popClip()
+
+const TextAreaPad = vec2(7, 5)   ## Text inset from a text area's border.
+
+proc areaLines(ui: Ui, text: string, width: float32): seq[(int, int)] =
+  ## A text area's visual lines as byte ranges [a, b): split at newlines (not
+  ## included) and wrapped after the last space that fits, or mid-word when a
+  ## word alone is too wide. An empty text, or one ending in a newline, ends
+  ## with an empty line.
+  var start = 0
+  while true:
+    var e = text.find('\n', start)
+    if e < 0: e = text.len
+    var a = start
+    while true:
+      if ui.textSize(text[a ..< e]).x <= width:
+        result.add (a, e)
+        break
+      var fit = a
+      var space = -1
+      var j = a
+      while j < e:
+        let n = nextRune(text, j)
+        if ui.textSize(text[a ..< n]).x > width: break
+        if text[j] == ' ': space = n
+        fit = n
+        j = n
+      let b = if space > a: space elif fit > a: fit else: nextRune(text, a)
+      result.add (a, b)
+      a = b
+    if e >= text.len: break
+    start = e + 1
+
+proc areaLineOf(lines: seq[(int, int)], i: int): int =
+  ## The visual line the caret at byte i is drawn on (a wrapped line's end is
+  ## the next line's start).
+  for k, (a, _) in lines:
+    if a <= i: result = k
+
+proc textAreaHeight*(ui: Ui, text: string, width: float32, minLines = 3, maxLines = 12): float32 =
+  ## The height that shows text in a text area of this width, within the line limits.
+  let n = clamp(ui.areaLines(text, width - TextAreaPad.x * 2).len, minLines, maxLines)
+  n.float32 * ui.textSize("Ag").y + TextAreaPad.y * 2
+
+proc textArea*(ui: Ui, id: string, r: Rect, text: var string,
+               placeholder = ""): set[EditEvent] =
+  ## Multi-line text input, wrapped to its width. Enter starts a new line;
+  ## Ctrl+Enter, Tab, Escape or a click elsewhere ends editing (eeCommitted).
+  ## Selection, words and the clipboard work as in textField; Up/Down move a
+  ## line, Home/End to the line's ends (with Ctrl, the text's); the wheel
+  ## scrolls a long text while it's being edited.
+  let w = ui.window
+  let hov = ui.hover(r)
+  let inner = rect(r.x + TextAreaPad.x, r.y + TextAreaPad.y, r.w - TextAreaPad.x * 2,
+                   r.h - TextAreaPad.y * 2)
+  let lineH = ui.textSize("Ag").y
+  var lines = ui.areaLines(text, inner.w)
+  proc indexIn(text: string, line: (int, int), x: float32): int =
+    ## Character boundary on a visual line nearest to window x.
+    let (a, b) = line
+    let x = x - inner.x
+    result = a
+    while result < b:
+      let j = nextRune(text, result)
+      if x < (ui.textSize(text[a ..< result]).x + ui.textSize(text[a ..< j]).x) / 2: break
+      result = j
+  proc hitIndex(text: string, lines: seq[(int, int)], p: Vec2): int =
+    let k = clamp(int(floor((p.y - inner.y + ui.fieldScroll) / lineH)), 0, lines.high)
+    indexIn(text, lines[k], p.x)
+  discard ui.tabStop(id, r, edit = true)
+  if ui.focusId == id and ui.focusFresh:
+    ui.focusFresh = false
+    ui.fieldScroll = 0
+    ui.selAnchor = 0
+    ui.caret = text.len
+    result.incl eeFocused
+  if ui.focusId == id: ui.focusSeen = true
+  if ui.focusId == id and ui.interacted() and not hov and not ui.popupHit:
+    ui.focusId = ""
+    result.incl eeCommitted
+  if hov and ui.pressed():
+    ui.consumeClick()
+    ui.editTyping = false
+    ui.navId = id
+    ui.activeId = id
+    ui.dragFrom = hitIndex(text, lines, ui.mouse)
+    ui.dragX = ui.mouse.x
+    let clicks = ui.countClick(id)
+    if ui.focusId != id:
+      ui.focusId = id
+      ui.fieldScroll = 0
+      ui.selAnchor = ui.dragFrom
+      ui.caret = ui.dragFrom
+      result.incl eeFocused
+    elif clicks == 2:
+      (ui.selAnchor, ui.caret) = wordAround(text.classes, ui.dragFrom)
+    elif clicks >= 3:
+      # The whole line, up to its newline.
+      let k = areaLineOf(lines, ui.dragFrom)
+      var a = lines[k][0]
+      while a > 0 and text[a - 1] != '\n': dec a
+      var b = lines[k][1]
+      while b < text.len and text[b] != '\n': inc b
+      (ui.selAnchor, ui.caret) = (a, b)
+    else:
+      if not w.shiftDown: ui.selAnchor = ui.dragFrom
+      ui.caret = ui.dragFrom
+  let focused = ui.focusId == id
+  if focused and ui.activeId == id and ui.down() and ui.clickCount == 2:
+    (ui.selAnchor, ui.caret) = wordDrag(text.classes, ui.dragFrom, hitIndex(text, lines, ui.mouse))
+  elif focused and ui.activeId == id and ui.down() and ui.clickCount == 1:
+    ui.caret = hitIndex(text, lines, ui.mouse)
+  if focused:
+    ui.caret = clamp(ui.caret, 0, text.len)
+    ui.selAnchor = clamp(ui.selAnchor, 0, text.len)
+    let ctrl = w.ctrlDown
+    let shift = w.shiftDown
+    let (s0, s1) = (min(ui.selAnchor, ui.caret), max(ui.selAnchor, ui.caret))
+    let (start, startCaret) = (text, ui.caret)
+    var typing = false
+    proc deleteSelection(text: var string) =
+      text.delete(s0 ..< s1)
+      ui.caret = s0
+      ui.selAnchor = s0
+    if ctrl and w.buttonPressed[KeyA]:
+      ui.selAnchor = 0
+      ui.caret = text.len
+    if ctrl and (w.buttonPressed[KeyC] or w.buttonPressed[KeyX]) and s1 > s0:
+      setClipboardString(text[s0 ..< s1])
+      if w.buttonPressed[KeyX]:
+        deleteSelection(text)
+        result.incl eeChanged
+    var ins = ""
+    for ch in ui.typed:  # drop control characters; Enter comes from the key below
+      if ch.ord >= 0x20 and ch.ord != 0x7f: ins.add ch
+    typing = ins.len > 0 and ui.caret == ui.selAnchor
+    if ctrl and w.buttonPressed[KeyV]:
+      ins.add getClipboardString().multiReplace(("\r\n", "\n"), ("\r", "\n"), ("\t", " "))
+      typing = false
+    let enter = w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter]
+    if enter and not ctrl: ins.add '\n'
+    if ins.len > 0:
+      if ui.caret != ui.selAnchor: deleteSelection(text)
+      text.insert(ins, ui.caret)
+      ui.caret += ins.len
+      ui.selAnchor = ui.caret
+      result.incl eeChanged
+    if (w.buttonPressed[KeyBackspace] or w.buttonPressed[KeyDelete]) and
+       ui.caret != ui.selAnchor:
+      deleteSelection(text)
+      result.incl eeChanged
+    elif w.buttonPressed[KeyBackspace] and ui.caret > 0:
+      let a = if ctrl: wordLeft(text.classes, ui.caret) else: prevRune(text, ui.caret)
+      text.delete(a ..< ui.caret)
+      ui.caret = a
+      ui.selAnchor = a
+      result.incl eeChanged
+    elif w.buttonPressed[KeyDelete] and ui.caret < text.len:
+      text.delete(ui.caret ..< nextRune(text, ui.caret))
+      result.incl eeChanged
+    if ui.editHistory(id, text, start, startCaret, typing, eeFocused in result):
+      result.incl eeChanged
+    if eeChanged in result: lines = ui.areaLines(text, inner.w)
+    var move = -1
+    let (lo, hi) = (min(ui.selAnchor, ui.caret), max(ui.selAnchor, ui.caret))
+    let k = areaLineOf(lines, ui.caret)
+    let caretX = inner.x + ui.textSize(text[lines[k][0] ..< ui.caret]).x
+    if w.buttonPressed[KeyLeft]:
+      move = if ctrl: wordLeft(text.classes, ui.caret)
+             elif shift or lo == hi: prevRune(text, ui.caret) else: lo
+    if w.buttonPressed[KeyRight]:
+      move = if ctrl: wordRight(text.classes, ui.caret)
+             elif shift or lo == hi: nextRune(text, ui.caret) else: hi
+    if w.buttonPressed[KeyUp]:
+      move = if k > 0: indexIn(text, lines[k - 1], caretX) else: 0
+    if w.buttonPressed[KeyDown]:
+      move = if k < lines.high: indexIn(text, lines[k + 1], caretX) else: text.len
+    if w.buttonPressed[KeyHome]: move = if ctrl: 0 else: lines[k][0]
+    if w.buttonPressed[KeyEnd]:
+      # Before a wrapped line's trailing space, so the caret stays on this line.
+      var e = lines[k][1]
+      if k < lines.high and lines[k + 1][0] == e and e > lines[k][0]: e = prevRune(text, e)
+      move = if ctrl: text.len else: e
+    if move >= 0:
+      ui.caret = move
+      if not shift: ui.selAnchor = move
+      ui.editTyping = false
+    if (enter and ctrl) or w.buttonPressed[KeyTab] or w.buttonPressed[KeyEscape]:
+      ui.focusId = ""
+      result.incl eeCommitted
+    ui.navTaken.incl {KeyEnter, NumpadEnter, KeyUp, KeyDown, KeyLeft, KeyRight, KeyHome, KeyEnd}
+  # Scrolled only while editing: to the caret, and by the wheel.
+  let contentH = lines.len.float32 * lineH
+  if focused:
+    if hov and ui.wheelNotches != 0 and contentH > inner.h:
+      ui.fieldScroll += ui.wheelNotches * lineH * 3
+      ui.scrollConsumed = true
+    if eeChanged in result or ui.activeId == id or
+       w.buttonPressed[KeyUp] or w.buttonPressed[KeyDown] or w.buttonPressed[KeyLeft] or
+       w.buttonPressed[KeyRight] or w.buttonPressed[KeyHome] or w.buttonPressed[KeyEnd]:
+      let cy = areaLineOf(lines, ui.caret).float32 * lineH
+      if cy - ui.fieldScroll > inner.h - lineH: ui.fieldScroll = cy - inner.h + lineH
+      if cy - ui.fieldScroll < 0: ui.fieldScroll = cy
+    ui.fieldScroll = clamp(ui.fieldScroll, 0, max(0'f32, contentH - inner.h))
+  let scroll = if focused: ui.fieldScroll else: 0
+  ui.rect(r, colBackground)
+  ui.border(r, if focused: colAccent elif hov: colTextDim else: colBorder)
+  ui.pushClip(rect(r.x + 1, r.y + 1, r.w - 2, r.h - 2))
+  if text.len == 0 and not focused:
+    ui.textIn(placeholder, rect(inner.x, inner.y, inner.w + 4000, lineH), colTextDisabled)
+  let (s0, s1) = (min(ui.selAnchor, ui.caret), max(ui.selAnchor, ui.caret))
+  for k, (a, b) in lines:
+    let y = inner.y + k.float32 * lineH - scroll
+    if y + lineH < r.y or y > r.y + r.h: continue
+    if focused and s1 > s0 and s0 <= b and s1 >= a:
+      let x0 = ui.textSize(text[a ..< max(a, s0)]).x
+      var x1 = ui.textSize(text[a ..< min(b, s1)]).x
+      if s1 > b and b < text.len and text[b] == '\n': x1 += 6   # the selected newline
+      if x1 > x0: ui.rect(rect(inner.x + x0, y, x1 - x0, lineH), colAccentDim)
+    ui.textIn(text[a ..< b], rect(inner.x, y, inner.w + 4000, lineH), colText)
+  if focused:
+    let k = areaLineOf(lines, ui.caret)
+    let cx = ui.textSize(text[lines[k][0] ..< ui.caret]).x
+    ui.rect(rect(inner.x + cx, inner.y + k.float32 * lineH - scroll + 1, 1, lineH - 2), colAccent)
   ui.popClip()
 
 proc evalMath*(s: string): float =
@@ -694,18 +1175,29 @@ proc evalMath*(s: string): float =
   if result.classify in {fcNan, fcInf, fcNegInf}:
     raise newException(ValueError, "not a number")
 
+proc fmtNumber*(v: float, decimals: int): string =
+  ## decimals < 0: as many as the value needs (a float field shows what's stored).
+  if decimals == 0: return $int(round(v))
+  if decimals > 0: return formatFloat(v, ffDecimal, decimals)
+  result = formatFloat(v, ffDecimal, 9)
+  result.trimZeros()
+  if result == "-0": result = "0"
+
 proc numberField*(ui: Ui, id: string, r: Rect, value: var float,
-                  step, lo, hi: float, decimals = 0, axis = -1, live = false): bool =
+                  step, lo, hi: float, decimals = 0, axis = -1, live = false,
+                  mixed = false): bool =
   ## Type a number (or basic math, worked out on Enter or unfocus), scroll
   ## over it or press Up/Down while typing (Shift: a quarter step). axis
   ## 0..2 colors the left edge with that axis's color. live also takes the
-  ## value on every keystroke that leaves a valid number. Returns true when value changed.
+  ## value on every keystroke that leaves a valid number. mixed (several
+  ## objects that differ) shows the field blank and only takes a typed value.
+  ## decimals < 0 shows as many as the value has. Returns true when value changed.
   let fid = id & "#field"
   proc fmt(v: float): string =
-    if decimals == 0: $int(round(v)) else: formatFloat(v, ffDecimal, decimals)
+    if mixed: "" else: fmtNumber(v, decimals)
   if ui.focusId == fid and ui.focusFresh: ui.editText = fmt(value)
   var buf = if ui.focusId == fid: ui.editText else: fmt(value)
-  let ev = ui.textField(fid, r, buf)
+  let ev = ui.textField(fid, r, buf, if mixed: "mixed" else: "")
   if axis in 0 .. 2:
     ui.rect(rect(r.x, r.y, 3, r.h), colAxis[axis])
   if eeFocused in ev:
@@ -720,11 +1212,11 @@ proc numberField*(ui: Ui, id: string, r: Rect, value: var float,
     elif decimals == 0: max(1.0, round(step / 4))
     else: step / 4
   var delta = 0.0
-  if ui.hover(r) and ui.scroll() != 0:
+  if ui.hover(r) and ui.scroll() != 0 and not mixed:
     delta = if ui.scroll() < 0: step else: -step
     ui.scrollConsumed = true
   let focused = ui.focusId == fid
-  if focused:
+  if focused and not mixed:
     if ui.window.buttonPressed[KeyUp]: delta = step
     if ui.window.buttonPressed[KeyDown]: delta = -step
     if delta != 0:
@@ -742,10 +1234,10 @@ proc numberField*(ui: Ui, id: string, r: Rect, value: var float,
         value = v
         result = true
     except ValueError: discard
-  if eeCommitted in ev:
+  if eeCommitted in ev and not (mixed and buf.strip.len == 0):
     try:
       let v = clamp(evalMath(buf), lo, hi)
-      if v != value:
+      if v != value or mixed:
         value = v
         result = true
     except ValueError: discard

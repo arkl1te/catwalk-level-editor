@@ -27,14 +27,34 @@ the icon (`assets/catwalk.svg`); `make uninstall` removes them.
   the start point (beginning or a save point), **Build** and **Play**.
 - **Tool options strip:** settings for the current tool (with no tool: the shape new
   brushes get, and Move objects by). **View options** is on its right.
-- **Map views:** 1–4 panes (View menu). The 2D views share zoom and pan.
-- **Console / Issues:** at the bottom (Ctrl+4).
-- **Inspector:** on the right (Ctrl+5), with three tabs:
-  - **Map:** layers as a tree (geometry and each object type, with counts). Open a
+- **Map views:** 1–4 panes (View menu), in the **Viewport** panel with the tool
+  options strip. The 2D views share zoom and pan.
+- **Panels:** Viewport, Properties, Map, Files, Classes, Entity Browser, Texture Browser, Console,
+  Issues and Scripts. Drag a panel's tab onto another panel's tabs (or its middle) to tab it
+  there, or onto a side of a panel or of the whole window to split that side off. View >
+  Panels turns each panel on or off and resets the layout, which Catwalk remembers.
+  Every panel scrolls with a slim scrollbar over its right edge.
+  - **Console / Issues:** below the views by default (Ctrl+4).
+  - **Properties** (Ctrl+2; Ctrl+5 turns it on or off): what's selected, as rows of
+    name and value under a header that names it:
+    - **Level** (nothing selected): its name in the Custom Game list, sky, music and
+      lighting.
+    - An object's type (**Character**, **Point light**, ...): its fields, with a search;
+      several of one type show the fields they share, and several types show counts.
+    - **Face** (faces or pieces): texture shift, scale and rotation, flips and World
+      align, script id, shade and surface flags.
+    - **Vertex** (handles in the vertex, edge or face tool): the corners' vertex color,
+      unlit factor, Override lights and light animation.
+  - **Map** (Ctrl+1): layers as a tree (geometry and each object type, with counts). Open a
     layer to see its pieces or objects; click, Ctrl+click and Shift+click select,
     double-click focuses. Eye and lock icons hide and lock.
-  - **Entity:** a key/value table and the entity browser: ready-to-use entities in
-    collapsible groups, with a search field. Drag one into a view, or click to place it.
+  - **Classes** (Ctrl+3) edits character classes: the values every
+    character of a type (Konoko, each striker, ...) starts with, such as Health, AI and
+    sounds. Pick a class from the searchable list, or select a character (its class opens);
+    the class's fields have their own search. Edited classes are saved in the project's
+    `classes/` folder and only affect this level. "Use game values" puts a class back.
+    A character's AdditionalHealth adds to its class's Health.
+  - **Entity Browser:** ready-to-use entities in collapsible groups, with a search field. Drag one into a view, or click to place it.
     Built in: a generic object of each type, the game's characters (players, enemies,
     TCTF, civilians, with their usual team and weapon), weapons, power-ups, turrets and
     particles (lights, fire, steam, sparks, weather, decals). Furniture, consoles, doors
@@ -48,13 +68,30 @@ the icon (`assets/catwalk.svg`); `make uninstall` removes them.
     triggers), as TrenchBroom does. Particles show a still frame of what they emit
     (glows, fire, smoke, sparks, decals). The library build renders these previews,
     by itself the first time they're needed.
-  - **Face:** texture adjustments, surface flags, script id, shade, and the texture
-    browser (red border: current texture, yellow: used in the level).
+  - **Texture Browser:** red border: current texture, yellow: used in the level. Click one
+    to apply it to the selected faces.
+  - **Scripts** (Ctrl+6; opens beside the views): a code editor for the level's scripts,
+    the `.bsl` files in `IGMD/<level>/` that Oni reads when the level loads (double-click
+    one in Files, or pick it from Open...). It colors the language and the game's own
+    commands and variables, which it reads from your Oni.exe with their descriptions and
+    argument lists. Hover a word to see what it does. Typing lists what fits there
+    (Ctrl+Space asks), including the level's characters, trigger volumes, patrol paths,
+    flags, doors and the like for the arguments that name them, and the values the game's
+    own scripts use. The line above the cursor shows the argument the command expects next.
+    Names of the level's objects are drawn in their type's color: Ctrl+click one to select
+    it, show its Properties and its Map row, and frame it in the views. Ctrl+click or F12
+    on a function goes to where it's declared, in any of the level's files. Problems the
+    game would report (unknown commands, arguments it can't convert, missing braces) get
+    a wavy underline. Click the count in the status line to go to the next one. Ctrl+F finds,
+    Ctrl+/ comments lines, Tab / Shift+Tab indent, Ctrl+wheel changes the text size (Ctrl+0
+    resets it). Ctrl+S (or Save) writes the scripts along
+    with the project. Fields that name a script function (a character's Scripts, a trigger
+    volume's Entry/Inside/Exit, an event's Function) have a `<>` button that opens the
+    function.
 - **Status bar:** while Ctrl, Shift or Alt is held, it lists what the mouse and keys
   do with those modifiers (scroll it with the wheel).
 
-Every divider between panes, the inspector, the bottom panel and the browsers can be
-dragged.
+Every divider between panes and panels can be dragged.
 
 ## New projects
 
@@ -63,16 +100,50 @@ The welcome screen (File ▸ New project, Ctrl+N) starts a project in two ways:
 - **Empty level:** like a new map in TrenchBroom: one floor brush and a player start
   (Konoko, `IsPlayer`) at the origin, plus a `main()` script. Pick the game levels whose
   environment textures go into the texture browser (all of them by default) and a sky
-  from level 0 (afternoon, sunset, night, crapsky, or none; the Map tab can change it
-  later). Character classes, weapons and skies are linked by name from level 0.
+  from level 0 (afternoon, sunset, night, crapsky, or none; Level in Properties can
+  change it later). Character classes, weapons and skies are linked by name from level 0.
 - **Copy of an Oni level:** an editable copy of one of the game's levels.
 
 Either kind of level can play one of the game's music tracks (from level 0) from the
-moment it loads: pick it and its volume under Level in the Map tab. Build adds the
+moment it loads: pick it and its volume under Level in Properties (nothing selected). Build adds the
 `sound_music_start` line to the built copy of `main()`; the project's scripts are left as
 they are. The play button next to the track previews it (intro, then its loop pieces in
 random order, as Oni plays them) through `pw-cat`, `paplay` or `aplay`. The first preview
 extracts level 0's music into `~/.cache/catwalk/music` (about 36 MB, a few seconds).
+
+## Baked lighting
+
+Oni lights its levels with colors baked into every face corner (texture × vertex color).
+Catwalk can bake them from lights you place from the view's context menu (Create object ▸
+Point light / Directional light) or the entity browser:
+
+- **Point light:** `Color` (0–255 each), `Intensity`, `Radius` (its light fades to nothing
+  there; the selected light shows it as a sphere) and `Shadows` (1 or 0).
+- **Directional light:** a sun: the same light everywhere, coming from one direction, with
+  `Color`, `Intensity` and `Shadows`. Its gizmo is a sun with an arrow pointing the way the
+  light travels; turn it with its Rotation (X tilts it down, Y turns its heading).
+
+Color fields (a light's, a flag's, a trigger's laser, Ambient) have a number field for
+each of red, green and blue (like the XYZ fields: type, or scroll over one), a swatch that
+opens a color picker (saturation/value square, hue bar, RGB, HSV and hex) and an eyedropper that
+takes the color of anything in Catwalk's window: click it, then click any pixel (Esc or a
+right click cancels). Each channel field takes a number or arithmetic (`200+16`); with
+several objects selected, one whose values differ is blank and setting it changes only
+that channel. Picker changes show live; closing the picker leaves one undo step, and Esc
+puts the color back.
+
+Each light has an **Enabled** checkbox at the top of its Properties: an off light is drawn
+dimmed and left out of the bake. Under Level in Properties (nothing selected):
+
+- **Ambient:** the color every face gets before the lights' light.
+- **Bake automatically:** on, every change to a light (moving, rotating, enabling), the
+  ambient color or the geometry rebakes at once (big levels rebake a few times a second
+  while you drag). Off, the lighting changes only when you press **Bake light**, which is
+  one undo step.
+
+A bake replaces the vertex colors of every visible face, including an original level's
+own lighting. Lights are Catwalk's own: they're kept in the project's `lights.xml` and are
+never built into the level; only the colors they bake are.
 
 ## How a level goes through Catwalk
 
@@ -100,8 +171,8 @@ no tool active:
 | Ctrl+click | Add to / remove from the selection |
 | Double-click | Everything in that layer (Ctrl: add) |
 | Shift+click, Ctrl+Shift+click | Select a face, add/remove a face |
-| Shift+double-click, Shift+Alt+double-click | All faces of a piece, connected coplanar faces |
-| Alt+click, Alt+drag, Alt+double-click | With one face selected: copy its texture and alignment to the clicked face, to every face the mouse passes over while the button is held, or to the whole piece (Alt+Ctrl: texture only) |
+| Shift+double-click, Shift+Alt+double-click | All faces of a piece, connected coplanar faces (Shift+Alt with one face selected: see below) |
+| Alt+click, Alt+drag, Alt+double-click | With one face selected: copy its texture, flags and alignment to the clicked face, to every face the mouse passes over while the button is held, or to the whole piece (Alt+Ctrl: texture only; Alt+Shift: the alignment wraps around corners) |
 | Drag the selection | Move (Alt: vertically in 3D, Shift: lock to one axis, Ctrl: duplicate first) |
 | Ctrl+drag | Paint select (Ctrl+Shift: faces) |
 | Drag with nothing selected | Draw a brush in the chosen shape. 2D: its depth comes from the last selection. 3D: on the surface under the mouse, one grid step high; Alt changes the height, Shift makes it square, Shift+Alt a cube. |
@@ -110,7 +181,7 @@ no tool active:
 | Ctrl+wheel (3D) | Select the next thing behind / in front |
 | Ctrl+Alt+wheel | Grid size |
 
-Tools (press the key again or Esc to leave; W or Shift+Esc always leaves):
+Tools (press the key again or Esc to leave; Shift+Esc always leaves):
 
 | | |
 |---|---|
@@ -137,7 +208,8 @@ Keys:
 | Ctrl+I, Ctrl+Alt+I, Ctrl+Shift+I | Isolate, hide, show all |
 | Ctrl+U, Ctrl+Shift+U | Focus on selection, reset cameras |
 | Space, Ctrl+Space | Switch the view under the mouse, maximize it |
-| 3D view | RMB look, RMB+WASD/QE fly (wheel: speed), Alt+RMB orbit, MMB pan, wheel forward/back, Shift+wheel zoom (Ctrl+Alt+Z resets) |
+| Z (hold) | Render mode pie: point toward a mode, let go of Z or click. Tap Z to keep it open; 1–9 pick by numpad direction, Esc cancels |
+| 3D view | WASD walk (no modifiers, nothing typed into), RMB look, LMB+RMB carry the selection while looking/flying (grid-snapped; Esc puts it back), RMB+WASD/QE fly (wheel: speed), Alt+RMB orbit, MMB pan, wheel forward/back, Shift+wheel zoom (Ctrl+Alt+Z resets) |
 | 2D views | RMB/MMB pan, wheel zoom |
 | Ctrl+Z / Ctrl+Shift+Z | Undo / redo (objects and geometry) |
 

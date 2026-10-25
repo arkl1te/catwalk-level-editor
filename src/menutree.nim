@@ -1,5 +1,5 @@
-## Menu bar + popup menus with separators, shortcuts, check/radio items and
-## nested submenus. The menu tree is rebuilt every frame from app state, so
+## Menu bar + popup menus with separators, shortcuts, check/radio items,
+## sliders and nested submenus. The menu tree is rebuilt every frame from app state, so
 ## checkmarks and dynamic lists (tracks, recent files) are always current.
 ## Each open popup level is its own override-redirect window, so menus can
 ## extend past the main window; layout and hit testing happen in main-window
@@ -11,7 +11,7 @@ import theme, ui, xwin
 
 type
   MenuKind* = enum
-    mkAction, mkCheck, mkRadio, mkSeparator, mkSub
+    mkAction, mkCheck, mkRadio, mkSeparator, mkSub, mkSlider
 
   MenuNode* = ref object
     label*, shortcut*: string
@@ -21,6 +21,8 @@ type
     action*: proc ()
     remove*: proc ()          ## set: a cross at the row's right end runs it
     swatch*: ColorRGBX        ## alpha > 0: a color square in the check column
+    value*: float             ## mkSlider: 0..1, shown as a percentage
+    onChange*: proc (v: float) ## mkSlider: dragged, clicked or scrolled to v
 
   MenuMode = enum
     mmClosed, mmBar, mmContext
@@ -45,6 +47,8 @@ type
     grabbed: bool             ## holds the pointer grab taken while open
     pendingAction: proc ()
     pendingRemove: proc ()
+    sliding: bool             ## a slider row is being dragged...
+    slideDepth, slideIndex: int ## ...this one (the menu stays open)
 
 proc newMenuSystem*(): MenuSystem = MenuSystem()
 
@@ -71,6 +75,12 @@ proc radio*(parent: MenuNode, label: string, shortcut = "", checked: bool,
   parent.children.add MenuNode(label: label, shortcut: shortcut, kind: mkRadio,
     checked: checked, enabled: enabled, action: action)
 
+proc slider*(parent: MenuNode, label: string, value: float, enabled = true,
+             onChange: proc (v: float) = nil) =
+  ## A label and a 0..1 track; changing it keeps the menu open.
+  parent.children.add MenuNode(label: label, kind: mkSlider, value: value,
+    enabled: enabled, onChange: onChange)
+
 proc sep*(parent: MenuNode) =
   parent.children.add MenuNode(kind: mkSeparator)
 
@@ -91,6 +101,7 @@ proc close*(m: MenuSystem) =
   m.path.setLen 0
   m.levels.setLen 0
   m.boundsValid = false
+  m.sliding = false
   for w in m.windows: w.hide()
 
 proc openBar*(m: MenuSystem, barIndex: int, path: seq[int] = @[]) =
@@ -142,7 +153,7 @@ proc captureInput*(m: MenuSystem, ui: Ui) =
     m.boundsValid = true
     let mon = monitorAt(screen)
     m.bounds = rect((mon.pos.vec2 - m.origin) / ui.scale, mon.size.vec2 / ui.scale)
-  if m.overMenu(m.mouse) or m.input.anyPressed:
+  if m.overMenu(m.mouse) or m.input.anyPressed or m.sliding:
     ui.captured = true
   elif ui.window.buttonPressed[MouseLeft] or ui.window.buttonPressed[MouseRight] or
        ui.window.buttonPressed[MouseMiddle]:
@@ -159,6 +170,9 @@ const
   checkW = 24'f32
   arrowW = 22'f32
   shortcutGap = 36'f32
+  sliderW = 110'f32
+  percentW = 44'f32
+  SliderStep = 0.05
 
 proc popupSize(ui: Ui, node: MenuNode): Vec2 =
   var labelW, scW = 0'f32
@@ -170,8 +184,20 @@ proc popupSize(ui: Ui, node: MenuNode): Vec2 =
       labelW = max(labelW, ui.textSize(c.label).x)
       if c.shortcut.len > 0: scW = max(scW, ui.textSize(c.shortcut).x)
       h += MenuRowHeight
-  let w = checkW + labelW + (if scW > 0: shortcutGap + scW else: 0) + arrowW + padX
+  var w = checkW + labelW + (if scW > 0: shortcutGap + scW else: 0) + arrowW + padX
+  for c in node.children:
+    if c.kind == mkSlider:
+      w = max(w, checkW + labelW + 12 + sliderW + percentW + padX)
   vec2(ceil(max(w, 160)), ceil(h))
+
+proc sliderTrack(row: Rect): Rect =
+  ## A slider row's track, before its percentage at the right end.
+  rect(row.x + row.w - percentW - sliderW, row.y, sliderW - 8, row.h)
+
+proc slideTo(c: MenuNode, row: Rect, x: float32) =
+  let t = sliderTrack(row)
+  let v = clamp(round(clamp((x - t.x) / t.w, 0, 1) / SliderStep) * SliderStep, 0.0, 1.0)
+  if v != c.value and c.onChange != nil: c.onChange(v)
 
 proc removeRect(row: Rect): Rect =
   ## The cross of a removable row, in the space submenu arrows use.
@@ -215,11 +241,20 @@ proc topLevelAt(m: MenuSystem, p: Vec2): int =
     if p.inside(m.levels[d].rect): return d
 
 proc layoutPopups(m: MenuSystem, ui: Ui, node: MenuNode, anchor: Rect,
-                  below: bool, released: bool) =
+                  below: bool, pressed, released: bool) =
   ## Places the open popups, then tracks hover/open submenus and clicks in the
   ## topmost popup under the pointer only.
   m.levels.setLen 0
   m.placePopup(ui, node, anchor, 0, below)
+  if m.sliding:
+    # A dragged slider follows the pointer anywhere until the button is let go.
+    if m.slideDepth < m.levels.len:
+      let lv = m.levels[m.slideDepth]
+      for (i, row) in rows(lv.node, lv.rect):
+        if i == m.slideIndex and lv.node.children[i].kind == mkSlider:
+          lv.node.children[i].slideTo(row, m.mouse.x)
+    if released or not pointerButtonsDown(): m.sliding = false
+    return
   let d = m.topLevelAt(m.mouse)
   if d < 0: return
   let lv = m.levels[d]
@@ -236,6 +271,16 @@ proc layoutPopups(m: MenuSystem, ui: Ui, node: MenuNode, anchor: Rect,
       if m.path.len > d:
         m.path.setLen d
         m.levels.setLen d + 1
+      if c.kind == mkSlider:
+        if pressed:
+          m.sliding = true
+          m.slideDepth = d
+          m.slideIndex = i
+          c.slideTo(row, m.mouse.x)
+        elif ui.scroll() != 0 and c.onChange != nil:
+          c.onChange(clamp(c.value + (if ui.scroll() < 0: SliderStep else: -SliderStep), 0.0, 1.0))
+          ui.scrollConsumed = true
+        continue
       if released:
         if c.remove != nil and m.mouse.inside(removeRect(row)):
           m.pendingRemove = c.remove
@@ -276,6 +321,16 @@ proc drawPopup(m: MenuSystem, ui: Ui, lv: PopupLevel, depth: int) =
       ui.icon("close16", xr.xy + xr.wh / 2, if xHov: colText else: colTextDim)
     if c.kind == mkSub:
       ui.icon("arrow16", vec2(row.x + row.w - arrowW / 2, row.y + row.h / 2), fg)
+    if c.kind == mkSlider:
+      let t = sliderTrack(row)
+      let cy = t.y + t.h / 2
+      let frac = clamp(c.value, 0, 1).float32
+      let active = m.sliding and m.slideDepth == depth and m.slideIndex == i
+      ui.rect(rect(t.x, cy - 2, t.w, 4), colTrack)
+      ui.rect(rect(t.x, cy - 2, t.w * frac, 4), if c.enabled: colAccent else: colTextDisabled)
+      ui.icon("knob16", vec2(t.x + t.w * frac, cy), if hov or active: colWhite else: fg)
+      ui.textIn($int(round(c.value * 100)) & "%", rect(row.x, row.y, row.w - 6, row.h),
+        if c.enabled: colTextDim else: colTextDisabled, h = RightAlign)
 
 proc drawBar*(m: MenuSystem, ui: Ui, root: MenuNode, bar: Rect) =
   ## Draws the menu bar strip. Popups are laid out by updatePopups and drawn
@@ -309,15 +364,16 @@ proc drawBar*(m: MenuSystem, ui: Ui, root: MenuNode, bar: Rect) =
 
 proc updatePopups*(m: MenuSystem, ui: Ui, root, contextRoot: MenuNode) =
   ## Lays out open popups, handles hover and runs a clicked action.
+  let pressed = ui.window.buttonPressed[MouseLeft] or m.input.leftPressed
   let released = ui.window.buttonReleased[MouseLeft] or m.input.leftReleased
   m.input = PopupInput()
   m.levels.setLen 0
   case m.mode
   of mmBar:
     if m.barIndex < m.barRects.len:
-      m.layoutPopups(ui, root.children[m.barIndex], m.barRects[m.barIndex], true, released)
+      m.layoutPopups(ui, root.children[m.barIndex], m.barRects[m.barIndex], true, pressed, released)
   of mmContext:
-    m.layoutPopups(ui, contextRoot, rect(m.contextPos, vec2(0, 0)), true, released)
+    m.layoutPopups(ui, contextRoot, rect(m.contextPos, vec2(0, 0)), true, pressed, released)
   of mmClosed: discard
   if m.pendingRemove != nil:
     # Removing keeps the menu open, so several entries can go in a row.

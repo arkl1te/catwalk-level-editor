@@ -6,6 +6,11 @@ type
     width*, height*: int
     rgba*: seq[uint8]   ## Top row first, 4 bytes per pixel.
 
+proc tgaSize*(data: string): (int, int) =
+  ## Width and height from the header alone.
+  if data.len < 18: raise newException(ValueError, "TGA too short")
+  (data[12].uint8.int or (data[13].uint8.int shl 8), data[14].uint8.int or (data[15].uint8.int shl 8))
+
 proc readTga*(data: string): TgaImage =
   if data.len < 18: raise newException(ValueError, "TGA too short")
   let

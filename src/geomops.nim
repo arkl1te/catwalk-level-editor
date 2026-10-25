@@ -3,7 +3,7 @@
 ## A "brush" is a piece whose faces bound a closed convex solid; any piece can be
 ## moved, clipped and vertex-edited, but CSG needs brushes.
 
-import std/[math, tables, sets, algorithm]
+import std/[math, tables, sets, algorithm, sequtils]
 import vmath
 import geometry, camera
 
@@ -66,7 +66,15 @@ proc textureDensity*(g: Geometry, texture: string): float32 =
   ## texture (median), so new faces match the level. 64 when unknown.
   var samples: seq[float32]
   for f in g.faces:
-    if f.texture != texture or f.verts.len < 3: continue
+    if f.texture != texture or f.verts.len < 3 or f.uvs.len != f.verts.len: continue
+    # Faces whose UVs are squashed to a point or a line say nothing about the
+    # texture's size (their edges give near-zero UV lengths, so huge densities).
+    var uvArea, uvPerim = 0'f32
+    for k in 0 ..< f.uvs.len:
+      let (a, b) = (f.uvs[k], f.uvs[(k + 1) mod f.uvs.len])
+      uvArea += a.x * b.y - b.x * a.y
+      uvPerim += (b - a).length
+    if abs(uvArea) * 0.5 < 1e-4 * uvPerim * uvPerim: continue
     for k in 0 ..< f.verts.len:
       let j = (k + 1) mod f.verts.len
       let w = (g.points[f.verts[j]] - g.points[f.verts[k]]).length
@@ -147,7 +155,7 @@ proc texFrame*(g: Geometry, f: Face, density: float32): TexFrame =
         sxx[i][j] += dq[i] * dq[j]
         sux[i][j] += du[i] * dq[j]
   let det = sxx[0][0] * sxx[1][1] - sxx[0][1] * sxx[1][0]
-  if abs(det) < 1e-9 * max(1.0, sxx[0][0] * sxx[1][1]): return
+  if sxx[0][0] * sxx[1][1] <= 0 or abs(det) < 1e-9 * sxx[0][0] * sxx[1][1]: return
   let inv = [[sxx[1][1] / det, -sxx[0][1] / det], [-sxx[1][0] / det, sxx[0][0] / det]]
   var m: array[2, array[2, float]]
   for i in 0 .. 1:
@@ -204,6 +212,20 @@ proc setTexFrame*(f: var Face, old, t: TexFrame): TexFrame =
 
 proc setTexFrame*(g: Geometry, fi: int, old, t: TexFrame): TexFrame =
   g.faces[fi].setTexFrame(old, t)
+
+proc retexture*(g: Geometry, fi: int, texture: string, density: proc(tex: string): float32) =
+  ## Gives face fi another texture with the same shift, scale and rotation as
+  ## the Face tab shows them, since those are relative to each texture's density.
+  let oldDensity = density(g.faces[fi].texture)
+  let keep = g.texFrame(fi, oldDensity)
+  g.faces[fi].texture = texture
+  let d = density(texture)
+  let cur = g.texFrame(fi, d)
+  if keep.ok and cur.ok: discard g.setTexFrame(fi, cur, keep)
+  else:
+    # No mapping to carry over (the UVs are squashed to a point or a line, so
+    # rescaling them would keep them squashed): World align instead.
+    g.projectUVs(fi, d)
 
 proc mapNewFace*(g: Geometry, f: var Face, attr: FaceAttr, density: float32) =
   ## UVs for a new face: World align, then attr's mapping (shift, scale,
@@ -266,13 +288,13 @@ proc solidFromPlanes*(planes: seq[Plane]): seq[(int, seq[Vec3])] =
     result.add (i, on)
 
 proc addSolid*(g: Geometry, planes: seq[Plane], attrs: seq[FaceAttr],
-               densityOf: proc(tex: string): float32): int32 =
+               densityOf: proc(tex: string): float32, group = 0'i32): int32 =
   ## Adds a brush bounded by planes; attrs[i] textures the face on planes[i].
   ## Returns the new piece, or -1 if the planes enclose nothing.
   let polys = solidFromPlanes(planes)
   if polys.len < 4: return -1
   result = g.pieces.len.int32
-  g.pieces.add Piece(brush: true)
+  g.pieces.add Piece(brush: true, group: group)
   for (i, poly) in polys:
     discard g.addPolygon(poly, attrs[i], result, densityOf(attrs[i].texture))
   g.bump()
@@ -370,6 +392,10 @@ proc reverseWinding*(g: Geometry, faces: HashSet[int]) =
     f.verts.reverse
     f.uvs.reverse
     f.colors.reverse
+    if f.anims.len > 0:
+      f.anims.setLen f.verts.len
+      f.anims.reverse
+    for l in f.lightAnims.mitems: l.corner = f.verts.high.int32 - l.corner
 
 proc duplicateFaces*(g: Geometry, faces: seq[int], offset: Vec3): seq[int] =
   ## Copies the faces (with their own points) into new pieces. Returns the new faces.
@@ -379,7 +405,7 @@ proc duplicateFaces*(g: Geometry, faces: seq[int], offset: Vec3): seq[int] =
     var f = g.faces[fi]
     if f.piece notin pieceMap:
       pieceMap[f.piece] = g.pieces.len.int32
-      g.pieces.add Piece(brush: g.pieces[f.piece].brush)
+      g.pieces.add Piece(brush: g.pieces[f.piece].brush, group: g.pieces[f.piece].group)
     f.piece = pieceMap[f.piece]
     f.objectId = -1
     for v in f.verts.mitems:
@@ -395,23 +421,26 @@ proc duplicateFaces*(g: Geometry, faces: seq[int], offset: Vec3): seq[int] =
 
 proc clipPolygon(g: Geometry, f: Face, pl: Plane, keepFront: bool): Face =
   ## The part of f on one side of pl, with UVs and colors interpolated on cuts.
+  ## Corners within Eps of the plane count as on it: they stay as they are, and
+  ## no cut point is made next to them (that left slivers and doubled corners).
   result = f
   result.verts.setLen 0
   result.uvs.setLen 0
   result.colors.setLen 0
+  result.anims.setLen 0
+  result.lightAnims.setLen 0   # until the next bake
   let n = f.verts.len
   for k in 0 ..< n:
     let j = (k + 1) mod n
     let (a, b) = (g.points[f.verts[k]], g.points[f.verts[j]])
     var (da, db) = (pl.dist(a), pl.dist(b))
-    if keepFront: (da, db) = (-da, -db)   # keep where dist >= 0
-    let ina = da <= Eps
-    let inb = db <= Eps
-    if ina:
+    if keepFront: (da, db) = (-da, -db)   # keep where dist <= 0
+    if da <= Eps:
       result.verts.add f.verts[k]
       result.uvs.add f.uvs[k]
       result.colors.add f.colors[k]
-    if ina != inb and abs(da - db) > 1e-6:
+      if f.anims.len > 0: result.anims.add f.animAt(k)
+    if (da < -Eps and db > Eps) or (da > Eps and db < -Eps):
       let t = da / (da - db)
       result.verts.add g.points.len.int32
       g.points.add a + (b - a) * t
@@ -420,47 +449,117 @@ proc clipPolygon(g: Geometry, f: Face, pl: Plane, keepFront: bool): Face =
       for ch in 0 .. 3:
         c[ch] = uint8(f.colors[k][ch].float32 + (f.colors[j][ch].float32 - f.colors[k][ch].float32) * t)
       result.colors.add c
+      if f.anims.len > 0: result.anims.add f.animAt(if t < 0.5: k else: j)
+
+proc onPlane(g: Geometry, f: Face, pl: Plane): bool =
+  for v in f.verts:
+    if abs(pl.dist(g.points[v])) > Eps: return false
+  true
+
+proc capPolygon(g: Geometry, faces: seq[Face], pl: Plane, n: Vec3): seq[Vec3] =
+  ## A cut brush's section by pl, from its cut faces: their corners on the
+  ## plane, in order around n (CCW seen from outside). Taking the cut faces' own
+  ## corners puts the cap's edges exactly on theirs, so the brush stays closed.
+  var on: seq[Vec3]
+  for f in faces:
+    for v in f.verts:
+      let p = g.points[v]
+      if abs(pl.dist(p)) > Eps: continue
+      var dup = false
+      for q in on:
+        if (q - p).length <= Eps:
+          dup = true
+          break
+      if not dup: on.add p
+  if on.len < 3: return
+  var c = vec3(0, 0, 0)
+  for p in on: c += p
+  c /= on.len.float32
+  var far = on[0]
+  for p in on:
+    if (p - c).length > (far - c).length: far = p
+  if (far - c).length < Eps: return
+  let u = (far - c).normalize
+  let v = n.cross(u)
+  on.sort(proc(a, b: Vec3): int =
+    cmp(arctan2((a - c).dot(v), (a - c).dot(u)), arctan2((b - c).dot(v), (b - c).dot(u))))
+  var area = 0'f32
+  for k in 1 ..< on.len - 1: area += (on[k] - on[0]).cross(on[k + 1] - on[0]).dot(n)
+  if area * 0.5 < Eps: return
+  on
+
+proc closestFace(g: Geometry, fs: seq[int], n: Vec3): int =
+  ## TrenchBroom's ClipTool::setFaceAttributes: the face whose normal is
+  ## closest to n, which a cap copies (texture, flags, alignment).
+  result = fs[0]
+  var bestD = Inf.float32
+  for fi in fs:
+    let d = (g.normal(g.faces[fi]) - n).lengthSq
+    if d < bestD: (result, bestD) = (fi, d)
 
 proc clipPieces*(g: Geometry, pieces: HashSet[int32], pl: Plane, side: Side,
-                 capAttr: FaceAttr, densityOf: proc(tex: string): float32) =
-  ## Cuts the pieces by pl ("front" = where the normal points). Brushes are
-  ## closed again with a cap face; other pieces are just cut.
+                 densityOf: proc(tex: string): float32) =
+  ## Cuts the pieces by pl ("front" = where the normal points), like
+  ## TrenchBroom's clip tool: each kept side becomes a piece of its own, and
+  ## brushes are closed again with a cap. A piece the plane misses stays whole
+  ## on its side and is left out of the other.
   let byPiece = g.pieceFaces
   var faces: seq[Face]
-  for i, f in g.faces:
+  for f in g.faces:
     if f.piece notin pieces: faces.add f
-  for pc in pieces:
+  for pc in toSeq(pieces).sorted:
     let fs = byPiece[pc]
-    let brush = g.pieces[pc].brush
+    if fs.len == 0: continue
+    var front, back = false
+    for fi in fs:
+      for v in g.faces[fi].verts:
+        let d = pl.dist(g.points[v])
+        if d > Eps: front = true
+        elif d < -Eps: back = true
+    if not front and not back:
+      # Flat on the plane: the side its faces face away from.
+      for fi in fs:
+        let s = g.normal(g.faces[fi]).dot(pl.n)
+        if s < 0: front = true
+        elif s > 0: back = true
+    let (brush, group) = (g.pieces[pc].brush, g.pieces[pc].group)
     for keepFront in [true, false]:
       if (keepFront and side == sideBack) or (not keepFront and side == sideFront): continue
+      if not (if keepFront: front else: back): continue
+      let cut = if keepFront: back else: front
       let target = g.pieces.len.int32
-      g.pieces.add Piece(brush: brush)
-      var any = false
+      g.pieces.add Piece(brush: brush, group: group)
+      var kept: seq[Face]
+      var flat = false
       for fi in fs:
-        var c = g.clipPolygon(g.faces[fi], pl, keepFront)
+        var c = g.faces[fi]
+        if cut:
+          if g.onPlane(c, pl):
+            # A face on the plane bounds the side it faces away from.
+            let s = g.normal(c).dot(pl.n)
+            if (keepFront and s > 0) or (not keepFront and s < 0): continue
+            flat = true
+          else:
+            c = g.clipPolygon(c, pl, keepFront)
         if c.verts.len >= 3:
           c.piece = target
-          faces.add c
-          any = true
-      if any and brush:
-        # Cap: the solid's section by the clip plane.
-        let (planes, attrs) = g.brushPlanes(fs)
-        var all = planes
-        let capPlane = if keepFront: pl.flipped else: pl
-        all.add capPlane
-        var attrs2 = attrs
-        attrs2.add capAttr
-        for (i, poly) in solidFromPlanes(all):
-          if i == all.high:
-            var f = Face(texture: capAttr.texture, flags: capAttr.flags, scriptId: capAttr.scriptId,
-                         objectId: -1, piece: target)
-            for p in poly:
-              f.verts.add g.points.len.int32
-              g.points.add p
-              f.colors.add capAttr.color
-            g.mapNewFace(f, capAttr, densityOf(capAttr.texture))
-            faces.add f
+          kept.add c
+      if cut and brush and not flat:
+        let n = if keepFront: -pl.n else: pl.n
+        let poly = g.capPolygon(kept, pl, n)
+        if poly.len >= 3:
+          let like = g.faces[g.closestFace(fs, n)]
+          var attr = attrOf(like)
+          attr.frame = g.texFrame(like, densityOf(like.texture))
+          var f = Face(texture: attr.texture, flags: attr.flags, scriptId: attr.scriptId,
+                       objectId: like.objectId, piece: target)
+          for p in poly:
+            f.verts.add g.points.len.int32
+            g.points.add p
+            f.colors.add attr.color
+          g.mapNewFace(f, attr, densityOf(attr.texture))
+          kept.add f
+      faces.add kept
   g.faces = faces
   g.weld(0.01)
 
@@ -474,6 +573,7 @@ proc csgSubtract*(g: Geometry, minuends: seq[int32], subtrahends: seq[int32],
   ## Each minuend brush minus every subtrahend brush, as convex pieces. The
   ## subtrahends are kept. Returns the number of brushes made.
   let byPiece = g.pieceFaces
+  let group = if minuends.len > 0: g.pieces[minuends[0]].group else: 0'i32
   var current: seq[(seq[Plane], seq[FaceAttr])]
   for m in minuends: current.add g.solidOf(byPiece, m)
   for s in subtrahends:
@@ -498,7 +598,7 @@ proc csgSubtract*(g: Geometry, minuends: seq[int32], subtrahends: seq[int32],
     current = next
   g.removePieces(toHashSet(minuends))
   for (planes, attrs) in current:
-    if g.addSolid(planes, attrs, densityOf) >= 0: inc result
+    if g.addSolid(planes, attrs, densityOf, group) >= 0: inc result
 
 proc csgIntersect*(g: Geometry, pieces: seq[int32], densityOf: proc(tex: string): float32): bool =
   let byPiece = g.pieceFaces
@@ -509,8 +609,9 @@ proc csgIntersect*(g: Geometry, pieces: seq[int32], densityOf: proc(tex: string)
     planes.add p
     attrs.add a
   if solidFromPlanes(planes).len < 4: return false
+  let group = if pieces.len > 0: g.pieces[pieces[0]].group else: 0'i32
   g.removePieces(toHashSet(pieces))
-  g.addSolid(planes, attrs, densityOf) >= 0
+  g.addSolid(planes, attrs, densityOf, group) >= 0
 
 proc uniquePoints*(pts: seq[Vec3]): seq[Vec3] =
   for p in pts:
@@ -560,8 +661,9 @@ proc csgMerge*(g: Geometry, pieces: seq[int32], densityOf: proc(tex: string): fl
   if planes.len == 0: return false
   var attrs: seq[FaceAttr]
   for _ in planes: attrs.add attr
+  let group = if pieces.len > 0: g.pieces[pieces[0]].group else: 0'i32
   g.removePieces(toHashSet(pieces))
-  g.addSolid(planes, attrs, densityOf) >= 0
+  g.addSolid(planes, attrs, densityOf, group) >= 0
 
 # --- rebuilding brushes, keeping their texturing ------------------------------------------
 
@@ -573,8 +675,56 @@ type UVMap* = object
   p0*, e1*, e2*: Vec3
   uv0*, d1*, d2*: Vec2
   attr*: FaceAttr
+  poly*: seq[Vec3]               ## The face's corners and their vertex colors, so a
+  cols*: seq[array[4, uint8]]    ## rebuilt face keeps its baked light (colorAt)
+  anims*: seq[CornerAnim]        ## and the animation of corners that stay (animAt).
+  polyN*: Vec3
+
+proc uvMapOnly(g: Geometry, f: Face): UVMap
 
 proc uvMapOf*(g: Geometry, f: Face): UVMap =
+  result = g.uvMapOnly(f)
+  result.polyN = g.normal(f)
+  if f.colors.len == f.verts.len:
+    for v in f.verts: result.poly.add g.points[v]
+    result.cols = f.colors
+    if f.anims.len > 0:
+      for k in 0 ..< f.verts.len: result.anims.add f.animAt(k)
+
+proc animAt*(m: UVMap, p: Vec3): CornerAnim =
+  ## The animation of the old face's corner at p, if it had one there.
+  for k, q in m.poly:
+    if k < m.anims.len and (q - p).length < 0.01: return m.anims[k]
+
+proc colorAt*(m: UVMap, p: Vec3): array[4, uint8] =
+  ## The vertex color of the old face at p, projected onto its plane: linear
+  ## over the face's triangle fan inside it, the nearest edge point's outside.
+  if m.poly.len < 3: return m.attr.color
+  let n = m.polyN
+  let q = p - n * (p - m.poly[0]).dot(n)
+  proc mixc(a, b, c: array[4, uint8], wa, wb, wc: float32): array[4, uint8] =
+    for ch in 0 .. 3:
+      result[ch] = uint8(clamp(round(a[ch].float32 * wa + b[ch].float32 * wb + c[ch].float32 * wc), 0, 255))
+  for k in 1 ..< m.poly.len - 1:
+    let (a, b, c) = (m.poly[0], m.poly[k], m.poly[k + 1])
+    let area = (b - a).cross(c - a).dot(n)
+    if abs(area) < 1e-6: continue
+    let wa = (b - q).cross(c - q).dot(n) / area
+    let wb = (c - q).cross(a - q).dot(n) / area
+    let wc = 1 - wa - wb
+    if wa >= -1e-4 and wb >= -1e-4 and wc >= -1e-4:
+      return mixc(m.cols[0], m.cols[k], m.cols[k + 1], wa, wb, wc)
+  var best = Inf.float32
+  for k in 0 ..< m.poly.len:
+    let j = (k + 1) mod m.poly.len
+    let e = m.poly[j] - m.poly[k]
+    let t = if e.dot(e) < 1e-9: 0'f32 else: clamp((q - m.poly[k]).dot(e) / e.dot(e), 0, 1)
+    let d = (m.poly[k] + e * t - q).length
+    if d < best:
+      best = d
+      result = mixc(m.cols[k], m.cols[j], m.cols[j], 1 - t, t, 0)
+
+proc uvMapOnly(g: Geometry, f: Face): UVMap =
   result.attr = attrOf(f)
   result.n = g.normal(f)
   if f.verts.len < 3 or f.uvs.len != f.verts.len: return
@@ -659,7 +809,9 @@ proc replacePiece*(g: Geometry, pc: int32, planes: seq[Plane], maps: seq[UVMap],
     for p in poly:
       f.verts.add g.points.len.int32
       g.points.add p
-      f.colors.add m.attr.color
+      f.colors.add m.colorAt(p)
+      let an = m.animAt(p)
+      if an.mode != amNone: f.setAnim(f.verts.high, an)
     if m.ok and m.n.dot(planes[i].n) > 0.999:
       for p in poly: f.uvs.add m.mapUV(p)
     else:
@@ -692,6 +844,7 @@ proc csgHollow*(g: Geometry, pieces: seq[int32], thickness: float32,
   let byPiece = g.pieceFaces
   var solids: seq[(seq[Plane], seq[FaceAttr])]
   for pc in pieces: solids.add g.solidOf(byPiece, pc)
+  let group = if pieces.len > 0: g.pieces[pieces[0]].group else: 0'i32
   g.removePieces(toHashSet(pieces))
   for (planes, attrs) in solids:
     for i, pl in planes:
@@ -699,7 +852,7 @@ proc csgHollow*(g: Geometry, pieces: seq[int32], thickness: float32,
       walls.add Plane(n: -pl.n, d: -(pl.d - thickness))
       var a = attrs
       a.add attrs[i]
-      if g.addSolid(walls, a, densityOf) >= 0: inc result
+      if g.addSolid(walls, a, densityOf, group) >= 0: inc result
 
 # --- extrusion -------------------------------------------------------------------------------
 
@@ -738,6 +891,35 @@ proc objectMatrix*(pos, rotDeg: Vec3): Mat4 =
   let rz = rotateZ(-rotDeg.z.float32.degToRad)
   translate(pos) * rz * ry * rx
 
+proc objectRotation*(ex, ey, ez: Vec3): Vec3 =
+  ## The rotation objectMatrix would build for the basis (local X, Y, Z in
+  ## world space), in degrees; at ±90° about Y the X angle is taken as 0.
+  let sy = clamp(-ex.z.float64, -1.0, 1.0)
+  var x, z: float64
+  var y = arcsin(sy)
+  if abs(sy) < 0.999999:
+    x = arctan2(ey.z.float64, ez.z.float64)
+    z = arctan2(ex.y.float64, ex.x.float64)
+  else:
+    z = arctan2(-ey.x.float64, ey.y.float64)
+  # (x, y, z) and (x + 180°, 180° - y, z + 180°) are the same turn; keep the
+  # one with less X and Z, so a mirrored yaw reads as a yaw.
+  proc wrap(r: float64): float64 = r - 2 * PI * round(r / (2 * PI))
+  let (x2, y2, z2) = (wrap(x + PI), wrap(PI - y), wrap(z + PI))
+  if abs(x2) + abs(z2) < abs(x) + abs(z) - 1e-6: (x, y, z) = (x2, y2, z2)
+  # These are objectMatrix's own angles (objectRotation(axes of objectMatrix(r)) = r).
+  proc deg(r: float64): float32 = (round(r.radToDeg * 10000) / 10000).float32 + 0
+  vec3(deg(x), deg(y), deg(z))
+
+proc turnRotation*(rotDeg, axis: Vec3, deg: float32): Vec3 =
+  ## rotDeg after turning the object deg about a world axis (not its own), the
+  ## same way rotateAxis turns points.
+  let m = objectMatrix(vec3(0, 0, 0), rotDeg)
+  let o = vec3(0, 0, 0)
+  objectRotation(rotateAxis(m * vec3(1, 0, 0), o, axis, deg),
+                 rotateAxis(m * vec3(0, 1, 0), o, axis, deg),
+                 rotateAxis(m * vec3(0, 0, 1), o, axis, deg))
+
 proc moveObjectGeometry*(g: Geometry, objectId: int32, oldPos, oldRot, newPos, newRot: Vec3) =
   ## Moves the faces linked to an object along with it.
   let m = objectMatrix(newPos, newRot) * objectMatrix(oldPos, oldRot).inverse
@@ -751,3 +933,66 @@ proc moveObjectGeometry*(g: Geometry, objectId: int32, oldPos, oldRot, newPos, n
 proc objectFaces*(g: Geometry, objectId: int32): seq[int] =
   for i, f in g.faces:
     if f.objectId == objectId: result.add i
+
+proc joinEnds*(g: Geometry, a, b: seq[int]): string =
+  ## Joins two meshes end to end, the way StalwartXL's pipes (furniture 108 +
+  ## 109, 110 + 111) are joined: each mesh's end facing the other (its outermost
+  ## corners along the line between their centers) slides along that line onto
+  ## the plane halfway between them, and corners that then coincide become
+  ## shared. UVs stay, so the texture stretches with the mesh, as in the game.
+  ## Returns why it can't, or "" when joined.
+  proc center(g: Geometry, fs: seq[int]): Vec3 =
+    var lo = vec3(Inf.float32)
+    var hi = vec3(-Inf.float32)
+    for fi in fs:
+      for v in g.faces[fi].verts:
+        lo = min(lo, g.points[v])
+        hi = max(hi, g.points[v])
+    (lo + hi) / 2
+  var d = g.center(b) - g.center(a)
+  if d.length < Eps: return "the two have the same center"
+  d = d.normalize
+  # Nearly along an axis: exactly along it, so an end stays square to the axis.
+  if abs(d.x) >= 0.95: d = vec3(sgn(d.x).float32, 0, 0)
+  elif abs(d.y) >= 0.95: d = vec3(0, sgn(d.y).float32, 0)
+  elif abs(d.z) >= 0.95: d = vec3(0, 0, sgn(d.z).float32)
+  var all = toHashSet(a)
+  for fi in b: all.incl fi
+  # Only these two stretch; anything else touching their ends stays put.
+  g.detachPoints(all)
+  let pa = g.pointsOf(toHashSet(a))
+  let pb = g.pointsOf(toHashSet(b))
+  if (pa * pb).len > 0: return "they're already joined"
+  # A's end is its far side along d, B's its near side (s = -1 looks along -d).
+  # Returns the end's corners, how far out it is and how far the next corners are.
+  proc ends(g: Geometry, pts: HashSet[int32], s: float32): (seq[int32], float32, float32) =
+    var e: seq[int32]
+    var hi = -Inf.float32
+    var inner = -Inf.float32
+    for v in pts: hi = max(hi, s * g.points[v].dot(d))
+    for v in pts:
+      let p = s * g.points[v].dot(d)
+      if p >= hi - Eps: e.add v
+      else: inner = max(inner, p)
+    (e, hi, inner)
+  let (endA, outA, innerA) = g.ends(pa, 1)
+  let (endB, outBn, innerBn) = g.ends(pb, -1)
+  let outB = -outBn
+  let innerB = -innerBn
+  let m = (outA + outB) / 2
+  if m <= innerA + Eps or m >= innerB - Eps:
+    return "an end would have to pass through the rest of its mesh"
+  for v in endA: g.points[v] += d * (m - g.points[v].dot(d))
+  for v in endB: g.points[v] += d * (m - g.points[v].dot(d))
+  # Share the corners that met.
+  var remap: Table[int32, int32]
+  for v in endB:
+    for u in endA:
+      if (g.points[v] - g.points[u]).length <= Eps:
+        remap[v] = u
+        break
+  for fi in b:
+    for v in g.faces[fi].verts.mitems:
+      if v in remap: v = remap[v]
+  g.compact()
+  ""

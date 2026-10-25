@@ -9,7 +9,7 @@
 ## carry that id. Free-form fields say what they take and list the values
 ## other objects in the level use.
 
-import std/[os, strutils, tables, sets, algorithm, xmlparser, re, uri, bitops, times]
+import std/[os, strutils, tables, sets, algorithm, xmlparser, re, uri, bitops, times, sequtils]
 import levelobjects, presets
 
 type
@@ -21,6 +21,7 @@ type
   Catalog* = ref object
     level0: Table[string, seq[string]]   ## Level 0 instance names by tag ("ONCC" -> [...]).
     level0Read: bool
+    loops: seq[string]                   ## Level 0's ambients a Sound object plays (see isLoop).
     combat, melee: seq[(int, string)]    ## Level 0's combat / melee profiles: (id, name).
     projDir: string
     projNames: Table[string, seq[string]]
@@ -108,6 +109,16 @@ proc profiles(raw: string, cjbo: int, idFirst: bool): seq[(int, string)] =
       else: result.add (u32(raw, osd + 64).int32.int, cstr(raw, osd, 64))
     p += 4 + size
 
+proc isLoop(name, raw: string, at: int): bool =
+  ## Whether an ambient (its OSAm blob in the .raw: tag, size, version,
+  ## priority, flags) is one a Sound object plays: not music (atm_ and mus_,
+  ## which sound_music_start plays) and not PlayOnce (flag 2: dialogue,
+  ## cutscene effects and screams, which scripts play once).
+  let n = name.toLowerAscii
+  if n.startsWith("atm_") or n.startsWith("mus_"): return false
+  if at + 20 > raw.len or raw[at ..< at + 4] != "mASO": return false
+  (u32(raw, at + 16) and 2) == 0
+
 proc readLevel0(c: Catalog, gameData: string) =
   ## Instance names from level0_Final.dat's descriptors (20 bytes each from
   ## 0x40: tag, data offset, name offset, size, flags; flag 1 = unnamed).
@@ -121,6 +132,7 @@ proc readLevel0(c: Catalog, gameData: string) =
   let dataAt = u32(d, 0x20)
   let namesAt = u32(d, 0x28)
   var combatAt, meleeAt = -1
+  var ambients: seq[(string, int)]       # OSBD .amb names and where their data is.
   for i in 0 ..< count:
     let o = 0x40 + 20 * i
     if o + 20 > d.len: break
@@ -131,12 +143,17 @@ proc readLevel0(c: Catalog, gameData: string) =
     # A BINA instance's data: its id (8 bytes), then size and offset in the .raw.
     if name == "BINACJBOCombat": combatAt = dataAt + u32(d, o + 4) - 8
     elif name == "BINACJBOMelee Profile": meleeAt = dataAt + u32(d, o + 4) - 8
-  if combatAt >= 0 or meleeAt >= 0:
+    elif name.startsWith("OSBD") and name.endsWith(".amb"):
+      ambients.add (name[4 ..< ^4], dataAt + u32(d, o + 4) - 8)
+  if combatAt >= 0 or meleeAt >= 0 or ambients.len > 0:
     try:
       let raw = readFile(gameData / "level0_Final.raw")
       if combatAt >= 0: c.combat = profiles(raw, u32(d, combatAt + 12), false)
       if meleeAt >= 0: c.melee = profiles(raw, u32(d, meleeAt + 12), true)
+      for (name, at) in ambients:
+        if isLoop(name, raw, u32(d, at + 12)): c.loops.add name
     except IOError: discard
+  c.loops.sort(cmpIgnoreCase)
   for _, v in c.level0.mpairs: v.sort(cmpIgnoreCase)
 
 proc readProject(c: Catalog, projDir: string) =
@@ -193,6 +210,10 @@ proc names(c: Catalog, tag: string, prefix = "", suffix = ""): seq[string] =
         seen.incl v.toLowerAscii
         result.add v
   result.sort(cmpIgnoreCase)
+
+proc instanceNames*(c: Catalog, tag: string, prefix = "", suffix = ""): seq[string] =
+  ## names, for the Scripts panel's completion.
+  c.names(tag, prefix, suffix)
 
 # --- choices -----------------------------------------------------------------
 
@@ -341,7 +362,15 @@ proc choices*(c: Catalog, o: LevelObject, path, attr, value: string,
     cls.sort(cmpIgnoreCase)
     result = nameChoices(cls)
     fixed = false
-  of "SNDG OSD/Class": result = nameChoices(ambient)
+  of "SNDG OSD/Class":
+    # Level 0's looping ambients, then the project's own.
+    var seen = c.loops.mapIt(it.toLowerAscii).toHashSet
+    var own: seq[string]
+    for n in c.projNames.getOrDefault("OSBD"):
+      if n.endsWith(".amb") and n[0 ..< ^4].toLowerAscii notin seen:
+        seen.incl n[0 ..< ^4].toLowerAscii
+        own.add n[0 ..< ^4]
+    result = nameChoices(c.loops & own)
   of "NEUT OSD/Speech/Trigger", "NEUT OSD/Speech/Abort", "NEUT OSD/Speech/Enemy",
      "NEUT OSD/DialogLines/DialogLine/SpeechName":
     result = nameChoices(ambient, "silent")
@@ -353,7 +382,35 @@ proc choices*(c: Catalog, o: LevelObject, path, attr, value: string,
   of "TRGV OSD/ParentId": result = idChoices(objs, "TRGV", "OSD/TriggerVolumeId", "no parent")
   of "TRGV OSD/Scripts/Entry", "TRGV OSD/Scripts/Inside", "TRGV OSD/Scripts/Exit":
     result = scripts
+  # Character classes (classes.nim): links are written with their tag.
+  of "ONCC Variant": result = nameChoices(c.names("ONCV").mapIt("ONCV" & it))
+  of "ONCC BodySet": result = nameChoices(c.names("TRBS").mapIt("TRBS" & it))
+  of "ONCC BodyTextures": result = nameChoices(c.names("TRMA").mapIt("TRMA" & it))
+  of "ONCC Animations": result = nameChoices(c.names("TRAC").mapIt("TRAC" & it))
+  of "ONCC AimingScreens": result = nameChoices(c.names("TRSC").mapIt("TRSC" & it))
+  of "ONCC ShadowConstants/Texture": result = nameChoices(c.names("TXMP").mapIt("TXMP" & it))
+  of "WEAP RespawnTime", "PWRU RespawnTime":
+    result = @[hint("Seconds until it's back after a player takes it (multiplayer maps)"),
+               hint("Empty: Arklite's default (item_respawn, 30 s)"),
+               Choice(value: "0", note: "never")]
+    for v in [10, 20, 30, 45, 60, 90, 120]: result.add Choice(value: $v, note: "seconds")
   of "PATR OSD/ReturnToNearest": result = @[Choice(value: "0", note: "no"), Choice(value: "1", note: "yes")]
+  # Catwalk's lights (objtemplates.LightTags).
+  of "LITE OSD/Enabled", "SPOT OSD/Enabled", "SUNL OSD/Enabled", "LITE OSD/Shadows",
+     "SPOT OSD/Shadows", "SUNL OSD/Shadows":
+    result = @[Choice(value: "0", note: "off"), Choice(value: "1", note: "on")]
+  of "LITE OSD/Animation/Mode", "SPOT OSD/Animation/Mode", "SUNL OSD/Animation/Mode":
+    result = @[Choice(value: "Off", note: "steady"),
+               Choice(value: "Pulse", note: "to Color and back once per Period"),
+               Choice(value: "Flicker", note: "a random level every Period")]
+  of "LITE OSD/Animation/Interpolation", "SPOT OSD/Animation/Interpolation",
+     "SUNL OSD/Animation/Interpolation":
+    result = @[Choice(value: "Smooth", note: "eases in and out"), Choice(value: "Linear", note: "steady rate"),
+               Choice(value: "Step", note: "jumps at once")]
+  of "SPOT OSD/Softness":
+    result = @[hint("0: a hard edge; 1: fades from the middle of the cone")]
+    for v in ["0", "0.15", "0.3", "0.5", "1"]: result.add Choice(value: v)
+    fixed = false
   of "PATR OSD/Points/MovementMode .Mode": result = enumChoices(PatrolPathMovementMode)
   of "PATR OSD/Points/LockFacing .Facing": result = enumChoices(PatrolPathFacing)
   of "PATR OSD/Points/IgnorePlayer .Value": result = @[Choice(value: "Yes"), Choice(value: "No")]

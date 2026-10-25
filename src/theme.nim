@@ -53,3 +53,9 @@ const
   FontMain* = "Default"
   FontSmall* = "Small"
   FontTitle* = "Title"
+  FontMono* = "Mono"           ## the Scripts panel's hover help (its code is codeFont)
+  LogoHeight* = 56'f32  ## the welcome screen's logo, at uiScale 1
+
+proc codeFont*(px: int): string =
+  ## The Scripts editor's code font at one of CodeFontSizes (appstate.nim).
+  "Mono" & $px

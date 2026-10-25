@@ -30,10 +30,24 @@ type
 const
   BOM = "\xEF\xBB\xBF"
 
+  RespawnField* = "RespawnTime"
+    ## Catwalk's own element on weapons and power-ups (not OniSplit's): seconds until a taken
+    ## item comes back in a multiplayer map. Build strips it and lists it in level.ini
+    ## [respawn] for Arklite; empty means Arklite's default.
+  RespawnTags* = ["WEAP", "PWRU"]
+
+  MessageField* = "ActivationMessage"
+    ## Catwalk's own element on consoles: text the game shows (a console text page, like the
+    ## original data consoles) when the player uses the console, one page line per line.
+    ## Build strips it, packs the page as TxtC<consoleMessageName> and adds a Script event
+    ## running consoleMessageName from a generated BSL file.
+
+  EditorFields = [RespawnField, MessageField]
+
   TypeNames* = {
     "CHAR": "Character", "CONS": "Console", "DOOR": "Door", "FLAG": "Flag",
-    "FURN": "Furniture", "NEUT": "Neutral", "PART": "Particle", "PATR": "Patrol path",
-    "PWRU": "Power-up", "SNDG": "Sound", "TRGV": "Trigger volume", "TRIG": "Trigger",
+    "FURN": "Furniture", "LITE": "Point light", "NEUT": "Neutral", "PART": "Particle", "PATR": "Patrol path",
+    "PWRU": "Power-up", "SNDG": "Sound", "SPOT": "Spot light", "SUNL": "Directional light", "TRGV": "Trigger volume", "TRIG": "Trigger",
     "TURR": "Turret", "WEAP": "Weapon"}.toTable
 
 proc typeName*(tag: string): string = TypeNames.getOrDefault(tag, tag)
@@ -111,10 +125,14 @@ proc label*(o: LevelObject): string =
   of "FLAG": "flag " & o.node.xpath("OSD/FlagId").str
   else: typeName(o.tag) & " " & $o.id
 
-proc loadObjectFile*(path: string): (ObjectFile, seq[LevelObject]) =
+proc readXmlFile*(path: string): XmlNode =
+  ## An OniSplit XML file (it starts with a byte order mark).
   var data = readFile(path)
   if data.startsWith(BOM): data = data[BOM.len .. ^1]
-  let root = parseXml(data)
+  parseXml(data)
+
+proc loadObjectFile*(path: string): (ObjectFile, seq[LevelObject]) =
+  let root = readXmlFile(path)
   let f = ObjectFile(path: path, root: root, list: root.xpath("Objects"))
   var objs: seq[LevelObject]
   if f.list != nil:
@@ -127,6 +145,7 @@ proc loadObjectFile*(path: string): (ObjectFile, seq[LevelObject]) =
 
 proc saveTo*(f: ObjectFile, path: string) =
   ## Writes the file to path in the same shape OniSplit reads; dirty is unchanged.
+  createDir(path.parentDir)
   writeFile(path, xmlHeader & $f.root & "\n")
 
 proc save*(f: ObjectFile) =
@@ -143,7 +162,10 @@ proc loadObjects*(dir: string): (seq[ObjectFile], seq[LevelObject]) =
     result[1].add objs
 
 proc fields*(o: LevelObject): seq[ObjectField] =
-  ## Every editable leaf under the object's OSD, depth-first.
+  ## Every editable leaf under the object's OSD, depth-first. For a character
+  ## class (tag ONCC, classes.nim) every leaf of the class but its links to
+  ## the parts packed with it ("#3").
+  let isClass = o.tag == "ONCC"
   proc walk(n: XmlNode, prefix: string, acc: var seq[ObjectField]) =
     var total, seen: CountTable[string]
     for c in n:
@@ -161,14 +183,36 @@ proc fields*(o: LevelObject): seq[ObjectField] =
       for g in c:
         if g.kind == xnElement: hasChild = true
       if hasChild: walk(c, path, acc)
-      elif c.attrsLen == 0: acc.add ObjectField(path: path, value: c.innerText)
+      elif c.attrsLen == 0:
+        let v = c.innerText
+        if not (isClass and v.startsWith("#")): acc.add ObjectField(path: path, value: v)
+  if isClass:
+    walk(o.node, "", result)
+    return
   let osd = o.node.xpath("OSD")
   if osd != nil: walk(osd, "OSD", result)
   let flags = o.node.xpath("Header/Flags")
   if flags != nil: result.insert(ObjectField(path: "Header/Flags", value: flags.str), 0)
+  if o.tag in RespawnTags:
+    result.add ObjectField(path: RespawnField, value: o.node.xpath(RespawnField).str.strip)
+  if o.tag == "CONS":
+    result.add ObjectField(path: MessageField, value: o.node.xpath(MessageField).str.strip)
+
+proc removeChild(n: XmlNode, tag: string) =
+  for i in countdown(n.len - 1, 0):
+    if n[i].kind == xnElement and n[i].tag == tag: n.delete(i)
 
 proc setField*(o: LevelObject, f: ObjectField, value: string) =
   ## Sets a field by path. Repeated element names resolve to the first match.
+  if f.path in EditorFields and f.attr.len == 0:
+    # Missing until set; cleared, it goes away (Arklite's default, no message).
+    o.node.removeChild(f.path)
+    if value.strip.len > 0:
+      let e = newElement(f.path)
+      e.add newText(value.strip)
+      o.node.add e
+    o.file.dirty = true
+    return
   let n = o.node.xpath(f.path)
   if n == nil: return
   if f.attr.len > 0:
@@ -178,6 +222,42 @@ proc setField*(o: LevelObject, f: ObjectField, value: string) =
   o.file.dirty = true
 
 proc snapshot*(o: LevelObject): string = $o.node
+
+proc stripEditorFields*(f: ObjectFile): bool =
+  ## Removes Catwalk's own elements, which OniSplit doesn't read; true if there were any.
+  if f.list == nil: return
+  for n in f.list:
+    if n.kind != xnElement: continue
+    for tag in EditorFields:
+      if n.xpath(tag) != nil:
+        n.removeChild(tag)
+        result = true
+
+proc hasEditorFields*(xml: string): bool =
+  ## Whether an object list's text has any of Catwalk's own elements.
+  for tag in EditorFields:
+    if ("<" & tag & ">") in xml: return true
+
+proc consoleMessage*(o: LevelObject): string =
+  ## The text a console shows when used (MessageField); "" for none.
+  if o.tag == "CONS": o.node.xpath(MessageField).str.strip else: ""
+
+proc consoleMessageName*(o: LevelObject): string =
+  ## The BSL function and TxtC page (without the tag) of a console's message.
+  "cw_message_" & $o.id
+
+proc respawnEntry*(o: LevelObject): string =
+  ## level.ini [respawn] value for an item with its own respawn time: "WEAP x y z seconds",
+  ## or "" (Arklite's default).
+  if o.tag notin RespawnTags: return
+  let v = o.node.xpath(RespawnField).str.strip
+  if v.len == 0: return
+  var seconds: float
+  try: seconds = parseFloat(v)
+  except ValueError: return
+  if seconds < 0: return
+  o.tag & " " & o.node.xpath("Header/Position").str.splitWhitespace.join(" ") & " " &
+    fmtFloat(seconds.float32)
 
 proc restore*(o: LevelObject, xml: string) =
   ## Replaces the object's element with a previous snapshot.

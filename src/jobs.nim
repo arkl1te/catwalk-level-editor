@@ -13,6 +13,9 @@ type
     case kind: StepKind
     of skCommand:
       args: proc(): seq[string]    ## Evaluated when the step starts.
+      explain: proc(output: string): string
+        ## Optional: turns the failed command's output into a readable error
+        ## ("" keeps the generic one).
     of skAction:
       action: proc()               ## Raises to fail the job.
 
@@ -26,10 +29,12 @@ type
     error*: string
     logPath*: string
     process: Process
+    outputStart: int               ## Log size when the running command began.
     started*: float
 
-proc command*(label: string, args: proc(): seq[string]): Step =
-  Step(label: label, kind: skCommand, args: args)
+proc command*(label: string, args: proc(): seq[string],
+              explain: proc(output: string): string = nil): Step =
+  Step(label: label, kind: skCommand, args: args, explain: explain)
 
 proc action*(label: string, fn: proc()): Step =
   Step(label: label, kind: skAction, action: fn)
@@ -70,7 +75,15 @@ proc poll*(j: Job) =
       j.process.close()
       j.process = nil
       if code != 0:
-        j.fail(j.steps[j.current].label & " exited with code " & $code)
+        let s = j.steps[j.current]
+        var msg = ""
+        if s.explain != nil:
+          try:
+            let all = readFile(j.logPath)
+            msg = s.explain(all[min(j.outputStart, all.len) .. ^1])
+          except CatchableError: discard
+        j.fail(if msg.len > 0: s.label & ": " & msg
+               else: s.label & " exited with code " & $code)
         return
       inc j.current
       continue
@@ -92,6 +105,7 @@ proc poll*(j: Job) =
       try:
         let args = s.args()
         j.log "$ " & quoteShellCommand(args)
+        j.outputStart = int(getFileSize(j.logPath))
         let sh = quoteShellCommand(args) & " >> " & quoteShell(j.logPath) & " 2>&1"
         j.process = startProcess("/bin/sh", args = ["-c", sh], options = {})
         return

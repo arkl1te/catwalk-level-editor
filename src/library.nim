@@ -13,8 +13,12 @@
 ##   prefabs/*.json      geometry (Catwalk's geometry.json format)
 ##   images/*.tga        textures the prefabs use
 ##   oni/TXMP*.oni       level textures decals need (see presets.DecalTextures)
+##   doors/*.oni         level 0's DOOR classes and their OBAN animations, and every
+##                       door texture (class links, Texture1/2) from any level:
+##                       what OniSplit needs to build doors into a level
 ##   thumbs/*.png        entity browser previews (see thumbKey)
 ##   models/*.bin        the models previews show, for the map views (see objectModel)
+##   screens/*.tga       level 0's console screen textures, by lowercase name (see consoleScreen)
 
 import std/[os, json, xmltree, xmlparser, strutils, tables, sets, algorithm, times, uri]
 import vmath
@@ -30,9 +34,7 @@ const
     "state": "State building", "roof": "Rooftops", "dream_lab": "Dream lab",
     "neuro": "Neuro lab", "tctf_II": "TCTF headquarters II", "compound": "Mountain compound"}.toTable
 
-proc libraryDir*(): string =
-  let xdg = getEnv("XDG_DATA_HOME")
-  (if xdg.len > 0: xdg else: getHomeDir() / ".local/share") / "catwalk" / "library"
+export libraryDir, libraryDoorsDir   # in project: Build reads the library's door files
 
 proc envMappedImages(oniDir: string): HashSet[string] =
   ## The .tga names (lowercase, as -extract:dae writes them) of the textures
@@ -77,7 +79,7 @@ proc libraryBusyElsewhere*(): bool =
     pid != getCurrentProcessId() and dirExists("/proc/" & $pid)
   except CatchableError: false
 
-const PreviewVersion = 4   ## Bump when previews should be rendered again (2: particles, 3: models, 4: env-mapped textures opaque).
+const PreviewVersion = 6   ## Bump when previews should be rendered again (2: particles, 3: models, 4: env-mapped textures opaque, 5: doors/ for Build, 6: console screens).
 
 proc hasPreviews*(): bool =
   ## The library has a complete set of model previews from this version.
@@ -202,6 +204,31 @@ proc objectModel*(o: LevelObject): (bool, ObjectModel) =
           m.hi = max(m.hi, q)
   (true, m)
 
+proc screenDir*(): string = libraryDir() / "screens"
+
+proc screenImage(texture: string): string =
+  ## The image of a console screen texture ("" if the library has none).
+  if texture.len == 0: return ""
+  let f = screenDir() / texture.toLowerAscii & ".tga"
+  if fileExists(f): f else: ""
+
+proc consoleState(n: XmlNode): string =
+  ## The OSD texture field a console's screen shows when the level starts.
+  if "InitialActive" in n.xpath("OSD/Flags").str.splitWhitespace: "OSD/ActiveTexture"
+  else: "OSD/InactiveTexture"
+
+proc consoleScreen*(o: LevelObject): (bool, string, string) =
+  ## A console's screen: not level geometry but its class's ScreenGeometry,
+  ## which the game textures by state. The model in models/ (object space,
+  ## like the class's prefab) and the image of the texture the console's
+  ## starting state shows ("" if the library lacks it).
+  if o.tag != "CONS": return
+  let cls = o.node.xpath("OSD/Class").str.strip
+  if cls.len == 0: return
+  let path = modelDir() / fileSafe("CONS_" & cls & "_screen") & ".bin"
+  if not modelBounds(path)[0]: return
+  (true, path, screenImage(o.node.xpath(consoleState(o.node)).str.strip))
+
 type Collector = ref object
   entries: seq[JsonNode]
   seen: HashSet[string]           ## tag/class already taken
@@ -211,6 +238,8 @@ type Collector = ref object
   l0: string                      ## Level 0's export (door classes).
   doorWanted: Table[string, HashSet[string]]  ## Door preview textures not found yet: lower case -> names.
   doorTextures: seq[(string, string)]  ## This level's TXMP files door previews need, and texture names.
+  doorWantedOni: HashSet[string]  ## Door textures doors/ keeps (instanceKey names).
+  doorHaveOni: HashSet[string]    ## Those in doors/ already.
   previews: seq[Preset]           ## Presets to render previews of.
   particleTextures: seq[string]   ## TXMPs particle previews show.
   particleGeometry: seq[string]   ## M3GMs particle previews show.
@@ -218,14 +247,29 @@ type Collector = ref object
 proc classTexture(file: string): string =
   ## The texture a door class's model links to, by name ("" if unknown):
   ## the first "TXMP<name>" string in its .oni file.
-  if not fileExists(file): return
-  let data = readFile(file)
-  var i = data.find("TXMP")
-  if i < 0: return
-  i += 4
-  while i < data.len and data[i] in {' ' .. '~'}:
-    result.add data[i]
-    inc i
+  let links = oniLinks(file, "TXMP")
+  if links.len > 0: links[0] else: ""
+
+proc collectDoorOni(lib: Collector, oniDir: string) =
+  ## Copies the door textures doors/ still lacks from one exported level.
+  for f in walkFiles(oniDir / "TXMP*.oni"):
+    let k = instanceKey(f)
+    if k in lib.doorWantedOni and k notin lib.doorHaveOni:
+      copyFile(f, libraryDoorsDir() / f.extractFilename)
+      lib.doorHaveOni.incl k
+
+proc collectDoorClasses(lib: Collector) =
+  ## Level 0's DOOR classes, their animations and the textures they link, for
+  ## Build (OniSplit builds a level's doors from them; see project.doorSteps).
+  let src = lib.l0 / "oni"
+  createDir(libraryDoorsDir())
+  for f in walkFiles(src / "DOOR*.oni"):
+    copyFile(f, libraryDoorsDir() / f.extractFilename)
+    for a in oniLinks(f, "OBAN"):
+      let anim = src / "OBAN" & a & ".oni"
+      if fileExists(anim): copyFile(anim, libraryDoorsDir() / anim.extractFilename)
+    for t in oniLinks(f, "TXMP"): lib.doorWantedOni.incl ("TXMP" & t).toLowerAscii
+  lib.collectDoorOni(src)
 
 proc collectLevel(lib: Collector, work: string) =
   ## Takes every class not in the library yet from one exported level.
@@ -244,6 +288,10 @@ proc collectLevel(lib: Collector, work: string) =
     if not fileExists(path): continue
     let (_, objs) = loadObjectFile(path)
     for o in objs:
+      if tag == "DOOR":
+        for field in ["OSD/Texture1", "OSD/Texture2"]:
+          let t = o.node.xpath(field).str.strip
+          if t.len > 0: lib.doorWantedOni.incl ("TXMP" & t).toLowerAscii
       let cls = o.node.xpath("OSD/Class").str.strip
       if cls.len == 0 or (tag & "/" & cls) in lib.seen: continue
       let code = int32((GunkTypes[tag] shl 24) or (o.id and 0xffffff))
@@ -314,6 +362,7 @@ proc collectLevel(lib: Collector, work: string) =
       if key in lib.doorWanted:
         for t in lib.doorWanted[key]: lib.doorTextures.add (f, t)
         lib.doorWanted.del key
+  lib.collectDoorOni(work / "oni")
   # Decal textures this level has.
   for t in decalTextures():
     let src = work / "oni" / "TXMP" & t & ".oni"
@@ -355,6 +404,10 @@ proc previewMesh(p: Preset, l0: string): ThumbMesh =
   if p.prefab.len > 0:
     result.addGeometry(loadGeometry(p.prefabPath), proc(t: string): string =
       libraryImages() / t & ".tga")
+    if p.tag == "CONS" and p.xml.len > 0:
+      let n = parseXml(p.xml)
+      let screen = l0 / "classes" / "screens" / fileSafe(p.presetClass) & ".dae"
+      result.addDae(screen, image = screenImage(n.xpath(consoleState(n)).str.strip))
     return
   let cls = p.presetClass
   let models = l0 / "models"
@@ -439,7 +492,8 @@ proc libraryJob*(c: Config, logPath: string, onDone: proc()): Job =
       for d in [dir, libraryImages(), libraryOni(), work]: createDir(d)),
     # First: the levels' door objects need their classes.
     command("Reading level 0", proc(): seq[string] =
-      @[c.mono, c.oniSplit, "-export", l0 / "oni", c.gameData / "level0_Final.dat"])]
+      @[c.mono, c.oniSplit, "-export", l0 / "oni", c.gameData / "level0_Final.dat"]),
+    action("Collecting door classes", proc() = lib.collectDoorClasses())]
   for n in c.gameLevels: steps.add levelSteps(c, lib, n, work / $n)
   # Textures prefabs use that no level had as an image: level 0's.
   steps.add @[
@@ -519,7 +573,31 @@ proc libraryJob*(c: Config, logPath: string, onDone: proc()): Job =
       result = @[c.mono, c.oniSplit, "-extract:xml", l0 / "classes"]
       for p in lib.previews:
         let f = l0 / "oni" / p.tag & p.presetClass & ".oni"
-        if p.tag in ["TURR", "DOOR"] and fileExists(f): result.add f)]
+        if p.tag in ["TURR", "DOOR"] and fileExists(f): result.add f),
+    command("Extracting console screens", proc(): seq[string] =
+      @[c.mono, c.oniSplit, "-extract:xml", l0 / "consoles", l0 / "oni" / "CONS*.oni"]),
+    command("Extracting console screen textures", proc(): seq[string] =
+      @[c.mono, c.oniSplit, "-extract:tga", l0 / "screens", l0 / "oni" / "TXMP_CON_*.oni"]),
+    action("Saving console screens", proc() =
+      # Each class's ScreenGeometry, for the map views and the previews.
+      createDir(l0 / "classes" / "screens")
+      for f in walkFiles(l0 / "consoles" / "CONS*.xml"):
+        let cls = f.splitFile.name["CONS".len .. ^1]
+        var s = readFile(f)
+        if s.startsWith("\xEF\xBB\xBF"): s = s[3 .. ^1]
+        let dae = parseXml(s).child("CONS").xpath("ScreenGeometry").str.strip
+        if dae.len == 0: continue
+        copyFile(l0 / "consoles" / dae, l0 / "classes" / "screens" / fileSafe(cls) & ".dae")
+        var m: ThumbMesh
+        m.addDae(l0 / "consoles" / dae)
+        if not m.isEmpty:
+          m.saveModel(modelDir() / fileSafe("CONS_" & cls & "_screen") & ".bin", libraryDir(),
+                      modelDir() / "images", libraryImages())
+      # OniSplit names the images after the instance: TXMP_CON_WH1.tga.
+      createDir(screenDir())
+      for f in walkFiles(l0 / "screens" / "TXMP*.tga"):
+        let name = f.splitFile.name["TXMP".len .. ^1].toLowerAscii
+        moveFile(f, screenDir() / name & ".tga"))]
   for part in 0 ..< PreviewSteps:
     steps.add previewStep(lib, l0, part)
   steps.add @[

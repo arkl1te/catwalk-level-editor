@@ -27,8 +27,6 @@ type
     modelTexture*: string             ## DOOR: library image for its preview (the level's Texture1).
 
 const
-  GenericGroup* = "Generic"
-
   ## (group, class, label, team, weapon, flags). Characters start in the level
   ## (no NotInitiallyPresent), unlike the game's, which its scripts spawn.
   Characters = [
@@ -290,7 +288,9 @@ proc builtinPresets*(): seq[Preset] =
   for t in Templates.keys: tags.add t
   tags.sort(proc(x, y: string): int = cmp(typeName(x), typeName(y)))
   for t in tags:
-    result.add Preset(group: GenericGroup, label: typeName(t), tag: t, generic: true)
+    let c = categoryIndex(t)
+    result.add Preset(group: (if c < Categories.len: Categories[c].generic else: "Generic"),
+                      label: typeName(t), tag: t, generic: true)
   for (group, cls, label, team, weapon, flags) in Characters:
     result.add Preset(group: group, label: label, detail: cls, tag: "CHAR", fields: @[
       ("OSD/Class", cls), ("OSD/Team", team), ("OSD/Weapon", weapon), ("OSD/Flags", flags)])

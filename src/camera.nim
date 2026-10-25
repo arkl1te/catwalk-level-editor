@@ -127,6 +127,16 @@ proc rayBox*(r: Ray, lo, hi: Vec3): float32 =
   if tmax < 0: return -1
   max(tmin, 0)
 
+proc raySphere*(r: Ray, center: Vec3, radius: float32): float32 =
+  ## Distance along the ray (direction normalized) to a ball, or -1.
+  let oc = r.origin - center
+  let b = oc.dot(r.dir)
+  let disc = b * b - (oc.dot(oc) - radius * radius)
+  if disc < 0: return -1
+  let q = sqrt(disc)
+  if -b + q < 0: return -1
+  max(-b - q, 0)
+
 proc rayTriangle*(r: Ray, a, b, c: Vec3): float32 =
   ## Möller–Trumbore; distance or -1. Both faces hit.
   let e1 = b - a

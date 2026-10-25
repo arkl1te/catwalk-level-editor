@@ -36,7 +36,14 @@ const iconPaths = {
   "folder": (24, "M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z"),
   "plus": (24, "M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"),
   "eyedropper": (24, "M20.71 5.63l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-3.12 3.12-1.93-1.91-1.41 1.41 1.42 1.42L3 16.25V21h4.75l8.92-8.92 1.42 1.42 1.41-1.41-1.92-1.92 3.12-3.12c.4-.4.4-1.03.01-1.42zM6.92 19L5 17.08l8.06-8.06 1.92 1.92L6.92 19z"),
+  "code": (24, "M9.4 16.6L4.8 12l4.6-4.6L8 6l-6 6 6 6 1.4-1.4zm5.2 0l4.6-4.6-4.6-4.6L16 6l6 6-6 6-1.4-1.4z"),
   "close": (24, "M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"),
+  # View headers: realtime preview and render modes
+  "gamepad": (24, "M15 7.5V2H9v5.5l3 3 3-3zM7.5 9H2v6h5.5l3-3-3-3zM9 16.5V22h6v-5.5l-3-3-3 3zM16.5 9l-3 3 3 3H22V9h-5.5z"),
+  "bulb": (24, "M9 21c0 .55.45 1 1 1h4c.55 0 1-.45 1-1v-1H9v1zm3-19C8.14 2 5 5.14 5 9c0 2.38 1.19 4.47 3 5.74V17c0 .55.45 1 1 1h6c.55 0 1-.45 1-1v-2.26c1.81-1.27 3-3.36 3-5.74 0-3.86-3.14-7-7-7z"),
+  "image": (24, "M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"),
+  "solid": (24, "M12 2a10 10 0 1 1 0 20a10 10 0 1 1 0-20z"),
+  "contrast": (24, "M12 22c5.52 0 10-4.48 10-10S17.52 2 12 2 2 6.48 2 12s4.48 10 10 10zm1-17.93c3.94.49 7 3.85 7 7.93s-3.06 7.44-7 7.93V4.07z"),
   # Catwalk tools
   "cursor": (24, "M5 3l14 9.5-6.2 1.3 3.6 6.8-2.6 1.4-3.6-6.9L5 19z"),
   "cube": (24, "M12 2l9 5v10l-9 5-9-5V7zm0 2.3L5.6 7.9 12 11.5l6.4-3.6zM5 9.6v6.2l6 3.4V13zm14 0L13 13v6.2l6-3.4z"),
@@ -58,6 +65,22 @@ const iconPaths = {
   "hammer": (24, "M14.5 2.5l7 7-3 3-2-2-8.2 8.2-3-3L13.5 7.5l-2-2z"),
   "uvlock": (24, "M4 4h7v7H4zm2 2v3h3V6zm7-2h7v7h-7zm2 2v3h3V6zM4 13h7v7H4zm2 2v3h3v-3zm9-2a3 3 0 013 3v1h1v4h-8v-4h1v-1a3 3 0 013-3zm0 2a1 1 0 00-1 1v1h2v-1a1 1 0 00-1-1z"),
 }
+
+# Bold letters for the view headers' view kind buttons, as stroked center
+# lines, as tall as the other icons' pictures.
+const letterPaths = {
+  "letterT": "M5 4.75H19M12 4.75V21",
+  "letterF": "M7.75 3V21M7.75 4.75H18M7.75 12H16.5",
+  "letterS": "M17.5 6.5C16.5 5 14.5 4.5 12 4.5C9 4.5 6.75 5.8 6.75 8.25C6.75 13.5 17.25 10.5 17.25 15.75" &
+             "C17.25 18.2 15 19.5 12 19.5C9.5 19.5 7.5 19 6.5 17.5",
+  "letterP": "M7.75 21V4.75H13a3.75 3.75 0 0 1 0 7.5H7.75",
+}
+
+proc renderLetter(path: string, size: int): Image =
+  result = newImage(size, size)
+  let s = size.float32 / 24
+  result.strokePath(parsePath(path), color(1, 1, 1, 1), scale(vec2(s, s)), strokeWidth = 3.5,
+                    lineJoin = MiterJoin)
 
 proc renderIcon*(path: string, viewBox, size: int, color = color(1, 1, 1, 1)): Image =
   ## viewBox is the square (or 32x24 for wide icons) design grid width.
@@ -143,9 +166,11 @@ proc addIcons*(builder: AtlasBuilder, scale = 1'f32) =
   ## Names keep the nominal size; images are rasterized at size * scale.
   proc px(size: int): int = int(round(size.float32 * scale))
   for (name, spec) in iconPaths:
-    for size in [16, 20]:
+    for size in [16, 20, 32]:
       let img = renderIcon(spec[1], spec[0], px(size))
       discard builder.addImage(name & $size, img)
+  for (name, path) in letterPaths:
+    discard builder.addImage(name & "32", renderLetter(path, px(32)))
   discard builder.addImage("ring16", ringIcon(px(16)))
   for (_, spec) in mouseIcons:
     discard builder.addImage(spec[0], mouseIcon(px(16), spec[1], spec[2]))

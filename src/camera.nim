@@ -71,12 +71,15 @@ proc toPlane*(kind: ViewKind, p: Vec3): Vec2 =
   let a = kind.axes
   vec2(p.dot(a.right), p.dot(a.up))
 
-const Depth2D = 100000'f32
+const
+  Depth2D = 100000'f32
+  Near3D* = 2'f32
+  Far3D* = 40000'f32
 
 proc matrix*(c: Camera, w, h: float32): M4 =
   ## Projection * view for a viewport of w x h pixels.
   if c.kind == vk3D:
-    mul(perspectiveM(c.fovY, w / max(h, 1), 2, 40000), viewM(c.pos, c.forward, vec3(0, 1, 0)))
+    mul(perspectiveM(c.fovY, w / max(h, 1), Near3D, Far3D), viewM(c.pos, c.forward, vec3(0, 1, 0)))
   else:
     let a = c.kind.axes
     let hw = w / 2 / c.zoom

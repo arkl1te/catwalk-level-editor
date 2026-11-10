@@ -24,7 +24,7 @@ const Templates* = {
 <OSD><Class></Class><Particle></Particle></OSD></FURN>""",
   "LITE": """<LITE Id="0"><Header><Position>0 0 0</Position><Rotation>0 0 0</Rotation></Header>
 <OSD><Enabled>1</Enabled><Color>255 236 210</Color><Intensity>1</Intensity><Radius>200</Radius><Shadows>1</Shadows>
-<Animation><Mode>Off</Mode><Color>0 0 0</Color><Period>2</Period><Offset>0</Offset><Interpolation>Smooth</Interpolation><Min>0</Min><Max>1</Max><Stability>0</Stability><FaultLength>1</FaultLength></Animation></OSD></LITE>""",
+<Animation><Mode>Off</Mode><Color>0 0 0</Color><Period>2</Period><Offset>0</Offset><Seed>0</Seed><Interpolation>Smooth</Interpolation><Min>0</Min><Max>1</Max><Stability>0</Stability><FaultLength>1</FaultLength><SoundKind>Impact</SoundKind><Sound></Sound><SoundPitch>1</SoundPitch><SoundPitchMax></SoundPitchMax><SoundVolume>1</SoundVolume><SoundMinRadius>30</SoundMinRadius><SoundMaxRadius>120</SoundMaxRadius></Animation></OSD></LITE>""",
   "NEUT": """<NEUT Id="0"><Header><Flags></Flags><Position>0 0 0</Position><Rotation>0 0 0</Rotation></Header>
 <OSD><Name>new_neutral</Name><NeutralId>0</NeutralId><Flags></Flags>
 <Ranges><Trigger>100</Trigger><Talk>40</Talk><Follow>200</Follow><Enemy>70</Enemy></Ranges>
@@ -38,12 +38,12 @@ const Templates* = {
 <OSD><Class>Hypo</Class></OSD></PWRU>""",
   "SPOT": """<SPOT Id="0"><Header><Position>0 0 0</Position><Rotation>90 0 0</Rotation></Header>
 <OSD><Enabled>1</Enabled><Color>255 236 210</Color><Intensity>1.5</Intensity><Radius>300</Radius><Angle>60</Angle><Softness>0.3</Softness><Shadows>1</Shadows>
-<Animation><Mode>Off</Mode><Color>0 0 0</Color><Period>2</Period><Offset>0</Offset><Interpolation>Smooth</Interpolation><Min>0</Min><Max>1</Max><Stability>0</Stability><FaultLength>1</FaultLength></Animation></OSD></SPOT>""",
+<Animation><Mode>Off</Mode><Color>0 0 0</Color><Period>2</Period><Offset>0</Offset><Seed>0</Seed><Interpolation>Smooth</Interpolation><Min>0</Min><Max>1</Max><Stability>0</Stability><FaultLength>1</FaultLength><SoundKind>Impact</SoundKind><Sound></Sound><SoundPitch>1</SoundPitch><SoundPitchMax></SoundPitchMax><SoundVolume>1</SoundVolume><SoundMinRadius>30</SoundMinRadius><SoundMaxRadius>120</SoundMaxRadius></Animation></OSD></SPOT>""",
   "SNDG": """<SNDG Id="0"><Header><Flags></Flags><Position>0 0 0</Position><Rotation>0 0 0</Rotation></Header>
 <OSD><Class></Class><Box><Min>-20 -20 -20</Min><Max>20 20 20</Max></Box><Volume>1</Volume><Pitch>1</Pitch></OSD></SNDG>""",
   "SUNL": """<SUNL Id="0"><Header><Position>0 0 0</Position><Rotation>50 30 0</Rotation></Header>
 <OSD><Enabled>1</Enabled><Color>255 244 225</Color><Intensity>0.8</Intensity><Shadows>1</Shadows>
-<Animation><Mode>Off</Mode><Color>0 0 0</Color><Period>2</Period><Offset>0</Offset><Interpolation>Smooth</Interpolation><Min>0</Min><Max>1</Max><Stability>0</Stability><FaultLength>1</FaultLength></Animation></OSD></SUNL>""",
+<Animation><Mode>Off</Mode><Color>0 0 0</Color><Period>2</Period><Offset>0</Offset><Seed>0</Seed><Interpolation>Smooth</Interpolation><Min>0</Min><Max>1</Max><Stability>0</Stability><FaultLength>1</FaultLength><Sound></Sound><SoundPitch>1</SoundPitch><SoundPitchMax></SoundPitchMax><SoundVolume>1</SoundVolume></Animation></OSD></SUNL>""",
   "TRGV": """<TRGV Id="0"><Header><Flags></Flags><Position>0 0 0</Position><Rotation>0 0 0</Rotation></Header>
 <OSD><Name>new_trigger_volume</Name><Scripts><Entry></Entry><Inside></Inside><Exit></Exit></Scripts><Teams>1</Teams><Size>20 40 20</Size><TriggerVolumeId>0</TriggerVolumeId><ParentId>0</ParentId><Notes></Notes><Flags>PlayerOnly</Flags></OSD></TRGV>""",
   "TRIG": """<TRIG Id="0"><Header><Flags></Flags><Position>0 0 0</Position><Rotation>0 0 0</Rotation></Header>

@@ -1,18 +1,18 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
   <title>Catwalk</title>
-  <rect x="8" y="8" width="240" height="240" rx="52" ry="52" fill="#17161f"/>
+  <rect x="8" y="8" width="240" height="240" rx="52" ry="52" fill="#16191f"/>
   <g transform="translate(0 16)">
     <!-- Cat ears on the brush's top face -->
-    <polygon points="66,76 74,10 118,46" fill="#7d6ee0"/>
-    <polygon points="190,76 182,10 138,46" fill="#5a4db8"/>
-    <polygon points="78,64 81,30 104,50" fill="#e4dcff"/>
-    <polygon points="178,64 175,30 152,50" fill="#e4dcff"/>
+    <polygon points="66,76 74,10 118,46" fill="#6e94e0"/>
+    <polygon points="190,76 182,10 138,46" fill="#4d72b8"/>
+    <polygon points="78,64 81,30 104,50" fill="#dce4ff"/>
+    <polygon points="178,64 175,30 152,50" fill="#dce4ff"/>
     <!-- Isometric brush -->
-    <polygon points="52,84 128,128 128,216 52,172" fill="#7d6ee0"/>
-    <polygon points="204,84 128,128 128,216 204,172" fill="#5a4db8"/>
-    <polygon points="128,40 204,84 128,128 52,84" fill="#b5a8ff"/>
+    <polygon points="52,84 128,128 128,216 52,172" fill="#6e94e0"/>
+    <polygon points="204,84 128,128 128,216 204,172" fill="#4d72b8"/>
+    <polygon points="128,40 204,84 128,128 52,84" fill="#a8c4ff"/>
     <!-- Editor grid on the top face -->
-    <g stroke="#8b7cf0" stroke-width="3" stroke-linecap="round">
+    <g stroke="#7ca3f0" stroke-width="3" stroke-linecap="round">
       <line x1="71" y1="73" x2="147" y2="117"/>
       <line x1="90" y1="62" x2="166" y2="106"/>
       <line x1="109" y1="51" x2="185" y2="95"/>
@@ -21,7 +21,7 @@
       <line x1="71" y1="95" x2="147" y2="51"/>
     </g>
     <!-- Edge highlight -->
-    <polyline points="52,84 128,128 204,84" fill="none" stroke="#ece8ff" stroke-width="4" stroke-linejoin="round"/>
-    <line x1="128" y1="128" x2="128" y2="216" stroke="#ece8ff" stroke-width="4" opacity="0.5"/>
+    <polyline points="52,84 128,128 204,84" fill="none" stroke="#e8efff" stroke-width="4" stroke-linejoin="round"/>
+    <line x1="128" y1="128" x2="128" y2="216" stroke="#e8efff" stroke-width="4" opacity="0.5"/>
   </g>
 </svg>

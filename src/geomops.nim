@@ -30,11 +30,15 @@ type
     flags*: uint32
     scriptId*: int32
     color*: array[4, uint8]
+    untint*: array[3, uint8]  ## Face.untint: 255 minus the tint (zero = untinted).
     frame*: TexFrame          ## Mapping new faces get (World align when not ok).
 
   Side* = enum sideFront, sideBack, sideBoth
 
 const Eps = 0.01'f32
+
+proc pkey*(p: Vec3): string =
+  $int(round(p.x * 16)) & "," & $int(round(p.y * 16)) & "," & $int(round(p.z * 16))
 
 proc plane*(n: Vec3, p: Vec3): Plane = Plane(n: n, d: n.dot(p))
 proc dist*(pl: Plane, p: Vec3): float32 = pl.n.dot(p) - pl.d
@@ -48,7 +52,7 @@ proc defaultAttr*(texture: string): FaceAttr =
   FaceAttr(texture: texture, color: [200'u8, 200, 200, 255])
 
 proc attrOf*(f: Face): FaceAttr =
-  FaceAttr(texture: f.texture, flags: f.flags, scriptId: f.scriptId,
+  FaceAttr(texture: f.texture, flags: f.flags, scriptId: f.scriptId, untint: f.untint,
            color: (if f.colors.len > 0: f.colors[0] else: [200'u8, 200, 200, 255]))
 
 # --- texture projection -------------------------------------------------------------------
@@ -240,7 +244,7 @@ proc mapNewFace*(g: Geometry, f: var Face, attr: FaceAttr, density: float32) =
 proc addPolygon(g: Geometry, poly: seq[Vec3], attr: FaceAttr, piece: int32,
                 density: float32): int =
   var f = Face(texture: attr.texture, flags: attr.flags, scriptId: attr.scriptId,
-               objectId: -1, piece: piece)
+               untint: attr.untint, objectId: -1, piece: piece)
   for p in poly:
     f.verts.add g.points.len.int32
     g.points.add p
@@ -322,6 +326,60 @@ proc brushPlanes*(g: Geometry, faces: seq[int]): (seq[Plane], seq[FaceAttr]) =
       result[0].add pl
       result[1].add attrOf(g.faces[fi])
 
+proc cutFace*(g: Geometry, fi: int, pl: Plane): int =
+  ## Cuts face fi in two along pl, with the same look on both parts (new
+  ## corners take their UVs and colors between their edge's ends). fi keeps
+  ## the part behind pl and the other is added at the end; returns its index,
+  ## or -1 when pl doesn't cross the face. The piece stops being a brush: a
+  ## brush is rebuilt from its planes, which would merge the parts again.
+  result = -1
+  let f = g.faces[fi]
+  let n = f.verts.len
+  var side = newSeq[float32](n)
+  var (behind, ahead) = (false, false)
+  for k in 0 ..< n:
+    side[k] = pl.dist(g.points[f.verts[k]])
+    if side[k] < -Eps: behind = true
+    if side[k] > Eps: ahead = true
+  if not (behind and ahead): return
+  var parts: array[2, Face]
+  for p in parts.mitems:
+    p = f
+    p.verts.setLen 0
+    p.uvs.setLen 0
+    p.colors.setLen 0
+    p.anims.setLen 0
+    p.lightAnims.setLen 0
+  proc keep(p: var Face, k: int) =
+    p.verts.add f.verts[k]
+    p.uvs.add f.uvs[k]
+    p.colors.add f.colors[k]
+    p.anims.add f.animAt(k)
+    for l in f.lightAnims:
+      if l.corner == k: p.lightAnims.add LightLayer(corner: p.verts.high.int32, anim: l.anim)
+  for k in 0 ..< n:
+    let next = (k + 1) mod n
+    if side[k] <= Eps: parts[0].keep(k)
+    if side[k] >= -Eps: parts[1].keep(k)
+    if (side[k] < -Eps and side[next] > Eps) or (side[k] > Eps and side[next] < -Eps):
+      let t = side[k] / (side[k] - side[next])
+      let v = g.points.len.int32
+      g.points.add g.points[f.verts[k]] + (g.points[f.verts[next]] - g.points[f.verts[k]]) * t
+      var color: array[4, uint8]
+      for c in 0 .. 3:
+        color[c] = uint8(f.colors[k][c].float32 + (f.colors[next][c].float32 - f.colors[k][c].float32) * t)
+      for p in parts.mitems:
+        p.verts.add v
+        p.uvs.add f.uvs[k] + (f.uvs[next] - f.uvs[k]) * t
+        p.colors.add color
+        p.anims.add f.animAt(if t < 0.5: k else: next)
+  if not f.hasCornerData:
+    for p in parts.mitems: p.anims.setLen 0
+  g.faces[fi] = parts[0]
+  g.faces.add parts[1]
+  g.pieces[f.piece].brush = false
+  result = g.faces.high
+
 proc isConvexClosed*(g: Geometry, faces: seq[int]): bool =
   ## Every corner lies behind every face plane.
   if faces.len < 4: return false
@@ -365,6 +423,34 @@ proc detachPoints*(g: Geometry, faces: HashSet[int]) =
           copy[v] = g.points.len.int32
           g.points.add g.points[v]
         v = copy[v]
+
+proc separatePieces*(g: Geometry, pieces: seq[int32]): seq[int32] =
+  ## Takes the pieces apart: every face (objects' stay) becomes a piece of its
+  ## own, in the same group, with its own points. Returns all the pieces.
+  for pc in pieces:
+    result.add pc
+    g.pieces[pc].brush = false
+    var first = true
+    for fi in 0 ..< g.faces.len:
+      if g.faces[fi].piece != pc or g.faces[fi].objectId != -1: continue
+      if not first:
+        g.pieces.add Piece(group: g.pieces[pc].group)
+        g.faces[fi].piece = g.pieces.high.int32
+        result.add g.pieces.high.int32
+      first = false
+      g.detachPoints([fi].toHashSet)
+  g.bump()
+
+proc separateFaces*(g: Geometry, faces: seq[int]): int32 =
+  ## Moves the faces into one new piece of their own, with their own points,
+  ## in the first's group. The pieces they leave stop being brushes.
+  g.pieces.add Piece(group: g.pieces[g.faces[faces[0]].piece].group)
+  result = g.pieces.high.int32
+  for fi in faces:
+    g.pieces[g.faces[fi].piece].brush = false
+    g.faces[fi].piece = result
+  g.detachPoints(faces.toHashSet)
+  g.bump()
 
 proc pointsOf*(g: Geometry, faces: HashSet[int]): HashSet[int32] =
   for i in faces:
@@ -552,7 +638,7 @@ proc clipPieces*(g: Geometry, pieces: HashSet[int32], pl: Plane, side: Side,
           var attr = attrOf(like)
           attr.frame = g.texFrame(like, densityOf(like.texture))
           var f = Face(texture: attr.texture, flags: attr.flags, scriptId: attr.scriptId,
-                       objectId: like.objectId, piece: target)
+                       untint: attr.untint, objectId: like.objectId, piece: target)
           for p in poly:
             f.verts.add g.points.len.int32
             g.points.add p
@@ -647,23 +733,6 @@ proc hullPlanes*(points: seq[Vec3]): seq[Plane] =
             break
         if not dup: result.add pl
   if solidFromPlanes(result).len < 4: result.setLen 0
-
-proc csgMerge*(g: Geometry, pieces: seq[int32], densityOf: proc(tex: string): float32): bool =
-  ## Convex hull of the pieces' corners, as one brush.
-  let byPiece = g.pieceFaces
-  var pts: seq[Vec3]
-  var attr = defaultAttr("NONE")
-  for pc in pieces:
-    for fi in byPiece[pc]:
-      attr = attrOf(g.faces[fi])
-      for v in g.faces[fi].verts: pts.add g.points[v]
-  let planes = hullPlanes(pts)
-  if planes.len == 0: return false
-  var attrs: seq[FaceAttr]
-  for _ in planes: attrs.add attr
-  let group = if pieces.len > 0: g.pieces[pieces[0]].group else: 0'i32
-  g.removePieces(toHashSet(pieces))
-  g.addSolid(planes, attrs, densityOf, group) >= 0
 
 # --- rebuilding brushes, keeping their texturing ------------------------------------------
 
@@ -805,7 +874,7 @@ proc replacePiece*(g: Geometry, pc: int32, planes: seq[Plane], maps: seq[UVMap],
     let k = bestMap(maps, planes[i].n)
     let m = if k >= 0: maps[k] else: UVMap(attr: fallback)
     var f = Face(texture: m.attr.texture, flags: m.attr.flags, scriptId: m.attr.scriptId,
-                 objectId: -1, piece: pc)
+                 untint: m.attr.untint, objectId: -1, piece: pc)
     for p in poly:
       f.verts.add g.points.len.int32
       g.points.add p
@@ -837,6 +906,101 @@ proc addHull*(g: Geometry, points: seq[Vec3], attr: FaceAttr,
   if not g.replacePiece(result, planes, maps, densityOf, attr):
     g.pieces.setLen result
     return -1
+
+proc polyArea(g: Geometry, f: Face): float32 =
+  if f.verts.len < 3: return 0
+  let a = g.points[f.verts[0]]
+  var c = vec3(0, 0, 0)
+  for k in 1 ..< f.verts.len - 1:
+    c += (g.points[f.verts[k]] - a).cross(g.points[f.verts[k + 1]] - a)
+  c.length * 0.5
+
+proc hullLike*(g: Geometry, points: seq[Vec3], src: seq[int], densityOf: proc(tex: string): float32,
+               remove = initHashSet[int32](), group = 0'i32): int32 =
+  ## A new brush, the convex hull of points, whose faces look like the src
+  ## faces (TrenchBroom's Brush::cloneFaceAttributesFrom): each takes the
+  ## largest src face on its plane (facing the same way, else the other way:
+  ## cloneInvertedFaceAttributesFrom), whose mapping and vertex colors run on
+  ## across it unbroken; else the src face whose center is nearest its plane,
+  ## its alignment projected (WrapStyle::Projection). The remove pieces go.
+  ## -1, changing nothing, when the points span no volume.
+  if src.len == 0: return -1
+  let planes = hullPlanes(points)
+  if planes.len == 0: return -1
+  let polys = solidFromPlanes(planes)
+  if polys.len < 4: return -1
+  # Everything taken from the old faces before they go (compact renumbers points).
+  var maps: seq[UVMap]
+  var srcPlanes: seq[Plane]
+  var areas: seq[float32]
+  var centers: seq[Vec3]
+  var looks: seq[FaceAttr]
+  for fi in src:
+    let f = g.faces[fi]
+    maps.add g.uvMapOf(f)
+    srcPlanes.add g.facePlane(f)
+    areas.add g.polyArea(f)
+    centers.add g.center(f)
+    var attr = attrOf(f)
+    attr.frame = g.texFrame(f, densityOf(f.texture))
+    looks.add attr
+  if remove.len > 0: g.removePieces(remove)
+  let pc = g.pieces.len.int32
+  g.pieces.add Piece(brush: true, group: group)
+  for (i, poly) in polys:
+    let pl = planes[i]
+    var coplanar: seq[int]
+    for k, sp in srcPlanes:
+      if sp.n.dot(pl.n) > 0.9999 and abs(sp.d - pl.d) < Eps * 10: coplanar.add k
+    if coplanar.len == 0:
+      # Facing the other way (a face built against it, like a floor under it).
+      for k, sp in srcPlanes:
+        if sp.n.dot(pl.n) < -0.9999 and abs(sp.d + pl.d) < Eps * 10: coplanar.add k
+    var best = -1
+    if coplanar.len > 0:
+      for k in coplanar:
+        if best < 0 or areas[k] > areas[best]: best = k
+    else:
+      var bestD = Inf.float32
+      for k, c in centers:
+        let d = abs(pl.dist(c))
+        if d < bestD: (best, bestD) = (k, d)
+    let attr = looks[best]
+    var f = Face(texture: attr.texture, flags: attr.flags, scriptId: attr.scriptId,
+                 untint: attr.untint, objectId: -1, piece: pc)
+    for p in poly:
+      f.verts.add g.points.len.int32
+      g.points.add p
+      if coplanar.len > 0:
+        # Each corner keeps the light of the old face it came from.
+        var m = best
+        for k in coplanar:
+          for q in maps[k].poly:
+            if (q - p).length < 0.01: m = k
+        f.colors.add maps[m].colorAt(p)
+        let an = maps[m].animAt(p)
+        if an.mode != amNone: f.setAnim(f.verts.high, an)
+      else:
+        f.colors.add attr.color
+    if coplanar.len > 0 and maps[best].ok:
+      for p in poly: f.uvs.add maps[best].mapUV(p)
+    else:
+      g.mapNewFace(f, attr, densityOf(attr.texture))
+    g.faces.add f
+  g.weld(0.01)
+  pc
+
+proc csgMerge*(g: Geometry, pieces: seq[int32], densityOf: proc(tex: string): float32): bool =
+  ## Convex hull of the pieces' corners, as one brush that looks like them.
+  let byPiece = g.pieceFaces
+  var pts: seq[Vec3]
+  var src: seq[int]
+  for pc in pieces:
+    for fi in byPiece[pc]:
+      src.add fi
+      for v in g.faces[fi].verts: pts.add g.points[v]
+  if src.len == 0: return false
+  g.hullLike(pts, src, densityOf, toHashSet(pieces), g.pieces[pieces[0]].group) >= 0
 
 proc csgHollow*(g: Geometry, pieces: seq[int32], thickness: float32,
                 densityOf: proc(tex: string): float32): int =
@@ -996,3 +1160,192 @@ proc joinEnds*(g: Geometry, a, b: seq[int]): string =
       if v in remap: v = remap[v]
   g.compact()
   ""
+
+proc extendFace*(g: Geometry, fi: int, p, q, along: Vec3): int =
+  ## A new face on fi's plane, from fi's edge p..q (corners in fi's order) out
+  ## by along, looking like fi: its texture runs on across the edge and the
+  ## edge's corners keep their colors. Returns its index, or -1 without that
+  ## edge. The piece stops being a brush, whose faces come from its planes.
+  result = -1
+  let f = g.faces[fi]
+  for k in 0 ..< f.verts.len:
+    let next = (k + 1) mod f.verts.len
+    if pkey(g.points[f.verts[k]]) != pkey(p) or pkey(g.points[f.verts[next]]) != pkey(q): continue
+    let map = g.uvMapOf(f)
+    var n = Face(texture: f.texture, flags: f.flags, scriptId: f.scriptId, untint: f.untint,
+                 objectId: f.objectId, piece: f.piece)
+    let far = g.points.len.int32
+    g.points.add q + along
+    g.points.add p + along
+    n.verts = @[f.verts[next], f.verts[k], far + 1, far]
+    n.colors = @[f.colors[next], f.colors[k], f.colors[k], f.colors[next]]
+    for v in n.verts: n.uvs.add map.mapUV(g.points[v])
+    g.faces.add n
+    g.pieces[f.piece].brush = false
+    return g.faces.high
+
+proc clipFaces*(g: Geometry, faces: seq[int], pl: Plane, side: Side): seq[int] =
+  ## The clip tool on faces: cuts them by pl ("front" = where the normal
+  ## points) and keeps side's parts. Faces the plane misses stay when they're
+  ## on that side, or lie flat on it, and go when not. Returns what's left of
+  ## them. Pieces that lose a face stop being brushes, like cut ones.
+  var kept: seq[int]
+  var drop: HashSet[int]
+  proc place(fi: int, isFront: bool) =
+    if side == sideBoth or isFront == (side == sideFront): kept.add fi
+    else:
+      drop.incl fi
+      g.pieces[g.faces[fi].piece].brush = false
+  for fi in faces:
+    if g.faces[fi].objectId != -1:
+      kept.add fi
+      continue
+    var (ahead, behind) = (false, false)
+    for v in g.faces[fi].verts:
+      let d = pl.dist(g.points[v])
+      if d > Eps: ahead = true
+      elif d < -Eps: behind = true
+    if ahead and behind:
+      let made = g.cutFace(fi, pl)
+      place(fi, false)
+      place(made, true)
+    elif ahead or behind: place(fi, ahead)
+    else: kept.add fi
+  var faceList: seq[Face]
+  var newIndex = newSeq[int](g.faces.len)
+  for i, f in g.faces:
+    newIndex[i] = faceList.len
+    if i notin drop: faceList.add f
+  g.faces = faceList
+  g.compact(keepPieces = true)
+  g.bump()
+  kept.mapIt(newIndex[it])
+
+# --- joining faces on one plane ------------------------------------------------------------------
+
+proc joinedOutline(a, b: seq[Vec3], n: Vec3): seq[Vec3] =
+  ## The corners of the two convex polygons a and b (same plane, same winding)
+  ## as one, or nothing unless they share part of an edge, don't overlap and
+  ## make one convex polygon.
+  proc pieces(poly, other: seq[Vec3]): seq[(Vec3, Vec3)] =
+    ## poly's edges, cut at the corners of other that lie on them.
+    for k in 0 ..< poly.len:
+      let (p, q) = (poly[k], poly[(k + 1) mod poly.len])
+      let d = q - p
+      let len = d.length
+      if len < Eps: continue
+      var ts = @[0'f32, len]
+      for c in other:
+        let t = (c - p).dot(d) / len
+        if t > Eps and t < len - Eps and ((c - p) - d * (t / len)).length < Eps: ts.add t
+      ts.sort
+      for i in 0 ..< ts.high:
+        if ts[i + 1] - ts[i] > Eps: result.add (p + d * (ts[i] / len), p + d * (ts[i + 1] / len))
+  proc area(poly: seq[Vec3]): float32 =
+    var sum = vec3(0, 0, 0)
+    for k in 1 ..< poly.len - 1: sum += (poly[k] - poly[0]).cross(poly[k + 1] - poly[0])
+    sum.length / 2
+  let (ea, eb) = (pieces(a, b), pieces(b, a))
+  var next: Table[string, Vec3]
+  var shared = false
+  proc rest(mine, theirs: seq[(Vec3, Vec3)]): bool =
+    for (p, q) in mine:
+      var gone = false
+      for (r, s) in theirs:
+        if pkey(p) == pkey(s) and pkey(q) == pkey(r): gone = true
+      if gone: shared = true
+      elif pkey(p) in next: return false   # Two ways on: the polygons only touch at a corner.
+      else: next[pkey(p)] = q
+    true
+  if not rest(ea, eb) or not rest(eb, ea) or not shared or next.len == 0: return
+  # One loop, through every outline edge.
+  var loop: seq[Vec3]
+  let first = (if pkey(ea[0][0]) in next: ea[0][0] else: eb[0][0])
+  var at = first
+  for _ in 0 ..< next.len:
+    if pkey(at) notin next: return
+    loop.add at
+    at = next[pkey(at)]
+    if pkey(at) == pkey(first): break
+  if pkey(at) != pkey(first) or loop.len != next.len: return
+  # Corners on straight edges go; every turn has to go the same way.
+  for k in 0 ..< loop.len:
+    let (p, c, q) = (loop[(k + loop.len - 1) mod loop.len], loop[k], loop[(k + 1) mod loop.len])
+    let turn = (c - p).normalize.cross((q - c).normalize).dot(n)
+    if turn < -1e-3: return @[]
+    if turn > 1e-3: result.add c
+  if result.len < 3 or abs(area(result) - area(a) - area(b)) > 0.5:
+    result.setLen 0
+
+proc joinFaces*(g: Geometry, faces: seq[int]): seq[int] =
+  ## Joins faces lying on one plane, facing the same way, with the same flags,
+  ## script id and tint, wherever they make a convex polygon; returns the joined
+  ## faces' indices, empty when none could join. Each takes the look of its
+  ## largest face, whose mapping runs on across it. Corners keep their colors.
+  ## Pieces that gave up a face to another piece stop being brushes: a brush is
+  ## rebuilt from its planes, which would bring the face back.
+  type Part = object
+    pts: seq[Vec3]
+    members: seq[int]
+  var parts: seq[Part]
+  for fi in faces:
+    parts.add Part(pts: g.faces[fi].verts.mapIt(g.points[it]), members: @[fi])
+  let n = g.normal(g.faces[faces[0]])
+  var joined = true
+  while joined:
+    joined = false
+    block search:
+      for i in 0 ..< parts.len:
+        for j in i + 1 ..< parts.len:
+          let (fa, fb) = (g.faces[parts[i].members[0]], g.faces[parts[j].members[0]])
+          if fa.flags != fb.flags or fa.scriptId != fb.scriptId or fa.untint != fb.untint: continue
+          let pts = joinedOutline(parts[i].pts, parts[j].pts, n)
+          if pts.len == 0: continue
+          parts[i].pts = pts
+          parts[i].members.add parts[j].members
+          parts.delete j
+          joined = true
+          break search
+  var drop: HashSet[int]
+  var kept: seq[int]
+  for part in parts:
+    if part.members.len < 2: continue
+    var base = part.members[0]
+    for fi in part.members:
+      if g.polyArea(g.faces[fi]) > g.polyArea(g.faces[base]): base = fi
+    let map = g.uvMapOf(g.faces[base])
+    var f = g.faces[base]
+    let anims = part.members.anyIt(g.faces[it].hasCornerData)
+    f.verts.setLen 0
+    f.uvs.setLen 0
+    f.colors.setLen 0
+    f.anims.setLen 0
+    f.lightAnims.setLen 0
+    for p in part.pts:
+      block corner:
+        for fi in part.members:
+          let src = g.faces[fi]
+          for k, v in src.verts:
+            if pkey(g.points[v]) == pkey(p):
+              f.verts.add v
+              f.uvs.add map.mapUV(p)
+              f.colors.add src.colors[k]
+              if anims: f.anims.add src.animAt(k)
+              break corner
+    g.faces[base] = f
+    kept.add base
+    for fi in part.members:
+      if fi != base: drop.incl fi
+      if g.faces[fi].piece != f.piece or part.members.anyIt(g.faces[it].piece != f.piece):
+        g.pieces[g.faces[fi].piece].brush = false
+  if kept.len == 0: return
+  var faceList: seq[Face]
+  var newIndex = newSeq[int](g.faces.len)
+  for i, f in g.faces:
+    newIndex[i] = faceList.len
+    if i notin drop: faceList.add f
+  g.faces = faceList
+  g.compact(keepPieces = true)
+  g.bump()
+  kept.mapIt(newIndex[it])
+

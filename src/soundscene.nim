@@ -20,8 +20,13 @@
 ## - At most the ambient's Treshold of it play at once (0x4821f0). A PlayOnce
 ##   ambient that ends starts again (InSound first) on the next tick while it
 ##   can be heard; a Box sound then fades in again.
+##
+## A point or spot light's ambient plays as the Sound object Build makes for
+## it. With Arklite, a flickering light's only plays while the flicker fails
+## (vertex_light.c): out of a failure it's stopped as if out of range. Each
+## start picks a pitch from the light's SoundPitch..SoundPitchMax, as Arklite does.
 
-import std/[math, strutils, tables, times]
+import std/[math, sets, strutils, tables, times]
 import vmath
 import levelobjects, camera, geometry, geomops, render, lighting, music, appstate
 
@@ -45,9 +50,11 @@ type
     fade: BoxFade
     fadeStart: float          ## Tick the fade began.
     level: float              ## Box: the fade's volume, 0..1.
+    pitch: float              ## Picked when it starts (a light's pitch range).
 
 var
   sources: Table[pointer, Source]      ## By Sound object.
+  lightSounds: Table[pointer, LevelObject]   ## By light: the Sound object its ambient plays as (Build's).
   sceneAmbients: seq[string]           ## What the running scene's channels can play...
   infos: seq[AmbientInfo]              ## ...and their level 0 settings.
   owner: array[MaxSceneChannels, pointer]
@@ -142,14 +149,35 @@ proc updateSoundScene*(a: App) =
   # the scene with it added (every channel stops; the sounds start again).
   var objs: seq[LevelObject]
   var restart = false
-  for o in a.objects:
-    if o.tag != "SNDG" or not a.visible(o): continue
+  var lit: Table[pointer, LevelObject]
+  var quiet: HashSet[pointer]   # Light ambients whose flicker isn't failing now.
+  var pitches: Table[pointer, float]   # Light ambients: the pitch a start now gets.
+  let lightSeconds = float32(epochTime() - a.realtimeStart)   # the light animations' clock
+  for light in a.objects:
+    var o = light
+    if light.tag in AmbientLightTags:
+      # A point or spot light with an ambient plays it as the Sound object Build makes.
+      if not a.visible(light): continue
+      let n = lightAmbientSound(light.node, 0)
+      if n == nil: continue
+      o = lightSounds.getOrDefault(cast[pointer](light))
+      if o == nil: o = LevelObject(tag: "SNDG")
+      o.node = n
+      o.syncFromNode()
+      lit[cast[pointer](light)] = o
+      let m = light.lightAnim
+      if m.mode == amFlicker and not m.flickerFailing(lightSeconds): quiet.incl cast[pointer](o)
+      let low = clamp(light.numField("OSD/Animation/SoundPitch", 1), 0.1, 4).float32
+      let high = clamp(light.numField("OSD/Animation/SoundPitchMax", low), low, 4).float32
+      pitches[cast[pointer](o)] = m.ambientPitch(light.id, low, high, lightSeconds)
+    elif o.tag != "SNDG" or not a.visible(o): continue
     let cls = o.soundClass.toLowerAscii
     if cls.len == 0: continue
     objs.add o
     if cls notin sceneAmbients:
       sceneAmbients.add cls
       restart = true
+  lightSounds = lit
   if restart or sceneAmbients.len == 0:
     let keep = sceneAmbients
     stopSoundScene()
@@ -174,7 +202,7 @@ proc updateSoundScene*(a: App) =
   for o in objs:
     let key = cast[pointer](o)
     let amb = seen[key]
-    if key notin sources: sources[key] = Source(ambient: amb, channel: -1, occAt: NegInf)
+    if key notin sources: sources[key] = Source(ambient: amb, channel: -1, occAt: NegInf, pitch: 1)
     let info = infos[amb]
     let volume = o.numField("OSD/Pitch", 1)
     var s = sources[key]
@@ -182,10 +210,12 @@ proc updateSoundScene*(a: App) =
       let minR = o.numField("OSD/Sphere/MinRadius", 0)
       let maxR = o.numField("OSD/Sphere/MaxRadius", 0)
       let d = if cam == nil: Inf else: float((cam.pos - o.pos).length) / 3
-      if d > maxR:
+      if d > maxR or key in quiet:
         s.stopSource()
       else:
-        if s.channel < 0 and count[amb] < info.treshold and s.startSource(key): inc count[amb]
+        if s.channel < 0 and count[amb] < info.treshold and s.startSource(key):
+          inc count[amb]
+          s.pitch = pitches.getOrDefault(key, 1)
         if s.channel >= 0:
           if tick - s.occAt >= OcclusionTicks:
             s.occTarget = if a.geo == nil: 1.0 else: occlusion(a.geo, o.pos, cam.pos, info.minOcclusion)
@@ -204,7 +234,7 @@ proc updateSoundScene*(a: App) =
               let side = dot(to, cam[].right)
               if side > 0: pan = int(3333 - f * 3333)
               elif side < 0: pan = -int(3333 - f * 3333)
-          setChannel(s.channel, amb, s.instance, volume * s.occlusion * near, pan)
+          setChannel(s.channel, amb, s.instance, volume * s.occlusion * near, pan, s.pitch)
     else:
       let lo = parseVec3(o.node.xpath("OSD/Box/Min").str)
       let hi = parseVec3(o.node.xpath("OSD/Box/Max").str)

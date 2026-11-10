@@ -4,10 +4,12 @@
 
 import std/[os, strutils, strformat, math, tables, sets, algorithm, times, xmltree, xmlparser, sequtils, json, hashes]
 import silky, vmath, bumpy, pixie
-import ui, dialogs, menutree
+import ui, dialogs, menutree, pictures, skyconvert, skyfit
+import crashlog
 import collada, levelobjects, project, jobs, camera, render, geometry, geomops, objtemplates, tga,
   presets, library, fieldchoices, lighting, files, scriptedit, particlesim
-from music import setMusicVolume
+from music import setMusicVolume, setProjectAmbients
+import ambients
 
 const
   GridSizes* = [0.125'f32, 0.25, 0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256]
@@ -42,6 +44,7 @@ type
   PanelKind* = enum
     pkViewport = "Viewport", pkProperties = "Properties", pkClasses = "Classes", pkMap = "Map", pkFiles = "Files",
     pkEntityBrowser = "Entity Browser", pkTextureBrowser = "Texture Browser",
+    pkTextureCollections = "Texture Collections",
     pkConsole = "Console", pkIssues = "Issues", pkScripts = "Scripts"
 
   DockNode* = ref object
@@ -69,7 +72,7 @@ type
   DragKind* = enum
     dkNone, dkMove, dkBox, dkLook, dkOrbit, dkPan, dkDraw, dkHandles, dkExtrude, dkRotate,
     dkScale, dkClipPoint, dkPaint, dkPaintFaces, dkSlide, dkSplit, dkStamp, dkRotateCenter,
-    dkClipNew, dkAssembleRect, dkAssembleDup, dkPlace, dkPaintTexture, dkGizmo, dkBoxFace, dkSelRect, dkIgnore
+    dkClipNew, dkAssembleRect, dkAssembleDup, dkPlace, dkPaintTexture, dkGizmo, dkBoxFace, dkSelRect, dkCut, dkIgnore
 
   Press* = object
     ## A left button press in a map view: a click until it moves 2 pixels,
@@ -85,14 +88,24 @@ type
     ppLights = "Animated lighting", ppSounds = "Sound objects", ppMusic = "Level music",
     ppParticles = "Particles"
 
+  ClassXmlDraft* = object
+    text*, base*, error*: string       ## What's typed, the class it started from, why Apply refused it.
+
   CtxMenu* = object
     pos*: Vec2
     view*: int
     point*: Vec3                       ## World point under the right click.
     obj*: LevelObject                  ## Object under it, if any.
     face*: int                         ## Geometry face under it, or -1.
+    groupHit*: int32                   ## Group of the nearest unselected thing under it (0 = none).
     file*: string                      ## Opened in the Files tab: the path under it (else "").
     realtime*: bool                    ## Opened on a view's Realtime preview button.
+    gizmos*: bool                      ## Opened on a view's Gizmos button.
+    classAdd*: string                  ## Opened on a class's + button: "+" for an event, else the event an action goes in.
+    classParentsOf*: string            ## Opened on a breadcrumb: the class whose other parents it lists.
+    ambient*: string                   ## Opened on a sound list's ambient: duplicating or editing it.
+    ambientPick*: proc(v: string)      ## ...and that list's field, which a duplicate's name goes in.
+    texture*: string                   ## Opened on a Texture Browser tile: its texture.
 
   DragPiece* = object
     ## Extrude-type drags: one piece with faces on the dragged face's plane.
@@ -107,12 +120,17 @@ type
     help*: seq[Vec3]   ## Axes it was placed along (TrenchBroom's help vectors): pick
                        ## the plane's third point when there are only two.
 
+  TexHold* = seq[tuple[face: int, frame: TexFrame, uvs: seq[Vec2]]]
+    ## UV lock off: moved faces' texture mappings from before the move (holdTextures).
+
   Drag* = object
     kind*: DragKind
     view*: int
     startMouse*: Vec2
     startWorld*: Vec3
     lastDelta*: Vec3
+    built*: bool                       ## Extrude / slide / split / stamp / cut: geometry rebuilt yet...
+    builtMove*: Vec3                   ## ...for this move (it starts over from geoBefore, so unbaked).
     planeNormal*: Vec3
     vertical*: bool
     moved*: bool
@@ -133,7 +151,8 @@ type
     along*: float32                    ## Gizmo: where the press was along the arrow's line.
     onPlane*: bool                     ## Gizmo: a square was grabbed; axis is its plane's normal.
     face*: int                         ## Extrude / slide: the dragged face; box face: 0..5 (boxHandles).
-    boxStart*: seq[(Vec3, Vec3)]       ## Box faces: each of objs' Box Min and Max at the start.
+    boxStart*: seq[(Vec3, Vec3)]       ## Box faces: each of objs' volumeRange at the start.
+    boxBase*: seq[Vec3]                ## Box faces: each of objs' position at the start.
     free*: bool                        ## Box faces: some move along another axis than the grabbed
                                        ## one, so the drag moves freely (like the vertex tool's).
     rectMode*: int                     ## Rectangle select: 0 nothing touched yet, 1 sound face
@@ -151,6 +170,7 @@ type
     carryLocal*: Vec3                  ## Carry: the center in the camera's frame (right, up, forward).
     xform*: Affine                     ## Move / rotate / scale: what the drag did so far
                                        ## (groups moved whole take it at the end).
+    texHold*: TexHold                  ## Move / rotate / scale with UV lock off.
     placed*: LevelObject               ## Entity browser drag: the new object.
     preset*: Preset                    ## Entity browser drag: what it places.
     corners*: seq[Vec3]                ## Brush tool: polygon being stretched.
@@ -159,6 +179,10 @@ type
     wrap*: bool                        ## Alt+Shift+drag: alignment folds around edges.
     lastMouse*: Vec2
     extrudes*: seq[DragPiece]          ## Extrude / slide / split / stamp: every piece moved.
+    cutEdge*: (Vec3, Vec3)             ## Cut: the edge the cut leaves from (axis points away from it).
+    cutEdges*: seq[(int, Vec3, Vec3)]  ## Cut: selected faces' open edges extending with it, it first.
+    cutLines*: seq[(Vec3, Vec3)]       ## Cut: where it crosses the selected faces now.
+    cutOutward*: bool                  ## Cut: dragged out past the edge, so it extends the surface.
     snapLines*: seq[(Vec3, Vec3)]      ## Extrude / slide / split / stamp: (point, unit direction)
                                        ## each dragged corner travels, snapped onto grid planes.
 
@@ -180,6 +204,8 @@ type
     link*: string                      ## Link set; unique unless linked.
     xform*: Affine                     ## Where the group was moved, rotated or flipped to
                                        ## (the link set's contents map through it).
+    spin*: float32                     ## Seconds per turn around its center's vertical
+                                       ## axis in the game, negative = the other way; 0 = fixed.
     objs*: seq[LevelObject]            ## Member objects (pieces carry their group).
 
   CmdKind* = enum
@@ -196,6 +222,8 @@ type
     musicVolume*: float
     autoBake*: bool
     ambient*: array[3, int]
+    softShadows*: float
+    skyGrade*: SkyGrade
 
   VisState* = object
     ## What is hidden or locked.
@@ -209,6 +237,26 @@ type
     pieces*: HashSet[int32]
     faces*: HashSet[int]
     lastFace*: int
+
+  TexCollection* = object
+    ## Textures the Texture Browser can list: the level's own (id "level"), the
+    ## ones imported into the project ("custom"), or another game level's
+    ## ("game:<n>"), which are copied into the project when first used.
+    id*, name*: string
+    level*: int                  ## Game level; 0 for the project's own.
+    dir*: string
+    ready*: bool                 ## Its textures are there (a game level's are extracted first).
+    textures*: seq[string]
+
+  CamAnim* = object
+    ## The cameras gliding to a new place (animateCameras). Moving one by hand
+    ## leaves it where it is.
+    on*: bool
+    start*: float
+    target*: Vec3                ## The point they turn around.
+    fromCam*, toCam*, shown*: array[4, Camera]
+    fromFocus*, toFocus*, shownFocus*: Vec3
+    fromZoom*, toZoom*, shownZoom*: float32
 
   Cmd* = object
     label*: string
@@ -232,10 +280,14 @@ type
     time*: float
 
   Issue* = object
+    severity*: Severity
     text*: string
+    time*: float                    ## When it was first found.
     obj*: LevelObject
     face*: int
     corner*: int = -1               ## Corner of face to put under the vertex tool.
+    mcpPort*: bool                  ## The MCP server's port: clicking opens it in Settings.
+    report*: string                 ## A crash report: clicking shows it in its folder.
 
   FieldDrop* = object
     ## The Entity tab's list under the focused field: what the game accepts there.
@@ -252,6 +304,22 @@ type
     left*: float32                  ## How far left the list may grow (the field row's start).
     pick*: proc(v: string)          ## Commits a picked value.
     sound*: LevelObject             ## A Sound object's Class: rows get a preview button.
+    soundField*: bool               ## A class's sound: the same, played at full volume.
+    impulse*: bool                  ## That sound is an impulse.
+    ambients*: bool                 ## It lists ambients: a row's right click can duplicate one.
+    command*: proc()                ## Runs its command row (Import sound...).
+
+  AmbientEdit* = ref object
+    ## The ambient sound editor (File > Import > New ambient sound, File > Ambient sounds,
+    ## or Duplicate as new ambient).
+    amb*: CustomAmbient
+    original*: string               ## The project's ambient being edited ("" = a new one).
+    track*: AmbTrack                ## The track whose sounds show.
+    addText*: string                ## The Add sound field.
+    error*: string
+    scroll*: float32
+    pick*: proc(v: string)          ## The field it was opened from: gets a new ambient's name on Save.
+    confirmDelete*: bool
 
   PieMenu* = object
     ## The render-mode pie (hold Z), after Blender's pie menus (pie.nim).
@@ -263,6 +331,9 @@ type
     dragStyle*: bool                ## The mouse moved since it opened: releasing Z confirms.
     keyLock*: bool                  ## Closed with Z still down: it can't open again until Z comes up.
     hover*: int                     ## Item under the cursor's direction, -1 = none (in the center).
+
+  NewKind* = enum           ## What the welcome screen's Create makes.
+    nkScratch, nkCopy, nkPreview
 
   App* = ref object
     window*: Window
@@ -278,6 +349,7 @@ type
     textures*: seq[string]          ## Texture names available (from env/images).
     thumbsLoaded*: bool
     texSizes*: Table[string, (int, int)]  ## Texture name -> width, height (filled with the thumbnails).
+    texAlpha*: Table[string, bool]  ## Texture name -> has see-through pixels (filled with the thumbnails).
     densities*: Table[string, float32]
     views*: array[4, ViewPane]
     layout*: PaneLayout
@@ -301,7 +373,7 @@ type
     selFaces*: HashSet[int]         ## Face selection (Shift+click).
     lastFace*: int                  ## Face clicked last; the Face tab shows it.
     selHandles*: HashSet[string]    ## Vertex/edge/face tool handles (by position key).
-    selBoxFaces*: seq[tuple[obj: LevelObject, face: int]]  ## Selected sound volume face handles.
+    selBoxFaces*: seq[tuple[obj: LevelObject, face: int]]  ## Selected volume face handles.
     clipPoints*: seq[ClipPoint]
     clipFace*: seq[Vec3]            ## Clip along a double-clicked face: its corners (else empty).
     clipSide*: Side
@@ -310,7 +382,14 @@ type
     dockDragging*: bool             ## That tab is being dragged to another place.
     viewsArea*: Rect                ## The map views' area this frame (empty: Viewport not shown).
     log*: seq[LogLine]
+    logDropped*: int                ## Lines trimmed off the top: a selection counts from the first ever.
+    logAnchor*, logCaret*: (int, int)  ## Console selection: (line + logDropped, byte), caret moving.
+    logWordStart*, logWord*: (int, int)  ## Double-click: the word's two ends.
+    logDrag*: int                   ## The press selecting: its click count, else 0.
+    logPressAt*: Vec2               ## Where it started.
+    logLink*: (int, int)            ## A face link under that press (face, corner); face -1: none.
     issues*: seq[Issue]
+    issuesTime*: float              ## When findIssues last ran (0: never).
     undoStack*, redoStack*: seq[Cmd]
     cleanAt*: int
     selRecorded*: SelState          ## Selection as of the last undo step (recordSelection).
@@ -325,21 +404,37 @@ type
     menuOpenedAt*: float            ## When the open menus opened, else 0.
     focusLostAt*: float             ## When the window lost focus, else 0.
     settingsOpen*: bool
-    optionsOpen*: bool              ## View > Options is up; it edits settingsEdit too.
+    mcpPortIssue*: string           ## Why the MCP server's port can't be used ("" = it can).
+    crashReport*: string            ## Report of a crash in an earlier run, until the next launch.
+    settingsPortMark*: bool         ## Settings outlines the port field (the issue was clicked).
+    settingsSaved*: bool            ## Saved this frame: the MCP server follows (catwalk.nim).
+    setupWin*: Window               ## Setup window (setupwin.nim): where Oni is, asked on the first run.
+    setupSk*: Silky
+    setupUi*: Ui
+    setupAe*, setupGame*: string    ## Its fields.
+    setupNote*: string              ## What Auto-detect found, or why Save refused.
+    setupNoteBad*: bool
+    mcpForced*: bool                ## --mcp-server: the server runs whatever the settings say.
+    afterFrame*: seq[proc()]        ## Run once the views are drawn, before the buffers swap.
     pie*: PieMenu                   ## Render-mode pie menu (hold Z over the views).
     realtime*: bool                 ## Realtime preview: Sound objects play, light animations run.
     realtimeStart*: float           ## epochTime when it was turned on (the animations' clock).
     previewParts*: set[PreviewPart] ## What it plays (lights and sounds by default; never empty).
-    previewSoundVolume*: float      ## Its Sound objects' volume (Oni's 0..1; not the level's).
+    previewSoundVolume*: float      ## Its Sound objects' and the sound fields' previews' volume (Oni's 0..1; not the level's).
     previewMusicVolume*: float      ## Its level music's volume (Oni's 0..1; not the level's).
     realtimeMusic*: string          ## The level music it started ("" = none).
     particleSim*: ParticleSim       ## Its particles (particlesim.nim), while they're on.
-    particleKey*: string            ## The Particle objects they were started from.
+    particleRestart*: bool          ## Start them all over next frame.
     particleClock*: float           ## epochTime of their last step.
+    particlePlaying*: HashSet[SourceId]  ## Objects played from the particle panel: they run without Realtime preview.
+    particlePlayNext*: seq[SourceId]     ## Play pressed: for updateParticles.
+    particleHaltNext*: seq[SourceId]     ## Stop pressed: for updateParticles.
+    particleLoop*: bool                  ## The panel's Loop.
     particleAutoBuild*: bool        ## Level 0's particles were extracted for it.
     particleLevelJob*: string       ## The oni folder whose decal textures were looked for.
     dupFlashAt*: float              ## When Ctrl+D last duplicated in place: the selection's lines flash white.
     sceneKey*: string               ## Realtime sound: "" (off), "extracting" (level 0's sounds) or "playing".
+    windowTitle*: string            ## What updateWindowTitle last set.
     savePrompt*: proc()             ## Unsaved-changes prompt is up; runs this after Yes or No.
     quitConfirmed*: bool            ## The prompt (or a clean project) allowed the window to close.
     settingsEdit*: Config           ## The settings dialog's copy; the views preview it.
@@ -347,6 +442,7 @@ type
     settingsFly*: float32           ## The dialog's copy of flySpeed.
     newName*: string
     newLevel*: int
+    newKind*: NewKind               ## Welcome screen: from scratch, a copy of game level newLevel or a preview of it.
     newTexLevel*: int               ## New empty level: textures from this game level (0 = all).
     newSky*: string                 ## New empty level: sky ("" = none).
     dialog*: Dialog
@@ -366,6 +462,8 @@ type
     brushHeight*: float             ## Depth of a brush drawn in 2D before anything was selected.
     clipboard*: seq[string]
     clipboardGeo*: Geometry
+    faceClip*: FaceAttr               ## Ctrl+C with faces selected: the last one's look, for Ctrl+Shift+V.
+    hasFaceClip*: bool
     lastTime*: float
     texFrames*: Table[int, TexFrame] ## Face tab: selected faces' texture mappings,
     texFramesFor*: tuple[geo: Geometry, version: int, faces: seq[int]]  ## valid for this geometry and selection.
@@ -385,6 +483,7 @@ type
     lastSel*: tuple[ok: bool, lo, hi: Vec3]  ## Bounds of the latest selection (new brush depth).
     extrudeHover*: int              ## Face Shift+drag would extrude, or -1.
     extrudeHoverFaces*: seq[int]    ## It and the selection's other faces on its plane.
+    cutHover*: seq[(int, Vec3, Vec3)] ## The edges Ctrl+Shift+drag would cut from or extend.
     hoverHandle*: string
     assemblePoints*: seq[Vec3]      ## Brush tool points.
     rotCenter*: Vec3
@@ -397,6 +496,8 @@ type
     shapeSteps*: float
     splitX*, splitY*: float32       ## Map view dividers (fractions).
     entityBrowserH*: float32        ## Classes page: the class list's height.
+    classListFolded*: bool          ## Classes page: the class list is down to its title.
+    classFolded*: HashSet[string]   ## Classes page: folded headings ("c:" or "p:" and the path), for every class.
     splitDrag*: string              ## Divider being dragged.
     splitGrab*: float32
     hintScroll*: float32
@@ -412,6 +513,7 @@ type
     filesCursor*: int
     frameNo*: int
     texUsedOnly*: bool
+    texAlphaOnly*: bool             ## Texture Browser: only textures with see-through pixels.
     texThumb*: float32              ## Texture browser tile size (pixels); Ctrl+wheel zooms it.
     codeFontSize*: int              ## Scripts editor text size (one of CodeFontSizes); Ctrl+wheel zooms it.
     showObjectNames*: bool
@@ -421,6 +523,7 @@ type
     soundObj*: LevelObject          ## Sound object whose ambient the preview plays.
     soundClass*: string             ## soundObj's Class when its preview started or last followed it.
     drop*: FieldDrop
+    soundImportPick*: proc(v: string)   ## The sound field whose Import sound... dialog is open.
     browserOpen*: HashSet[string]   ## Entity browser: expanded groups.
     entityFilter*: string
     entityPreview*: float           ## Entity browser preview size: 0 = list, up to 1.
@@ -430,8 +533,16 @@ type
     skyAutoBuild*: bool             ## The sky images were extracted for the 3D view.
     fieldFilter*: string            ## Entity tab: only the fields matching it show.
     classFilter*: string            ## Classes page: only the classes matching it show.
+    ctxPending*: bool               ## ctx is set: its menu opens after this frame's menu update.
+    classXml*: bool                 ## Classes page: the open class shows as its XML.
+    classXmlDrafts*: Table[string, ClassXmlDraft]   ## The XML view's text by class, until applied.
     classFieldFilter*: string       ## Classes page: only the class fields matching it show.
-    className*: string              ## Classes page: the class shown ("" = none).
+    className*: string              ## Classes page: the class shown ("" = none); a particle class has ParticlePrefix.
+    classParticles*: bool           ## Classes page: the Particles side is up.
+    classOther*: string             ## The class shown on the other side.
+    particleClasses*: seq[string]   ## Classes page: level 0's particle classes.
+    particleEditStamp*: (int, int, int)  ## The undo state particleSim's edited classes are from.
+    particleEditKey*: string        ## Those classes' XML.
     classFor*: LevelObject          ## The character whose class the page followed last.
     classes*: Table[string, LevelObject]  ## Classes opened since the project was (undo points at them).
     classOrig*: Table[string, string]     ## Level 0's version of each of them (snapshot).
@@ -439,8 +550,13 @@ type
     classOnDiskRead*: bool
     classMarks*: HashSet[string]    ## Edited classes as of classMarkStamp.
     classMarkStamp*: (int, int, int)
+    classTrail*: seq[string]        ## Classes page: the open particle class's ancestors, outermost first.
+    level0Spawns*: Table[string, seq[string]]  ## What level 0's particle classes spawn (read once).
+    classParentMap*: Table[string, seq[string]]  ## Every particle class's parents as of classParentStamp.
+    classParentStamp*: (int, int, int)
     classText*: Table[string, string]
     classTextFor*: LevelObject
+    classAsText*: HashSet[string]   ## Color fields shown as text, to name a variable.
     classScroll*, classListScroll*: float32
     classCursor*: int
     classAutoBuild*: bool           ## Level 0's classes were extracted (or tried) unasked.
@@ -454,8 +570,37 @@ type
     linkSigs*: Table[int32, LinkSig] ## Linked groups as of the last sync.
     namePrompt*: proc(name: string) ## Group name prompt is up; runs this after OK.
     namePromptTitle*, namePromptText*: string
+    skyImportDir*: string           ## The sky folder popup is up for this folder ("" = closed).
+    skyImportFiles*: seq[string]    ## Its pictures.
+    skyImportSides*: seq[int]       ## Index into SkySides per picture, -1 = not used.
+    skyImportTurns*: seq[int]       ## Quarter turns clockwise per picture, -1 = from the edges.
+    skyImportFit*: SkyFit           ## Their edges, nil when one couldn't be read.
+    skyImportScroll*: float32
+    skyConvertOpen*: bool           ## Run > Add-Ons > Skybox Converter is up.
+    ambientEdit*: AmbientEdit       ## The ambient sound editor, nil when closed.
+    skyConvertFile*: string         ## Its source picture.
+    skyConvertKind*: SkySource
+    skyConvertUse*: bool            ## Its Use skybox toggle.
+    skyConvertError*: string
+    skyConvertShown*: string        ## The picture the preview was last looked up for.
+    skyPreviews*: Table[string, tuple[w, h: int, srcW, srcH: int]]
+      ## Picture path -> preview (in pixels on screen) and picture sizes; the preview is
+      ## atlas entry "skysrc:<path>".
     scripts*: ScriptEditor          ## Scripts panel: open script files and its state (scriptpanel.nim).
     mapReveal*: LevelObject         ## The Map tab scrolls to this object's row next frame.
+    mapSeen*: SelState              ## Selection as of the Map tab's last frame: a change means
+                                    ## it was made elsewhere, and the tab jumps to it.
+    groupPicked*: int32             ## Group whose row was clicked in the Map tab (Properties shows it).
+    groupNameText*: string          ## Properties' group name while it's typed.
+    groupSpinText*: string          ## Properties' group spin while it's typed.
+    camAnim*: CamAnim
+    texCollections*: seq[TexCollection]  ## Every collection there is (refreshCollections).
+    texGroup*: bool                 ## Texture Browser: headed by collection (TrenchBroom's Group).
+    collAvailable*, collEnabled*: HashSet[string]  ## Texture Collections: selected rows.
+    collScroll*: array[2, float32]  ## ...and their lists' scroll.
+    showDirections*: bool           ## Entities show where they point.
+    showGizmos*: bool               ## Entities draw their gizmos (boxes, light shapes, arrows, volumes).
+    gizmoHidden*: HashSet[string]   ## Object types left out of them (right click the Gizmos button).
 
 # --- basics -------------------------------------------------------------------------------
 
@@ -473,7 +618,10 @@ proc snapV*(a: App, v: Vec3): Vec3 =
 
 proc say*(a: App, msg: string, error = false) =
   a.log.add LogLine(text: msg, error: error, time: epochTime())
-  if a.log.len > 2000: a.log.delete(0)
+  logLine(msg, error)
+  if a.log.len > 2000:
+    a.log.delete(0)
+    inc a.logDropped
 
 proc busy*(a: App): bool = a.job != nil and a.job.state == jsRunning
 
@@ -500,7 +648,9 @@ proc defaultFov*(a: App): float32 =
   ## The 3D view's field of view from the preferences (radians).
   a.cfg.fov.float32.degToRad
 
-proc modalOpen*(a: App): bool = a.settingsOpen or a.optionsOpen or a.savePrompt != nil or a.namePrompt != nil
+proc setupOpen*(a: App): bool = a.setupWin != nil and a.setupWin.visible
+
+proc modalOpen*(a: App): bool = a.setupOpen or a.settingsOpen or a.savePrompt != nil or a.namePrompt != nil or a.skyConvertOpen or a.skyImportDir.len > 0 or a.ambientEdit != nil
 
 proc toggleRealtime*(a: App) =
   ## Realtime preview: Sound objects play (panels.updateRealtime) and the
@@ -516,9 +666,18 @@ proc togglePreviewPart*(a: App, p: PreviewPart) =
     a.previewParts = {ppLights}
     if a.realtime: a.toggleRealtime()
 
+proc toggleGizmoKind*(a: App, tag: string) =
+  ## Shows or hides one object type's gizmos. Hiding the last type turns the
+  ## gizmos off and leaves that type on.
+  if tag in a.gizmoHidden: a.gizmoHidden.excl tag else: a.gizmoHidden.incl tag
+  if Categories.allIt(it.tags.allIt(it in a.gizmoHidden)):
+    a.gizmoHidden.excl tag
+    a.showGizmos = false
+
 proc whenSaved*(a: App, action: proc()) =
   ## Runs action now, or after asking whether to save the open project's changes.
-  if a.proj != nil and a.dirty:
+  ## A preview's changes are never kept, so it doesn't ask.
+  if a.proj != nil and a.dirty and not a.proj.preview:
     a.savePrompt = action
     a.ui.navId = ""  # Keys go to the prompt, not a widget behind it.
   else: action()
@@ -542,6 +701,7 @@ proc currentSel*(a: App): SelState =
 
 proc sameSel*(x, y: SelState): bool =
   if x.pieces != y.pieces or x.faces != y.faces or x.objs.len != y.objs.len: return false
+  if x.objs == y.objs: return true   # selection lists objects in level order
   for o in x.objs:
     if o notin y.objs: return false
   true
@@ -560,6 +720,52 @@ proc setSel*(a: App, s: SelState) =
 
 proc visible*(a: App, o: LevelObject): bool =
   not o.hidden and o.tag notin a.layerHidden
+
+proc entityGizmo*(a: App, o: LevelObject): bool =
+  ## Whether o draws its gizmo. A selected object always does, or it couldn't be seen.
+  o.selected or (a.showGizmos and o.tag notin a.gizmoHidden)
+
+proc particleSpins(a: App): Table[int, SpinGroup] =
+  ## The spinning groups, by the ids of their Particle objects.
+  if a.groups.allIt(it.spin == 0): return
+  var parent = initTable[int32, int32]()
+  var spin = initTable[int32, float32]()
+  var members: seq[SpinMember]
+  for g in a.groups:
+    parent[g.id] = g.parent
+    spin[g.id] = g.spin
+    for o in g.objs:
+      if o.tag == "PART": members.add (o.id, g.id, o.pos)
+  for s in collectSpins(if a.geo != nil: a.geo else: Geometry(), parent, spin, members):
+    for id in s.particles: result[id] = s
+
+proc particleSource(a: App, o: LevelObject, nth: int): ParticleSource =
+  let cls = o.node.xpath("OSD/Class").str.strip
+  let flags = try: parseInt(o.node.xpath("OSD/Flags").str.strip) except ValueError: 0
+  let ds = strutils.splitWhitespace(o.node.xpath("OSD/DecalScale").str)
+  var decal = vec2(1, 1)
+  if ds.len == 2:
+    try: decal = vec2(parseFloat(ds[0]), parseFloat(ds[1]))
+    except ValueError: discard
+  let started = o.node.xpath("OSD/Tag").str.strip == AutoStartTag
+  let m = objectMatrix(vec3(0, 0, 0), o.rot)
+  ParticleSource(id: (o.id, nth), cls: cls, pos: o.pos, flags: flags, decalScale: decal,
+    started: started,
+    axes: [(m * vec3(1, 0, 0)).normalize, (m * vec3(0, 1, 0)).normalize, (m * vec3(0, 0, 1)).normalize])
+
+proc particleSources*(a: App, only: seq[LevelObject] = @[]): seq[ParticleSource] =
+  ## The visible Particle objects, or those of them in only.
+  var nth: Table[int, int]
+  let spins = a.particleSpins
+  for o in a.objects:
+    if o.tag != "PART" or not a.visible(o): continue
+    nth.mgetOrPut(o.id, -1).inc
+    if only.len == 0 or o in only:
+      var src = a.particleSource(o, nth[o.id])
+      if o.id in spins:
+        src.spin = spins[o.id].seconds
+        src.pivot = spins[o.id].center
+      result.add src
 
 # --- groups: membership and locking ----------------------------------------------------------
 
@@ -617,6 +823,10 @@ proc pieceLocked*(a: App, pc: int32): bool = a.groupLocked(a.pieceGroup(pc))
 proc pickable*(a: App, o: LevelObject): bool =
   a.visible(o) and o.tag notin a.layerLocked and not a.groupLocked(a.objGroup(o))
 
+proc viewPickable*(a: App, o: LevelObject): bool =
+  ## Whether a click in a view can hit o: there has to be something to click.
+  a.pickable(o) and (a.entityGizmo(o) or (a.opts.models and o.objectModel[0]))
+
 proc geometryVisible*(a: App): bool = a.geo != nil and GeometryLayer notin a.layerHidden
 proc geometryEditable*(a: App): bool = a.geometryVisible and GeometryLayer notin a.layerLocked
 
@@ -624,6 +834,7 @@ proc faceVisible*(a: App, fi: int): bool =
   let f = a.geo.faces[fi]
   if f.piece >= 0 and f.piece < a.geo.pieces.len and a.geo.pieces[f.piece].hidden: return false
   if f.isMarkerFace and not a.opts.markers: return false
+  if f.isInvisibleFace and not a.opts.invisible: return false
   true
 
 # --- objects and their geometry ------------------------------------------------------------
@@ -635,7 +846,7 @@ proc objectCode*(o: LevelObject): int32 =
 
 proc facePickable*(a: App): proc(fi: int): bool =
   ## Faces a click can hit: the visible ones, plus selected faces that are only
-  ## hidden as marker faces (they're still drawn highlighted).
+  ## hidden as marker or invisible faces (they're still drawn highlighted).
   var codes: HashSet[int32]
   for o in a.objects:
     if o.selected and o.objectCode != -1: codes.incl o.objectCode
@@ -648,6 +859,19 @@ proc facePickable*(a: App): proc(fi: int): bool =
     let f = app.geo.faces[fi]
     if f.piece >= 0 and f.piece < app.geo.pieces.len and app.geo.pieces[f.piece].hidden: return false
     fi in app.selFaces or f.piece in app.selPieces or f.objectId in codes
+
+proc facePickable*(a: App, vi: int, r: Ray): proc(fi: int): bool =
+  ## The same for ray r in view vi, which also passes through back faces where
+  ## the view culls them (render.drawView), so a camera inside a wall picks
+  ## what it sees past the wall.
+  let pickable = a.facePickable
+  if a.views[vi].cam.kind != vk3D or a.opts.mode.wireframe: return pickable
+  let app = a
+  result = proc(fi: int): bool =
+    if not pickable(fi): return false
+    let f = app.geo.faces[fi]
+    (f.flags and gfTwoSided) != 0 or f.isMarkerFace or f.isInvisibleFace or
+      app.geo.normal(f).dot(r.dir) < 0
 
 proc ownerOf*(a: App, objectId: int32): LevelObject =
   if objectId == -1: return nil
@@ -755,6 +979,22 @@ proc pickRay*(o: LevelObject, r: Ray): float32 =
   let (lo, hi) = o.pickBox
   r.rayBox(lo, hi)
 
+proc pointing*(o: LevelObject): (bool, Vec3) =
+  ## The way an object faces, for those that have one: a character's and a
+  ## flag's facing is their Y rotation (Oni: sin, 0, cos), a turret aims along
+  ## its local +Z, a particle emits along its local +Y.
+  case o.tag
+  of "CHAR", "NEUT", "FLAG":
+    let ang = o.rot.y.float64.degToRad
+    (true, vec3(sin(ang).float32, 0, cos(ang).float32))
+  of "TURR":
+    let t = objectMatrix(vec3(0, 0, 0), o.rot)
+    (true, (t * vec3(0, 0, 1)).normalize)
+  of "PART":
+    let t = objectMatrix(vec3(0, 0, 0), o.rot)
+    (true, (t * vec3(0, 1, 0)).normalize)
+  else: (false, vec3(0, 0, 0))
+
 proc extentBox*(o: LevelObject): (bool, Vec3, Vec3) =
   ## Volumes some objects carry in their data (sounds, trigger volumes).
   case o.tag
@@ -767,6 +1007,42 @@ proc extentBox*(o: LevelObject): (bool, Vec3, Vec3) =
     if s != vec3(0, 0, 0): return (true, o.pos, o.pos + s)
   else: discard
   (false, vec3(0, 0, 0), vec3(0, 0, 0))
+
+proc volumeTurn*(o: LevelObject): Mat4 =
+  ## How the object's volume is turned around its position: the game rotates a
+  ## trigger volume with the object, a sound's Box stays on the world axes.
+  if o.tag == "TRGV": objectMatrix(vec3(0, 0, 0), o.rot) else: mat4()
+
+proc volumeRange*(o: LevelObject): (bool, Vec3, Vec3) =
+  ## The object's volume in its own axes, relative to its position.
+  let (has, a, b) = o.extentBox
+  if not has: return
+  let (lo, hi) = (a - o.pos, b - o.pos)
+  (true, min(lo, hi), max(lo, hi))
+
+proc volumeCorners*(o: LevelObject, lo, hi: Vec3): array[8, Vec3] =
+  ## World corners of a volumeRange.
+  let half = (hi - lo) / 2
+  result = boxCorners((lo + hi) / 2, half, 0)
+  let turn = o.volumeTurn
+  for p in result.mitems: p = o.pos + turn * p
+
+proc setVolumeRange*(a: App, o: LevelObject, base, lo, hi: Vec3) =
+  ## Gives o the volume lo .. hi around base, its position when lo and hi were
+  ## measured. A trigger volume starts at its position, so its Min side moves it.
+  case o.tag
+  of "SNDG":
+    let (bmin, bmax) = (o.node.xpath("OSD/Box/Min"), o.node.xpath("OSD/Box/Max"))
+    if bmin == nil or bmax == nil: return
+    bmin.setText(fmtVec3(lo))
+    bmax.setText(fmtVec3(hi))
+  of "TRGV":
+    let size = o.node.xpath("OSD/Size")
+    if size == nil: return
+    size.setText(fmtVec3(hi - lo))
+    a.setPose(o, base + o.volumeTurn * lo, o.rot, moveGeometry = false)
+  else: return
+  o.file.dirty = true
 
 # --- undo ----------------------------------------------------------------------------------
 
@@ -793,8 +1069,17 @@ proc captureGroups(a: App, c: var Cmd) =
     c.grpAfter = a.groups
     a.groupsRecorded = a.groups
 
+proc showCrashReport*(a: App) =
+  ## At launch: says so if an earlier run crashed.
+  let report = unseenCrash()
+  if report.len == 0: return
+  a.crashReport = report
+  a.issues.add Issue(severity: sevError, text: CrashIssue, time: epochTime(), face: -1, report: report)
+  a.say("Catwalk crashed in an earlier run. Report: " & report, true)
+
 proc push*(a: App, c: Cmd) =
   var c = c
+  if c.isModification: logLine("Edit: " & c.label)
   if c.isModification: a.syncLinkedGroups(c)
   a.captureGroups(c)
   if a.cleanAt > a.undoStack.len:
@@ -825,7 +1110,7 @@ proc geoCmd*(label: string, before, after: Geometry): Cmd =
 
 proc projSettings*(p: Project): ProjSettings =
   ProjSettings(title: p.title, sky: p.sky, music: p.music, musicVolume: p.musicVolume,
-               autoBake: p.autoBake, ambient: p.ambient)
+               autoBake: p.autoBake, ambient: p.ambient, softShadows: p.softShadows, skyGrade: p.skyGrade)
 
 proc editProject*(a: App, label: string, before: ProjSettings, merge = "") =
   ## After a change to the level's settings: saves them and leaves an undo
@@ -888,8 +1173,6 @@ proc removeFromList(a: App, o: LevelObject) =
   let i = a.objects.find(o)
   if i >= 0: a.objects.delete(i)
 
-proc updateWindowTitle*(a: App)
-
 proc applyCmd(a: App, c: Cmd, undo: bool) =
   if undo:
     for i in countdown(c.extra.high, 0): a.applyCmd(c.extra[i], true)
@@ -911,10 +1194,9 @@ proc applyCmd(a: App, c: Cmd, undo: bool) =
     let s = if undo: c.projBefore else: c.projAfter
     if s.music != p.music: a.musicUndone = true
     elif s.musicVolume != p.musicVolume: setMusicVolume(s.musicVolume)
-    (p.title, p.sky, p.music, p.musicVolume, p.autoBake, p.ambient) =
-      (s.title, s.sky, s.music, s.musicVolume, s.autoBake, s.ambient)
+    (p.title, p.sky, p.music, p.musicVolume, p.autoBake, p.ambient, p.softShadows, p.skyGrade) =
+      (s.title, s.sky, s.music, s.musicVolume, s.autoBake, s.ambient, s.softShadows, s.skyGrade)
     p.save()
-    a.updateWindowTitle()
   of ckVisibility: a.setVis(if undo: c.visBefore else: c.visAfter)
   of ckGeometry, ckSelect: discard
   let g = if undo: c.geoBefore else: c.geoAfter
@@ -997,6 +1279,58 @@ proc texturePath*(a: App, name: string): string =
   if name.startsWith("_marker"): a.proj.markersDir / name & ".tga"
   else: a.proj.imagesDir / name & ".tga"
 
+proc textureFile*(a: App, name: string): string =
+  ## Where a listed texture's image is: the project's, or else a collection's.
+  result = a.texturePath(name)
+  if fileExists(result): return
+  for c in a.texCollections:
+    if c.ready and c.level != 0 and fileExists(c.dir / name & ".tga"): return c.dir / name & ".tga"
+
+proc refreshCollections*(a: App) =
+  ## Rereads what each collection holds; the textures of enabled ones get
+  ## thumbnails.
+  a.texCollections.setLen 0
+  if a.proj == nil: return
+  let p = a.proj
+  var own, custom: seq[string]
+  for t in a.textures:
+    if t in p.customTextures: custom.add t else: own.add t
+  a.texCollections.add TexCollection(id: "level", name: "This level", dir: p.imagesDir, ready: true, textures: own)
+  a.texCollections.add TexCollection(id: "custom", name: "Custom textures", dir: p.imagesDir, ready: true,
+                                     textures: custom)
+  for n in a.cfg.gameLevels:
+    if n == p.levelNumber and not p.scratch: continue
+    var c = TexCollection(id: "game:" & $n, name: "Level " & $n, level: n, dir: levelTexturesDir(n),
+                          ready: levelTexturesReady(n))
+    if c.ready:
+      for f in walkFiles(c.dir / "*.tga"): c.textures.add f.splitFile.name
+      c.textures.sort
+    a.texCollections.add c
+  a.thumbsLoaded = false
+
+proc enabledTextures*(a: App): seq[(string, int)] =
+  ## The enabled collections' textures, each once: (name, index in texCollections).
+  if a.proj == nil: return
+  var seen: HashSet[string]
+  for id in a.proj.textureCollections:
+    for ci, c in a.texCollections:
+      if c.id == id and c.ready:
+        for t in c.textures:
+          if not seen.containsOrIncl(t): result.add (t, ci)
+
+proc adoptTexture*(a: App, name: string) =
+  ## A collection's texture was used: the level gets its own copy (Build packs env/images).
+  if name in a.textures or a.proj == nil: return
+  let dst = a.texturePath(name)
+  try:
+    if not fileExists(dst): copyFile(a.textureFile(name), dst)
+    a.textures.add name
+    a.textures.sort
+    let keep = a.thumbsLoaded
+    a.refreshCollections()
+    a.thumbsLoaded = keep   # It has its thumbnail already.
+  except CatchableError as e: a.say("Could not copy texture " & name & ": " & e.msg, true)
+
 proc density*(a: App, tex: string): float32 =
   if tex notin a.densities: a.densities[tex] = a.geo.textureDensity(tex)
   a.densities[tex]
@@ -1025,16 +1359,27 @@ proc loadThumbnails*(a: App) =
   a.thumbsLoaded = true
   let sk = a.sk
   if sk.builder == nil: sk.builder = newAtlasBuilderFromAtlas(sk.atlas, sk.image)
-  for name in a.textures:
+  var names = a.textures
+  for (name, _) in a.enabledTextures:
+    if name notin names: names.add name
+  for name in names:
     let key = "tex:" & name
     try:
-      let data = readFile(a.texturePath(name))
+      let data = readFile(a.textureFile(name))
       a.texSizes[name] = tgaSize(data)
-      if key in sk.atlas.entries: continue
+      if key in sk.atlas.entries and name in a.texAlpha: continue
       let t = readTga(data)
+      a.texAlpha[name] = t.seeThrough
+      if key in sk.atlas.entries: continue
       var img = newImage(t.width, t.height)
+      # See-through pixels over a checkerboard, as image editors show them
+      # (8 squares across, whatever the texture's size).
+      let cell = max(1, max(t.width, t.height) div 8)
       for i in 0 ..< t.width * t.height:
-        img.data[i] = rgbx(t.rgba[i * 4], t.rgba[i * 4 + 1], t.rgba[i * 4 + 2], 255)
+        let al = t.rgba[i * 4 + 3].int
+        let bg = if ((i mod t.width) div cell + (i div t.width) div cell) mod 2 == 0: 200 else: 120
+        proc ch(c: uint8): uint8 = uint8((c.int * al + bg * (255 - al)) div 255)
+        img.data[i] = rgbx(ch(t.rgba[i * 4]), ch(t.rgba[i * 4 + 1]), ch(t.rgba[i * 4 + 2]), 255)
       # Square, at the texture's own size up to the largest zoom; drawn scaled.
       let side = clamp(max(t.width, t.height), 1, MaxTexThumb.int)
       let thumb = if t.width == side and t.height == side: img else: img.resize(side, side)
@@ -1045,6 +1390,35 @@ proc loadThumbnails*(a: App) =
   sk.image = sk.builder.atlasImage
   sk.atlas = sk.builder.atlas
   sk.uploadAtlas()
+
+proc loadSkyPreview*(a: App, path: string, maxW, maxH: float32, key = "") =
+  ## The picture's preview goes into the UI atlas, once, under key (default:
+  ## path). A picture that can't be read gets no entry in skyPreviews.
+  let key = if key.len > 0: key else: path
+  if key in a.skyPreviews: return
+  try:
+    if path.splitFile.ext.toLowerAscii.strip(chars = {'.'}) notin DirectFormats or
+       not fileExists(path): return
+    let t = readPicture(path)
+    if t.width == 0 or t.height == 0: return
+    let k = min(1'f32, min(maxW / t.width.float32, maxH / t.height.float32))
+    let (w, h) = (max(1, int(t.width.float32 * k)), max(1, int(t.height.float32 * k)))
+    # The atlas holds device pixels.
+    let sc = a.sk.atlasScale.float
+    let thumb = t.resized(max(1, int(w.float * sc)), max(1, int(h.float * sc)))
+    var img = newImage(thumb.width, thumb.height)
+    for i in 0 ..< thumb.width * thumb.height:
+      img.data[i] = rgbx(thumb.rgba[i * 4], thumb.rgba[i * 4 + 1], thumb.rgba[i * 4 + 2], 255)
+    let sk = a.sk
+    if sk.builder == nil: sk.builder = newAtlasBuilderFromAtlas(sk.atlas, sk.image)
+    if not sk.builder.addImage("skysrc:" & key, img):
+      sk.builder.growAtlas(sk.builder.size * 2)
+      discard sk.builder.addImage("skysrc:" & key, img)
+    sk.image = sk.builder.atlasImage
+    sk.atlas = sk.builder.atlas
+    sk.uploadAtlas()
+    a.skyPreviews[key] = (w, h, t.width, t.height)
+  except CatchableError: discard
 
 proc texSizeText*(a: App, name: string): string =
   ## "256×128", or "" when the texture's size isn't known.
@@ -1062,8 +1436,10 @@ proc frameAll*(a: App)
 # and where each map's 3D camera was left.
 proc layoutPath(): string = configPath().parentDir / "layout.json"
 proc camerasPath(): string =
-  let state = getEnv("XDG_STATE_HOME", getHomeDir() / ".local/state")
-  state / "catwalk" / "cameras.json"
+  when defined(windows): configPath().parentDir / "cameras.json"
+  else:
+    let state = getEnv("XDG_STATE_HOME", getHomeDir() / ".local/state")
+    state / "catwalk" / "cameras.json"
 
 proc readJson(path: string): JsonNode =
   try: parseFile(path) except CatchableError: newJObject()
@@ -1077,7 +1453,15 @@ proc loadLayout*(a: App) =
   a.splitX = j{"splitX"}.getFloat(a.splitX).float32
   a.splitY = j{"splitY"}.getFloat(a.splitY).float32
   a.dock = dockFromJson(j{"dock"})
+  if j{"dockVersion"}.getInt < 2:
+    # Saved before Texture Collections existed: it goes with the Texture Browser.
+    let l = a.dock.leafOf(pkTextureBrowser)
+    if l != nil and a.dock.leafOf(pkTextureCollections) == nil: l.tabs.add pkTextureCollections
+  a.texGroup = j{"textureGroup"}.getBool(true)
   a.entityBrowserH = j{"entityBrowserH"}.getFloat(a.entityBrowserH).float32
+  a.classListFolded = j{"classListFolded"}.getBool(false)
+  if j{"classFolded"} != nil and j["classFolded"].kind == JArray:
+    for n in j["classFolded"]: a.classFolded.incl n.getStr
   a.entityPreview = clamp(j{"entityPreview"}.getFloat(a.entityPreview), 0, 1)
   a.texThumb = clamp(j{"texThumb"}.getFloat(a.texThumb), MinTexThumb, MaxTexThumb).float32
   if j{"codeFontSize"}.getInt in CodeFontSizes: a.codeFontSize = j{"codeFontSize"}.getInt
@@ -1090,6 +1474,10 @@ proc loadLayout*(a: App) =
       for p in PreviewPart:
         if $p == n.getStr: parts.incl p
     if parts != {}: a.previewParts = parts
+  a.showGizmos = j{"gizmos"}.getBool(a.showGizmos)
+  if j{"gizmosHidden"} != nil and j["gizmosHidden"].kind == JArray:
+    a.gizmoHidden.clear()
+    for n in j["gizmosHidden"]: a.gizmoHidden.incl n.getStr
   a.previewSoundVolume = clamp(j{"realtimeSoundVolume"}.getFloat(a.previewSoundVolume), 0, 1)
   a.previewMusicVolume = clamp(j{"realtimeMusicVolume"}.getFloat(a.previewMusicVolume), 0, 1)
   let w = j{"window"}
@@ -1107,10 +1495,12 @@ proc saveLayout*(a: App) =
   try:
     createDir(layoutPath().parentDir)
     writeFile(layoutPath(), pretty(%*{"layout": $a.layout, "splitX": a.splitX, "splitY": a.splitY,
-      "dock": a.dock.toJson, "entityBrowserH": a.entityBrowserH,
+      "dock": a.dock.toJson, "dockVersion": 2, "textureGroup": a.texGroup, "entityBrowserH": a.entityBrowserH,
+      "classListFolded": a.classListFolded, "classFolded": a.classFolded.toSeq.sorted,
       "entityPreview": a.entityPreview, "texThumb": a.texThumb, "codeFontSize": a.codeFontSize, "entityGroupsOpen": a.browserOpen.toSeq.sorted,
       "flySpeed": a.flySpeed, "renderMode": $a.opts.mode,
       "realtimePreview": a.previewParts.toSeq.mapIt($it),
+      "gizmos": a.showGizmos, "gizmosHidden": a.gizmoHidden.toSeq.sorted,
       "realtimeSoundVolume": a.previewSoundVolume, "realtimeMusicVolume": a.previewMusicVolume, "window": {"x": a.winPos.x, "y": a.winPos.y,
         "width": a.winSize.x, "height": a.winSize.y, "maximized": a.winMaximized}}))
   except CatchableError as e: a.say("Could not save the layout: " & e.msg, true)
@@ -1124,7 +1514,7 @@ proc camera3D*(a: App): ptr Camera =
 proc saveCamera*(a: App) =
   ## Remembers the open map's 3D camera, keyed by its project folder.
   let cam = a.camera3D
-  if a.proj == nil or cam == nil: return
+  if a.proj == nil or cam == nil or a.proj.preview: return
   var j = readJson(camerasPath())
   if j.kind != JObject: j = newJObject()
   j[a.proj.dir] = %*{"pos": [cam.pos.x, cam.pos.y, cam.pos.z], "yaw": cam.yaw, "pitch": cam.pitch}
@@ -1147,8 +1537,15 @@ proc restoreCamera(a: App) =
 proc closeProject*(a: App) =
   ## Leaves the open map, keeping its 3D camera for next time.
   if a.proj == nil: return
+  let preview = if a.proj.preview: a.proj.dir else: ""
   a.saveCamera()
   a.proj = nil
+  if preview.len > 0:
+    try: removeDir(preview)
+    except CatchableError: discard
+  openSoundsDir = ""
+  a.ambientEdit = nil
+  setProjectAmbients(@[])
 
 # --- baked lighting ---------------------------------------------------------------------------
 
@@ -1190,6 +1587,7 @@ proc lightAnim*(o: LevelObject): CornerAnim =
       except ValueError: discard
   result.period = max(0.01'f32, num("Period", 2))
   result.offset = num("Offset", 0)
+  result.seed = clamp(num("Seed", 0), 0, MaxAnimSeed.float32).uint32
   result.low = clamp(num("Min", 0), 0, 1)
   result.high = clamp(num("Max", 1), 0, 1)
   result.stability = clamp(num("Stability", 0), 0, 1)
@@ -1218,6 +1616,7 @@ proc setLightAnim*(o: LevelObject, m: CornerAnim) =
   put "Color", &"{m.color[0]} {m.color[1]} {m.color[2]}"
   put "Period", num(m.period)
   put "Offset", num(m.offset)
+  put "Seed", $m.seed
   put "Interpolation", interps[m.interp]
   put "Min", num(m.low)
   put "Max", num(m.high)
@@ -1277,7 +1676,7 @@ proc lights*(a: App): seq[Light] =
 proc lightingKey*(a: App): string =
   ## Everything a bake depends on; a different key means the lighting is stale.
   if a.geo == nil or a.proj == nil: return ""
-  result = $a.geo.version & "|" & $a.proj.ambient
+  result = $a.geo.version & "|" & $a.proj.ambient & "|" & $a.proj.softShadows
   for o in a.objects:
     if o.tag in LightTags: result.add "|" & o.snapshot
 
@@ -1293,11 +1692,16 @@ proc bakeLights*(a: App) =
   let before = a.geo.clone
   let t0 = epochTime()
   let lights = a.lights
-  let n = a.geo.bakeLighting(lights, a.ambientColor)
+  let n = a.geo.bakeLighting(lights, a.ambientColor, a.proj.softShadows.float32)
   if n > 0: a.push geoCmd("Bake lighting", before, a.geo)
   a.bakeKey = a.lightingKey
   let ms = int((epochTime() - t0) * 1000)
   a.say &"Baked lighting from {lights.len} light(s): {n} corner color(s) changed ({ms} ms)"
+
+proc bakeWaits*(a: App): bool =
+  ## Automatic baking is on but won't run this frame: since it waits as long as
+  ## the last bake took, a big level's bakes leave frames between them.
+  a.proj.autoBake and epochTime() - a.bakeAt < a.bakeTook
 
 proc autoBake*(a: App) =
   ## Once a frame: with automatic baking on, rebakes when a light, the ambient
@@ -1306,9 +1710,9 @@ proc autoBake*(a: App) =
   if a.proj == nil or a.geo == nil or not a.proj.autoBake: return
   let key = a.lightingKey
   if key == a.bakeKey: return
+  if a.bakeWaits: return
   let t0 = epochTime()
-  if t0 - a.bakeAt < a.bakeTook: return
-  discard a.geo.bakeLighting(a.lights, a.ambientColor)
+  discard a.geo.bakeLighting(a.lights, a.ambientColor, a.proj.softShadows.float32)
   a.bakeAt = epochTime()
   a.bakeTook = a.bakeAt - t0
   a.bakeKey = a.lightingKey
@@ -1321,10 +1725,18 @@ proc refreshGeometry*(a: App) =
 
 proc updateWindowTitle*(a: App) =
   ## "<title> (<folder>) - Catwalk": the folder tells copies of one level apart.
-  a.window.title =
+  ## An asterisk after the name marks unsaved changes. Runs every frame; the
+  ## window is only touched when the text changes.
+  let title =
     if a.proj == nil: "Catwalk"
-    elif a.proj.title.len == 0 or a.proj.folder == a.proj.title: a.proj.folder & " - Catwalk"
-    else: &"{a.proj.title} ({a.proj.folder}) - Catwalk"
+    else:
+      let mark = if a.dirty: "*" else: ""
+      if a.proj.preview: &"{a.proj.title} (preview){mark} - Catwalk"
+      elif a.proj.title.len == 0 or a.proj.folder == a.proj.title: &"{a.proj.folder}{mark} - Catwalk"
+      else: &"{a.proj.title}{mark} ({a.proj.folder}) - Catwalk"
+  if title != a.windowTitle:
+    a.windowTitle = title
+    a.window.title = title
 
 proc loadGroups(a: App)
 proc saveGroups(a: App, dir: string)
@@ -1333,7 +1745,9 @@ proc loadProject*(a: App, p: Project) =
   if a.proj != nil and a.proj != p: a.saveCamera()
   a.rend.clearAll()
   a.proj = p
-  a.cfg.noteOpened(p.dir)
+  openSoundsDir = p.soundsDir
+  setProjectAmbients(loadAmbients(p.ambientsPath))
+  if not p.preview: a.cfg.noteOpened(p.dir)
   a.files.setLen 0
   a.scripts = nil
   a.mapReveal = nil
@@ -1350,7 +1764,12 @@ proc loadProject*(a: App, p: Project) =
   a.classOrig.clear()
   a.classOnDiskRead = false
   a.classMarkStamp = (-1, -1, -1)
+  a.classParentStamp = (-1, -1, -1)
   a.className = ""
+  a.classOther = ""
+  a.classParticles = false
+  a.particleEditStamp = (-1, -1, -1)
+  a.particleRestart = true
   a.classFor = nil
   a.classTextFor = nil
   a.clearSelection()
@@ -1362,6 +1781,7 @@ proc loadProject*(a: App, p: Project) =
   a.geo = nil
   a.thumbsLoaded = false
   a.texSizes.clear()
+  a.texAlpha.clear()
   try:
     (a.files, a.objects) = loadObjects(p.objectsDir)
   except CatchableError as e:
@@ -1392,17 +1812,27 @@ proc loadProject*(a: App, p: Project) =
     if not n.startsWith("bnv_grid"): a.textures.add n
   a.textures.sort
   if a.currentTexture.len == 0 and a.textures.len > 0: a.currentTexture = a.textures[0]
+  a.refreshCollections()
   if a.geo != nil: a.refreshGeometry()
   a.savePointList = p.savePoints
   a.bakeKey = a.lightingKey   # geometry.json was saved baked
-  a.updateWindowTitle()
   a.frameAll()
-  a.restoreCamera()
-  a.say &"Opened {p.folder}: {a.objects.len} objects" &
-    (if a.geo != nil: &", {a.geo.faces.len} faces in {a.geo.pieces.len} pieces" else: "")
+  if not p.preview: a.restoreCamera()
+  if p.preview:
+    a.say &"Previewing {p.title}: nothing is kept unless you save it as a project (File > Save As...)"
+  else:
+    a.say &"Opened {p.folder}: {a.objects.len} objects" &
+      (if a.geo != nil: &", {a.geo.faces.len} faces in {a.geo.pieces.len} pieces" else: "")
+
+proc nextFreeProjectDir*(a: App): string
 
 proc saveProject*(a: App) =
   if a.proj == nil: return
+  if a.proj.preview:
+    # A preview has no project to save into: ask for one.
+    a.dialog = startDialog(dkSaveFile, "saveas", "Save the preview as a project", a.nextFreeProjectDir())
+    a.say "A preview isn't saved: choose a folder to keep it as a project"
+    return
   var n = 0
   for f in a.files:
     if f.dirty:
@@ -1419,17 +1849,28 @@ proc saveProject*(a: App) =
   a.cleanAt = a.undoStack.len
   a.say(if n > 0: &"Saved ({n} file(s))" else: "Nothing to save")
 
-proc nextFreeProjectDir*(a: App): string =
-  ## "<folder>-2", "-3"... next to the open project: the save dialogs' suggestion.
-  let parent = a.proj.dir.parentDir
-  var base = a.proj.folder
-  let dash = base.rfind('-')
-  if dash > 0 and base[dash + 1 .. ^1].allCharsInSet(Digits): base = base[0 ..< dash]
+proc copyName*(base: string, taken: proc(name: string): bool): string =
+  ## A free name for a duplicate of base: base itself, then "<base>-Copy2", "-Copy3"...
+  result = base
   var n = 2
-  while true:
-    result = parent / &"{base}-{n}"
-    if not dirExists(result) and not fileExists(result): return
+  while taken(result):
+    result = &"{base}-Copy{n}"
     inc n
+
+proc nextFreeProjectDir*(a: App): string =
+  ## "<folder>-Copy2", "-Copy3"... next to the open project: the save dialogs'
+  ## suggestion. A preview's goes in the projects folder as "Level<n>" first.
+  let parent = if a.proj.preview: a.cfg.projectsDir else: a.proj.dir.parentDir
+  var base = if a.proj.preview: "Level" & $a.proj.levelNumber else: a.proj.folder
+  let dash = base.rfind('-')
+  if dash > 0:
+    var tail = base[dash + 1 .. ^1]
+    if tail.startsWith("Copy"): tail = tail["Copy".len .. ^1]
+    if tail.len > 0 and tail.allCharsInSet(Digits): base = base[0 ..< dash]
+  proc taken(name: string): bool =
+    dirExists(parent / name) or fileExists(parent / name) or
+      (not a.proj.preview and name == a.proj.folder)
+  parent / copyName(base, taken)
 
 proc copyProjectTree(src, dst: string) =
   ## The project's files, without build/ (Build recreates everything in it).
@@ -1472,6 +1913,7 @@ proc saveProjectAs*(a: App, target: string, keepWorking: bool) =
       p[] = a.proj[]
       p.dir = dst
       p.folder = dst.lastPathPart
+      if p.preview: p.title = p.folder
       if a.geo != nil and a.geo.version != a.geoSavedVersion:
         a.geo.save(p.geometryPath)
         p.geometryEdited = true
@@ -1487,10 +1929,15 @@ proc saveProjectAs*(a: App, target: string, keepWorking: bool) =
         a.scripts.files.setLen 0
       a.proj.dir = dst
       a.proj.folder = dst.lastPathPart
+      if a.proj.preview:
+        # The preview becomes a project: its copy in the cache isn't needed any more.
+        a.proj.preview = false
+        a.proj.title = a.proj.folder
+        try: removeDir(src)
+        except CatchableError: discard
       a.saveProject()
       a.cfg.noteOpened(dst)
       a.saveCamera()
-      a.updateWindowTitle()
       a.say(&"Saved as {dst}; now editing it")
   except CatchableError as e:
     a.say("Could not save the project: " & e.msg, true)
@@ -1562,9 +2009,187 @@ proc selectionCenter*(a: App): (bool, Vec3) =
   let (ok, lo, hi) = a.selectionBounds
   (ok, (lo + hi) / 2)
 
+# Focusing the 3D view on the selection: the current direction if nothing is
+# in the way, else the nearest one that shows the selection, found by casting
+# rays from candidate spots around it through the same kind of grid the light
+# bake and the sound preview use.
+
+const
+  CamAnimTime = 0.45
+  FocusRays = 32                ## Most points of the selection tested per spot.
+
+type FocusPoint = object
+  pos, nrm: Vec3                ## nrm: a selected face's (it's only seen from the front).
+
+var
+  focusGrid: Grid
+  focusStamp: seq[int32]
+  focusRay = 0'i32
+  focusGeo: Geometry
+  focusVersion = -1
+
+proc blocksView(f: Face): bool {.nimcall.} =
+  f.isLit and (f.flags and gfTransparent) == 0
+
+proc focusPoints(a: App): (seq[FocusPoint], seq[bool]) =
+  ## Points of the selection to see, and per face whether it can't get in the
+  ## way (it's selected, hidden, or belongs to a selected object).
+  var pts: seq[FocusPoint]
+  var owned: HashSet[int32]
+  for o in a.selection:
+    let (lo, hi) = o.pickBox
+    let c = (lo + hi) / 2
+    pts.add FocusPoint(pos: c)
+    pts.add FocusPoint(pos: c + vec3(0, (hi.y - lo.y) * 0.35, 0))
+    pts.add FocusPoint(pos: c - vec3(0, (hi.y - lo.y) * 0.35, 0))
+    owned.incl o.objectCode
+  var skip: seq[bool]
+  if a.geo != nil:
+    skip = newSeq[bool](a.geo.faces.len)
+    for i, f in a.geo.faces:
+      if f.piece in a.selPieces or i in a.selFaces or f.objectId in owned or not a.faceVisible(i):
+        skip[i] = true
+      if (f.piece in a.selPieces or i in a.selFaces) and f.verts.len >= 3:
+        var c = vec3(0, 0, 0)
+        for v in f.verts: c += a.geo.points[v]
+        c = c / f.verts.len.float32
+        let n = a.geo.normal(f)
+        pts.add FocusPoint(pos: c + n * 0.5, nrm: if i in a.selFaces: n else: vec3(0, 0, 0))
+  let stride = max(1, pts.len div FocusRays)
+  for i in countup(0, pts.high, stride): result[0].add pts[i]
+  result[1] = skip
+
+proc focusBlocked(p: FocusPoint, eye: Vec3, skip: seq[bool]): (bool, bool) =
+  ## Whether a face the 3D view draws hides the point from eye, and whether
+  ## any face lies between them (a back face isn't drawn, but it means the
+  ## view comes from outside the level or from inside a wall).
+  if p.nrm != vec3(0, 0, 0) and p.nrm.dot(eye - p.pos) <= 0: return (true, true)
+  inc focusRay
+  let d = (p.pos - eye).normalize
+  for (t, fi) in crossings(addr focusGrid, eye, p.pos - d * 1.5, focusStamp, focusRay):
+    if skip[fi]: continue
+    result[1] = true
+    if focusGeo.normal(focusGeo.faces[fi]).dot(d) < 0 or (focusGeo.faces[fi].flags and gfTwoSided) != 0:
+      result[0] = true
+      return
+
+proc focusView(a: App, lo, hi: Vec3): (Vec3, float32, float32) =
+  ## Where the 3D camera sees the box lo..hi framed with nothing in front of
+  ## it: (position, yaw, pitch). Costs per spot: anything hidden first, then a
+  ## turn away from the current view, then coming closer than the full frame.
+  let cam = a.camera3D
+  let c = (lo + hi) / 2
+  let radius = max((hi - lo).length / 2, 24)
+  var aspect = 1'f32
+  for v in a.views:
+    if v.cam.kind == vk3D and v.rect.h > 1: aspect = v.viewBody.w / max(v.viewBody.h, 1)
+  let halfAngle = arctan(tan(cam.fovY / 2) * min(aspect, 1))
+  let far = radius / sin(halfAngle) * 1.05
+  let here = Camera(yaw: cam.yaw, pitch: clamp(cam.pitch, -1.45, 1.45))
+  proc spot(yaw, pitch, dist: float32): Vec3 =
+    c - Camera(yaw: yaw, pitch: pitch).forward * dist
+  if a.geo == nil or a.geo.faces.len == 0: return (spot(here.yaw, here.pitch, far), here.yaw, here.pitch)
+  if focusGeo != a.geo or focusVersion != a.geo.version:
+    focusGrid = buildGrid(a.geo, blocksView)
+    focusGeo = a.geo
+    focusVersion = a.geo.version
+    focusStamp = newSeq[int32](focusGrid.triangles)
+    focusRay = 0
+  let (pts, skip) = a.focusPoints
+  if pts.len == 0: return (spot(here.yaw, here.pitch, far), here.yaw, here.pitch)
+  var best = Inf.float32
+  var res = (spot(here.yaw, here.pitch, far), here.yaw, here.pitch)
+  let f0 = here.forward
+  var pitches = @[here.pitch]
+  for p in [-0.25'f32, -0.55, -0.9, -1.25, 0.15, 0.45]: pitches.add p
+  for pitch in pitches:
+    for k in 0 ..< 16:
+      let yaw = here.yaw + k.float32 / 16 * 2 * PI.float32
+      let turn = arccos(clamp(Camera(yaw: yaw, pitch: pitch).forward.dot(f0), -1, 1)) / PI.float32
+      for near in [1'f32, 0.7, 0.45, 0.25]:
+        let dist = max(far * near, radius * 1.15 + 4)
+        var cost = turn * 1.2 + (1 - near) * 0.5
+        if cost >= best: continue
+        let eye = spot(yaw, pitch, dist)
+        var hidden, crossed = 0
+        for p in pts:
+          let (h, x) = p.focusBlocked(eye, skip)
+          if h: inc hidden
+          if x: inc crossed
+          if cost + 6 * hidden.float32 / pts.len.float32 >= best: break
+        cost += 6 * hidden.float32 / pts.len.float32 + 2 * crossed.float32 / pts.len.float32
+        if cost < best:
+          best = cost
+          res = (eye, yaw, pitch)
+  res
+
+proc animateCameras(a: App, change: proc()) =
+  ## Runs change, which puts the cameras somewhere else at once, and turns
+  ## that into a glide from where they are now. The 2D views glide along.
+  var an = CamAnim(on: true, start: epochTime(), fromFocus: a.focus2D, fromZoom: a.zoom2D)
+  for i in 0 .. 3: an.fromCam[i] = a.views[i].cam
+  change()
+  (an.toFocus, an.toZoom, an.target) = (a.focus2D, a.zoom2D, a.focus2D)
+  for i in 0 .. 3:
+    an.toCam[i] = a.views[i].cam
+    a.views[i].cam = an.fromCam[i]
+  (a.focus2D, a.zoom2D) = (an.fromFocus, an.fromZoom)
+  a.sync2D()
+  for i in 0 .. 3: an.shown[i] = a.views[i].cam
+  (an.shownFocus, an.shownZoom) = (a.focus2D, a.zoom2D)
+  a.camAnim = an
+
+proc updateCamAnim*(a: App) =
+  ## Once a frame, before the views handle input. A camera moved by hand since
+  ## the last frame ends the glide there.
+  template an: untyped = a.camAnim
+  if not an.on: return
+  for i in 0 .. 3:
+    let (c, s) = (a.views[i].cam, an.shown[i])
+    if c.kind != s.kind or (c.kind == vk3D and (c.pos != s.pos or c.yaw != s.yaw or c.pitch != s.pitch)):
+      an.on = false
+      return
+  if a.focus2D != an.shownFocus or a.zoom2D != an.shownZoom:
+    an.on = false
+    return
+  let raw = clamp(float32((epochTime() - an.start) / CamAnimTime), 0, 1)
+  let t = raw * raw * raw * (raw * (raw * 6 - 15) + 10)
+  for i in 0 .. 3:
+    if a.views[i].cam.kind != vk3D: continue
+    let (p, q) = (an.fromCam[i], an.toCam[i])
+    # Swings around the target instead of cutting straight across it.
+    let (d0, d1) = ((an.target - p.pos).length, (an.target - q.pos).length)
+    let look = mix(p.pos + p.forward * d0, q.pos + q.forward * d1, t)
+    var dy = (q.yaw - p.yaw) mod (2 * PI.float32)
+    if dy > PI.float32: dy -= 2 * PI.float32
+    elif dy < -PI.float32: dy += 2 * PI.float32
+    a.views[i].cam.yaw = p.yaw + dy * t
+    a.views[i].cam.pitch = p.pitch + (q.pitch - p.pitch) * t
+    a.views[i].cam.pos = look - a.views[i].cam.forward * (d0 + (d1 - d0) * t)
+    if raw >= 1: (a.views[i].cam.pos, a.views[i].cam.yaw, a.views[i].cam.pitch) = (q.pos, q.yaw, q.pitch)
+    an.shown[i] = a.views[i].cam
+  a.focus2D = mix(an.fromFocus, an.toFocus, t)
+  a.zoom2D = an.fromZoom * pow(an.toZoom / max(an.fromZoom, 1e-4), t)
+  a.sync2D()
+  (an.shownFocus, an.shownZoom) = (a.focus2D, a.zoom2D)
+  if raw >= 1: an.on = false
+
 proc frameSelection*(a: App) =
   let (ok, lo, hi) = a.selectionBounds
-  if ok: a.frameBox(lo, hi) else: a.frameAll()
+  if not ok:
+    a.animateCameras(proc() = a.frameAll())
+    return
+  let (pos, yaw, pitch) = a.focusView(lo, hi)
+  a.animateCameras(proc() =
+    a.frameBox(lo, hi)
+    for i in 0 .. 3:
+      let cam = if a.views[i].cam.kind == vk3D: addr a.views[i].cam
+                elif a.views[i].last3D.fovY > 0: addr a.views[i].last3D
+                else: nil
+      if cam != nil: (cam.pos, cam.yaw, cam.pitch) = (pos, yaw, pitch))
+
+proc resetCameras*(a: App) =
+  a.animateCameras(proc() = a.frameAll())
 
 # --- picking ------------------------------------------------------------------------------------
 
@@ -1587,12 +2212,12 @@ proc pickAt*(a: App, vi: int, mouse: Vec2, geometryToo = true): Hit =
   let r = a.viewRay(vi, mouse)
   result = Hit(kind: hkNone, t: Inf.float32, face: -1)
   for o in a.objects:
-    if not a.pickable(o): continue
+    if not a.viewPickable(o): continue
     let t = o.pickRay(r)
     if t >= 0 and t < result.t:
       result = Hit(kind: hkObject, obj: o, t: t, face: -1)
   if geometryToo and a.geometryVisible:
-    let (fi, t) = a.geo.pickFace(r, a.facePickable)
+    let (fi, t) = a.geo.pickFace(r, a.facePickable(vi, r))
     if fi >= 0 and t < result.t:
       let owner = a.ownerOf(a.geo.faces[fi].objectId)
       if owner != nil:
@@ -1615,6 +2240,25 @@ proc selectedFaceSet*(a: App): HashSet[int] =
   if a.geo == nil: return
   for i, f in a.geo.faces:
     if f.piece in a.selPieces or i in a.selFaces: result.incl i
+
+proc holdTextures*(a: App, faces: HashSet[int]): TexHold =
+  ## With UV lock off, notes each face's shift, scale and rotation on its world
+  ## axes, for releaseTextures to put back after a move, turn, scale or flip, so
+  ## textures stay put in the world (TrenchBroom without UV lock). Empty with UV
+  ## lock on: the UVs ride along with the corners.
+  if a.uvLock or a.geo == nil: return
+  for fi in faces:
+    let f = a.geo.faces[fi]
+    let t = a.geo.texFrame(f, a.density(f.texture))
+    if t.ok: result.add (fi, t, f.uvs)
+
+proc releaseTextures*(a: App, hold: TexHold, restore = false) =
+  ## Gives held faces their noted mappings back on their new corners. restore
+  ## first puts back their UVs from the hold (drags, applied again every frame).
+  for h in hold:
+    if restore: a.geo.faces[h.face].uvs = h.uvs
+    let cur = a.geo.texFrame(h.face, a.density(a.geo.faces[h.face].texture))
+    if cur.ok: discard a.geo.setTexFrame(h.face, cur, h.frame)
 
 proc deleteSelection*(a: App) =
   let sel = a.selection
@@ -1675,7 +2319,12 @@ proc duplicateSelection*(a: App, offset: Vec3, linked = false, flash = false) =
     c.objs.add d
     c.indices.add d.file.list.findChild(d.node)
   if geoSel:
-    let added = a.geo.duplicateFaces(a.selectedFaceSet.toSeq.sorted, offset)
+    let src = a.selectedFaceSet.toSeq.sorted
+    var hold = a.holdTextures(src.toHashSet)
+    let added = a.geo.duplicateFaces(src, offset)
+    # Each copy keeps its original's mapping (added is in src's order).
+    for h in hold.mitems: h.face = added[src.binarySearch(h.face)]
+    a.releaseTextures(hold)
     a.selPieces.clear()
     a.selFaces.clear()
     for fi in added:
@@ -1700,8 +2349,10 @@ proc moveSelection*(a: App, d: Vec3, label = "Move") =
   for o in sel: a.setPose(o, o.pos + d, o.rot)
   if geoSel:
     let faces = a.selectedFaceSet
+    let hold = a.holdTextures(faces)
     a.geo.detachPoints(faces)
     a.geo.movePoints(a.geo.pointsOf(faces), d)
+    a.releaseTextures(hold)
   a.transformSelectedGroups(affineOf(proc(p: Vec3): Vec3 = p + d))
   a.push editCmd(label, sel, before, geoBefore, a.geo)
 
@@ -1720,8 +2371,10 @@ proc rotateSelection*(a: App, axis: Vec3, deg: float32, label = "Rotate") =
     a.setPose(o, p, r)
   if geoSel:
     let faces = a.selectedFaceSet
+    let hold = a.holdTextures(faces)
     a.geo.detachPoints(faces)
     a.geo.transformPoints(a.geo.pointsOf(faces), proc(p: Vec3): Vec3 = rotateAxis(p, pivot, axis, deg))
+    a.releaseTextures(hold)
   a.transformSelectedGroups(affineOf(proc(p: Vec3): Vec3 = rotateAxis(p, pivot, axis, deg)))
   a.push editCmd(label, sel, before, geoBefore, a.geo)
 
@@ -1797,9 +2450,12 @@ proc flipSelection*(a: App, axis: int) =
     a.setPose(o, pos, rot, moveGeometry = false)
     if doorCenter != nil: doorCenter.setText(fmtVec3(mirror(oldCenter)))
   if faces.len > 0:
+    # Objects' own geometry is their model: its textures always go with it.
+    let hold = if geoSel: a.holdTextures(a.selectedFaceSet) else: @[]
     a.geo.detachPoints(faces)
     a.geo.transformPoints(a.geo.pointsOf(faces), mirror)
     a.geo.reverseWinding(faces)
+    a.releaseTextures(hold)
   a.transformSelectedGroups(affineOf(mirror))
   a.push editCmd("Flip", sel, before, geoBefore, a.geo)
 
@@ -2001,7 +2657,12 @@ proc loadPreviews*(a: App, wanted: seq[Preset]) =
 
 # --- issues ----------------------------------------------------------------------------------
 
-proc findIssues*(a: App) =
+proc findIssues*(a: App, extra: seq[(Severity, string)] = @[]) =
+  ## Fills the Issues list; `extra` adds lines from elsewhere (a build log's
+  ## warnings) that the checks here don't already name. An issue that was
+  ## already listed keeps the time it was first found.
+  var seen: Table[string, float]
+  for iss in a.issues: seen[iss.text] = iss.time
   a.issues.setLen 0
   var ids: CountTable[int]
   var player = false
@@ -2009,24 +2670,37 @@ proc findIssues*(a: App) =
     ids.inc o.id
     if o.tag == "CHAR" and "IsPlayer" in o.node.xpath("OSD/Flags").str: player = true
   if not player:
-    a.issues.add Issue(text: "No player start (a character with the IsPlayer flag)", face: -1)
+    a.issues.add Issue(severity: sevWarning, text: "No player start (a character with the IsPlayer flag)", face: -1)
   for o in a.objects:
     if ids[o.id] > 1:
-      a.issues.add Issue(text: &"{typeName(o.tag)} #{o.id}: duplicate object id", obj: o, face: -1)
+      a.issues.add Issue(severity: sevError, text: &"{typeName(o.tag)} #{o.id}: duplicate object id", obj: o, face: -1)
     if o.tag in ["CHAR", "FURN", "WEAP", "PWRU", "CONS", "DOOR", "TURR", "TRIG"] and
        o.node.xpath("OSD/Class").str.strip.len == 0:
-      a.issues.add Issue(text: &"{typeName(o.tag)} #{o.id}: no class", obj: o, face: -1)
+      a.issues.add Issue(severity: sevError, text: &"{typeName(o.tag)} #{o.id}: no class", obj: o, face: -1)
   if a.geo != nil:
     var known = toHashSet(a.textures)
     var missing: CountTable[string]
     for i, f in a.geo.faces:
       if f.verts.len < 3:
-        a.issues.add Issue(text: &"Face {i}: fewer than three corners", face: i)
+        a.issues.add Issue(severity: sevError, text: &"Face {i}: fewer than three corners", face: i)
       elif not (f.isMarkerFace or f.isInvisibleFace) and f.texture notin known and f.texture != "NONE":
         missing.inc f.texture
     for t, n in missing:
-      a.issues.add Issue(text: &"Texture {t} ({n} faces): no image in env/images", face: -1)
+      a.issues.add Issue(severity: sevWarning, text: &"Texture {t} ({n} faces): no image in env/images", face: -1)
     for fp in a.geo.faceProblems:
-      a.issues.add Issue(text: &"{fp.faceRef.capitalizeAscii}: {fp.text}", face: fp.face, corner: fp.corner)
+      a.issues.add Issue(severity: fp.severity, text: &"{fp.faceRef.capitalizeAscii}: {fp.text}", face: fp.face, corner: fp.corner)
+  for (sev, l) in extra:
+    let text = l.capitalizeAscii
+    if a.issues.anyIt(it.text == text): continue
+    let (face, corner) = if a.geo != nil: parseFaceRef(text) else: (-1, -1)
+    a.issues.add Issue(severity: sev, text: text, face: face, corner: corner)
+  if a.mcpPortIssue.len > 0:
+    a.issues.add Issue(severity: sevError, text: a.mcpPortIssue, face: -1, mcpPort: true)
+  if a.crashReport.len > 0:
+    a.issues.add Issue(severity: sevError, text: CrashIssue, face: -1, report: a.crashReport)
+  a.issues.sort(proc(x, y: Issue): int = cmp(x.severity, y.severity))   # Errors first; stable.
+  let now = epochTime()
+  a.issuesTime = now
+  for iss in a.issues.mitems: iss.time = seen.getOrDefault(iss.text, now)
 
 include groups

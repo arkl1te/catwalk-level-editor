@@ -9,10 +9,15 @@
 
 import std/[parsexml, streams, strutils, tables, os, algorithm, sets, json, math, strformat, sequtils]
 import vmath
+import tga
 
 type
   AnimMode* = enum amNone, amPulse, amFlicker
   AnimInterp* = enum aiSmooth, aiLinear, aiStep
+
+const MaxAnimSeed* = 999999
+
+type
 
   CornerAnim* = object
     ## A corner's own light settings. Its light going back and forth between
@@ -23,8 +28,9 @@ type
     interp*: AnimInterp
     color*: array[3, uint8]          ## The other end, 0..255.
     period*: float32                 ## Seconds: one pulse there and back, or one flicker step.
-    offset*: float32                 ## Seconds added to the clock. Flickers with the same
-                                     ## period and offset flicker together.
+    offset*: float32                 ## Seconds added to the clock.
+    seed*: uint32                    ## Flicker: picks the random pattern. Flickers with the
+                                     ## same period, offset and seed flicker together.
     unlit*: float32                  ## 0..1: how far the corner ignores its shading (1 = its
                                      ## color at full brightness, hue kept: fullbright).
                                      ## Applied on top of its colors and its animations' colors
@@ -52,6 +58,8 @@ type
     anims*: seq[CornerAnim]          ## Empty, or per corner (may be shorter than verts: animAt).
     lightAnims*: seq[LightLayer]     ## Baked from animated lights (lighting.nim), any number per corner.
     texture*: string                 ## Name without the TXMP prefix, e.g. WH_INTWALL.
+    untint*: array[3, uint8]         ## 255 minus the face's tint per channel (use tint and
+                                     ## tint=), so a zeroed Face is untinted (white).
     flags*: uint32                   ## Gunk flags (authorable ones; see AuthorFlags).
     scriptId*: int32                 ## 0 = none. Used by env_show and friends.
     objectId*: int32                 ## -1, or object type << 24 | object id: geometry
@@ -116,7 +124,7 @@ const
   ## Flags shown as checkboxes in the Face inspector, with their tooltips.
   EditableFlags* = [
     ("Transparent", gfTransparent,
-     "Drawn alpha-blended after the opaque geometry. Use for glass, grates and other textures with alpha."),
+     "Drawn alpha-blended after the opaque geometry. Build sets it (and Two-sided) on every face whose texture has alpha, as Bungie's tools did."),
     ("Two-sided", gfTwoSided,
      "Rendered from both sides instead of only the front."),
     ("No collision", gfNoCollision,
@@ -235,8 +243,9 @@ proc bounds*(g: Geometry): (Vec3, Vec3) =
       hi = max(hi, g.points[v])
   (lo, hi)
 
-proc compact*(g: Geometry) =
-  ## Drops faces without corners, unused points and empty pieces.
+proc compact*(g: Geometry, keepPieces = false) =
+  ## Drops faces without corners, unused points and empty pieces (keepPieces:
+  ## not the pieces, so piece numbers stay valid).
   var keep: seq[Face]
   for f in g.faces:
     if f.verts.len >= 3: keep.add f
@@ -253,6 +262,9 @@ proc compact*(g: Geometry) =
   g.points = pts
   for f in g.faces.mitems:
     for v in f.verts.mitems: v = remap[v]
+  if keepPieces:
+    g.bump()
+    return
   var pieceUsed = newSeq[bool](g.pieces.len)
   for f in g.faces:
     if f.piece >= 0 and f.piece < g.pieces.len: pieceUsed[f.piece] = true
@@ -268,6 +280,7 @@ proc compact*(g: Geometry) =
 
 proc weld*(g: Geometry, eps = 0.01'f32) =
   ## Merges points closer than eps (after moves that make corners meet).
+  ## Piece numbers stay as they are: callers hold on to them.
   var grid: Table[(int, int, int), seq[int32]]
   var remap = newSeq[int32](g.points.len)
   var pts: seq[Vec3]
@@ -305,7 +318,7 @@ proc weld*(g: Geometry, eps = 0.01'f32) =
         if j < f.anims.len: f.anims.delete(j)
         f.lightAnims.setLen 0   # until the next bake
       else: inc i
-  g.compact()
+  g.compact(keepPieces = true)
 
 # --- import from OniSplit's AKEV XML ---------------------------------------------------------------
 
@@ -481,7 +494,7 @@ proc animated*(f: Face): bool =
   for m in f.anims:
     if m.mode != amNone: return true
 
-proc hasCornerData(f: Face): bool =
+proc hasCornerData*(f: Face): bool =
   for m in f.anims:
     if m.mode != amNone or m.manual or m.unlit > 0: return true
 
@@ -508,15 +521,31 @@ proc unlitColor*(c, base: array[3, uint8], unlit: float32): array[3, uint8] =
   let gain = 1 + (255 / top.float32 - 1) * u
   for i in 0 .. 2: result[i] = uint8(min(round(c[i].float32 * gain), 255))
 
+const NoTint* = [255'u8, 255, 255]
+
+proc tint*(f: Face): array[3, uint8] =
+  ## The face's tint: its color, multiplied into the light its corners get
+  ## (baked, unlit, animated). White = none.
+  [255'u8 - f.untint[0], 255'u8 - f.untint[1], 255'u8 - f.untint[2]]
+
+proc `tint=`*(f: var Face, c: array[3, uint8]) =
+  f.untint = [255'u8 - c[0], 255'u8 - c[1], 255'u8 - c[2]]
+
+proc tinted*(f: Face): bool = f.untint != [0'u8, 0, 0]
+
+proc tinted*(c, tint: array[3, uint8]): array[3, uint8] =
+  ## Light c on a surface of color tint (channel times channel, 255 = 1).
+  for i in 0 .. 2: result[i] = uint8((c[i].int * tint[i].int + 127) div 255)
+
 proc shownColor*(f: Face, k: int): array[4, uint8] =
   ## The corner's color as the views draw it and Build writes it: its baked
-  ## color with its unlit factor applied.
+  ## color with its unlit factor applied, then the face's tint.
   result = f.colors[k]
   let u = f.animAt(k).unlit
-  if u > 0:
-    let b = [result[0], result[1], result[2]]
-    let c = unlitColor(b, b, u)
-    result = [c[0], c[1], c[2], result[3]]
+  var c = [result[0], result[1], result[2]]
+  if u > 0: c = unlitColor(c, c, u)
+  if f.tinted: c = tinted(c, f.tint)
+  result = [c[0], c[1], c[2], result[3]]
 
 proc noise(seed: uint32, step: int): float32 =
   ## vertex_light.c's noise: 0..1, the same for the same step of the same flicker.
@@ -525,6 +554,34 @@ proc noise(seed: uint32, step: int): float32 =
   h = h xor (h shr 15); h *= 0x846ca68b'u32
   h = h xor (h shr 16)
   (h shr 8).float32 * (1'f32 / 16777215'f32)
+
+proc flickerSeed(m: CornerAnim): uint32 =
+  ## vertex_light.c's flicker_seed.
+  cast[uint32](max(m.period, 0.01'f32)) * 31'u32 + cast[uint32](m.offset) + m.seed
+
+proc runWorks(m: CornerAnim, seed: uint32, step: int): bool =
+  ## Whether the run of steps that flicker step `step` is in came up working
+  ## (vertex_light.c's flicker_run and run_works). Only for stability > 0.
+  let period = max(m.period, 0.01'f32)
+  let run = max(m.faultLen, period)
+  noise(seed xor 0x5bd1e995'u32, floor(step.float32 * period / run).int) < m.stability
+
+proc flickerFailing*(m: CornerAnim, seconds: float32): bool =
+  ## Whether a flicker is in one of its failures at seconds (Stability 0 fails
+  ## all the time): when a light's ambient plays, as Arklite's vertex_light.c
+  ## sound_gate_open has it.
+  if m.stability <= 0: return true
+  let period = max(m.period, 0.01'f32)
+  not m.runWorks(m.flickerSeed, floor((seconds + m.offset) / period).int)
+
+proc ambientPitch*(m: CornerAnim, light: int, low, high: float32, seconds: float32): float32 =
+  ## The pitch a light's ambient starts at, at seconds: from low to high, by the
+  ## flicker's run (any other light: its step) and the light's id. Arklite's
+  ## vertex_light.c ambient_pitch is the same, so the preview picks what the game does.
+  let period = max(m.period, 0.01'f32)
+  let k = floor((seconds + m.offset) / period).int
+  let step = if m.mode == amFlicker: floor(k.float32 * period / max(m.faultLen, period)).int else: k
+  low + (high - low) * noise(m.flickerSeed xor (0x6c8e9cf5'u32 * uint32(light + 1)), step)
 
 proc animAmount*(m: CornerAnim, seconds: float32): float32 =
   ## How far toward m.color at seconds, 0..1: Arklite's vertex_light.c amount(),
@@ -542,32 +599,36 @@ proc animAmount*(m: CornerAnim, seconds: float32): float32 =
     let t = if m.interp == aiStep: (if f < 0.5: 0'f32 else: 1'f32)
             else: shape(if f < 0.5: 2 * f else: 2 - 2 * f, m.interp)
     return m.low + (m.high - m.low) * t
-  let seed = cast[uint32](period) * 31'u32 + cast[uint32](m.offset)
+  let seed = m.flickerSeed
   proc level(step: int): float32 =
     ## flicker_level: 0 while the light works (by stability), else between low and high.
-    if m.stability > 0:
-      let run = max(m.faultLen, period)
-      if noise(seed xor 0x5bd1e995'u32, floor(step.float32 * period / run).int) < m.stability: return 0
+    if m.stability > 0 and m.runWorks(seed, step): return 0
     m.low + (m.high - m.low) * noise(seed, step)
   let v0 = level(k.int)
   if m.interp == aiStep: return v0
   v0 + (level(k.int + 1) - v0) * shape(f, m.interp)
 
+proc animEnd*(f: Face, k: int, color: array[3, uint8]): array[3, uint8] =
+  ## An animation's other end (color) for corner k as shown and built: with
+  ## the corner's unlit factor and the face's tint, like shownColor.
+  let baked = [f.colors[k][0], f.colors[k][1], f.colors[k][2]]
+  result = unlitColor(color, baked, f.animAt(k).unlit)
+  if f.tinted: result = tinted(result, f.tint)
+
 proc liveColor*(f: Face, k: int, seconds: float32): array[4, uint8] =
   ## The corner's shown color at seconds with its own and its lights'
-  ## animations playing (they add up, like vertex_light.c's records).
+  ## animations playing (they add up, like vertex_light.c's records). The
+  ## animations' other ends are tinted like the baked color (animEnd).
   let base = f.shownColor(k)
-  let u = f.animAt(k).unlit
-  let baked = [f.colors[k][0], f.colors[k][1], f.colors[k][2]]
   var sum = [base[0].float32, base[1].float32, base[2].float32]
-  proc add(m: CornerAnim) =
-    if m.mode == amNone: return
-    let t = m.animAmount(seconds)
-    let b = unlitColor(m.color, baked, u)
-    for i in 0 .. 2: sum[i] += (b[i].float32 - base[i].float32) * t
-  f.animAt(k).add
+  template add(m: CornerAnim) =
+    if m.mode != amNone:
+      let t = m.animAmount(seconds)
+      let b = f.animEnd(k, m.color)
+      for i in 0 .. 2: sum[i] += (b[i].float32 - base[i].float32) * t
+  add f.animAt(k)
   for l in f.lightAnims:
-    if l.corner == k: l.anim.add
+    if l.corner == k: add l.anim
   for i in 0 .. 2: result[i] = uint8(clamp(sum[i] + 0.5, 0, 255))
   result[3] = base[3]
 
@@ -600,9 +661,12 @@ proc save*(g: Geometry, path: string) =
       col.add %((c[0].int shl 16) or (c[1].int shl 8) or c[2].int)
     var fj = %*{"v": vs, "uv": uv, "c": col, "t": texIndex[f.texture], "f": f.flags.int,
                 "s": f.scriptId, "o": f.objectId, "p": f.piece}
+    if f.tinted:
+      let t = f.tint
+      fj["ti"] = %((t[0].int shl 16) or (t[1].int shl 8) or t[2].int)
     proc animJson(m: CornerAnim): JsonNode =
       %*[m.mode.ord, m.interp.ord, (m.color[0].int shl 16) or (m.color[1].int shl 8) or m.color[2].int,
-         m.period, m.offset, (if m.manual: 1 else: 0), m.low, m.high, m.stability, m.faultLen, m.unlit]
+         m.period, m.offset, (if m.manual: 1 else: 0), m.low, m.high, m.stability, m.faultLen, m.unlit, m.seed.int]
     if f.hasCornerData:
       var an = newJArray()
       for k in 0 ..< f.verts.len:
@@ -639,6 +703,9 @@ proc loadGeometry*(path: string): Geometry =
     var f = Face(texture: texNames[fj["t"].getInt], flags: uint32(fj["f"].getInt),
                  scriptId: fj["s"].getInt.int32, objectId: fj{"o"}.getInt(-1).int32,
                  piece: fj["p"].getInt.int32)
+    if fj.hasKey("ti"):
+      let t = fj["ti"].getInt
+      f.tint = [uint8((t shr 16) and 255), uint8((t shr 8) and 255), uint8(t and 255)]
     for v in fj["v"].getElems: f.verts.add v.getInt.int32
     let uv = fj["uv"].getElems
     var k = 0
@@ -663,6 +730,7 @@ proc loadGeometry*(path: string): Geometry =
           result.stability = e[8].getFloat.float32
           result.faultLen = e[9].getFloat.float32
         if e.len >= 11: result.unlit = clamp(e[10].getFloat, 0, 1).float32
+        if e.len >= 12: result.seed = clamp(e[11].getInt, 0, MaxAnimSeed).uint32
     for aj in fj{"a"}.getElems: f.anims.add animOf(aj)
     for lj in fj{"la"}.getElems:
       let e = lj.getElems
@@ -703,10 +771,17 @@ proc daePieces(g: Geometry, f: Face): seq[seq[int]] =
     if area.length > 1e-4: result.add piece
     i += piece.len - 2
 
-type FaceProblem* = object
-  face*: int
-  corner*: int     ## Index into the face's verts of the corner to fix, or -1.
-  text*: string
+type
+  Severity* = enum
+    ## How bad an issue is: info = the build copes with it, warning = the level
+    ## builds but likely looks or plays wrong, error = it breaks the level.
+    sevError = "error", sevWarning = "warning", sevInfo = "info"
+
+  FaceProblem* = object
+    severity*: Severity
+    face*: int
+    corner*: int     ## Index into the face's verts of the corner to fix, or -1.
+    text*: string
 
 proc faceProblems*(g: Geometry): seq[FaceProblem] =
   ## Faces Oni (or OniSplit) can't take as they are: more than 4 corners,
@@ -722,13 +797,13 @@ proc faceProblems*(g: Geometry): seq[FaceProblem] =
       let (a, b) = (ps[k], ps[(k + 1) mod n])
       nrm += vec3((a.y - b.y) * (a.z + b.z), (a.z - b.z) * (a.x + b.x), (a.x - b.x) * (a.y + b.y))
     if nrm.length < 1e-4:
-      result.add FaceProblem(face: fi, corner: -1, text: "has no area")
+      result.add FaceProblem(severity: sevWarning, face: fi, corner: -1, text: "has no area")
       continue
     nrm = nrm.normalize
     # Corner turns: cross of the edges in and out, along the normal. Negative =
     # concave; near zero relative to the edges = a corner on a straight line.
-    var dup, concave, straightest = -1
-    var straightness = Inf.float32
+    var dup, concave = -1
+    var straight: seq[int]   # Corners on a straight edge: deleting one keeps the shape.
     for k in 0 ..< n:
       let ein = ps[k] - ps[(k + n - 1) mod n]
       let eout = ps[(k + 1) mod n] - ps[k]
@@ -738,14 +813,18 @@ proc faceProblems*(g: Geometry): seq[FaceProblem] =
       if ein.length < 1e-3: continue
       let turn = dot(cross(ein, eout), nrm) / (ein.length * eout.length)
       if turn < -1e-3 and concave < 0: concave = k
-      if abs(turn) < straightness:
-        straightness = abs(turn)
-        straightest = k
+      if abs(turn) < 1e-3: straight.add k
     if dup >= 0:
-      result.add FaceProblem(face: fi, corner: dup, text: &"corner {dup} is on top of corner {(dup + n - 1) mod n}")
+      result.add FaceProblem(severity: sevWarning, face: fi, corner: dup, text: &"sits on top of corner {(dup + n - 1) mod n}")
     if n > 4:
-      result.add FaceProblem(face: fi, corner: straightest,
-        text: &"has {n} corners; Oni quads take at most 4, so the build splits it into {daePieces(g, f).len} pieces")
+      # The whole face's problem, not one corner's: no corner is named.
+      var text = &"has {n} corners, but Oni faces take at most 4, so the build splits it into {daePieces(g, f).len} pieces"
+      if straight.len > 0:
+        let names = straight.mapIt($it)
+        let list = if names.len == 1: "corner " & names[0]
+                   else: "corners " & names[0 ..< ^1].join(", ") & " and " & names[^1]
+        text.add &"; {list} lie on straight edges and can be deleted without changing its shape"
+      result.add FaceProblem(severity: sevInfo, face: fi, corner: -1, text: text)
     var c = vec3(0)
     for p in ps: c += p
     c /= n.float32
@@ -757,10 +836,10 @@ proc faceProblems*(g: Geometry): seq[FaceProblem] =
         farDist = d
         far = k
     if far >= 0:
-      result.add FaceProblem(face: fi, corner: far,
-        text: &"is bent: corner {far} is {farDist:.2f} off the face's plane")
+      result.add FaceProblem(severity: sevWarning, face: fi, corner: far,
+        text: &"is {farDist:.2f} off the plane of the rest of the face (the face is bent)")
     if concave >= 0:
-      result.add FaceProblem(face: fi, corner: concave, text: &"is concave at corner {concave}")
+      result.add FaceProblem(severity: sevWarning, face: fi, corner: concave, text: "dents inwards (the face is concave here)")
 
 proc faceRef*(fp: FaceProblem): string =
   ## How build logs and the Issues list name the face; parseFaceRef reads it back.
@@ -786,8 +865,144 @@ proc parseFaceRef*(s: string): tuple[face, corner: int] =
     while j < s.len and s[j].isDigit: inc j
     if j > i: result.corner = parseInt(s[i ..< j])
 
-proc writeDae(path: string, g: Geometry, faces: seq[int], imageDir, markerDir: string) =
-  ## One geometry node; one polylist per material.
+# Spinning groups: Oni moves only physics objects (ONLV OBOA) with an OBAN, so
+# a group with a spin leaves the environment and goes to -create:level's
+# <Physics> as a looping object, turned about the vertical through its center.
+# An Oni mesh has one texture, so each texture is its own object, sharing the
+# group's pivot and script id. No collision: characters find floors only in the
+# environment, so they fall through it anyway, and one that blocks an animated
+# object pauses that object alone, which would pull a group's parts apart.
+# Particle objects in the group don't go to the object: Arklite turns them
+# (spinparticles.bin, its spin_particle.c), with the same period.
+
+const
+  MinSpinSeconds* = 0.1'f32
+  SpinSource = "spin.xml"
+  SpinScriptBase = 30000    ## Group id + this = the object's script id.
+  SpinParticleMagic = 0x50535743'u32   ## "CWSP"
+  SpinParticleVersion = 1'u32
+
+type
+  SpinGroup* = object
+    name*: string          ## The object's name: its M3GM and OBAN instances.
+    seconds*: float32      ## Per turn; negative = the other way.
+    center*: Vec3
+    faces*: seq[int]
+    particles*: seq[int]   ## Ids of the Particle objects in it.
+    scriptId*: int         ## obj_create's handle: see startOnLoad.
+
+  SpinMember* = tuple[id: int, group: int32, pos: Vec3]  ## A Particle object in a group.
+
+proc spinTicks*(seconds: float32): int =
+  ## A turn's length in ticks.
+  max(round(abs(seconds) * 60).int, 2)
+
+proc collectSpins*(g: Geometry, parent: Table[int32, int32], spin: Table[int32, float32],
+                   members: seq[SpinMember]): seq[SpinGroup] =
+  ## The groups that spin, from the group table. A group inside a spinning group
+  ## turns with the outer one; its own spin doesn't add to it. The center is that
+  ## of the group's faces and particles together, so they turn as one.
+  proc outerSpin(gid: int32): int32 =
+    var at = gid
+    while at != 0:
+      if spin.getOrDefault(at) != 0: result = at
+      at = parent.getOrDefault(at)
+  var found: OrderedTable[int32, SpinGroup]
+  var bounds: Table[int32, (Vec3, Vec3)]
+  proc note(id: int32, p: Vec3) =
+    let (lo, hi) = bounds.getOrDefault(id, (vec3(Inf.float32), vec3(-Inf.float32)))
+    bounds[id] = (min(lo, p), max(hi, p))
+  for i, f in g.faces:
+    if f.verts.len < 3 or f.piece notin 0'i32 .. g.pieces.high.int32: continue
+    let id = outerSpin(g.pieces[f.piece].group)
+    if id == 0: continue
+    found.mgetOrPut(id, SpinGroup()).faces.add i
+    for v in f.verts: note(id, g.points[v])
+  for m in members:
+    let id = outerSpin(m.group)
+    if id == 0: continue
+    found.mgetOrPut(id, SpinGroup()).particles.add m.id
+    note(id, m.pos)
+  for id, s in found:
+    var s = s
+    let (lo, hi) = bounds[id]
+    s.name = "cw_spin" & $id
+    s.seconds = spin[id]
+    s.center = (lo + hi) / 2
+    s.scriptId = SpinScriptBase + id
+    result.add s
+
+proc spinGroups*(g: Geometry, groupsFile: string, particles: Table[int, Vec3]): seq[SpinGroup] =
+  ## The groups in groupsFile that spin. particles: where each Particle object is.
+  if not fileExists(groupsFile): return
+  let j = parseFile(groupsFile)
+  var parent = initTable[int32, int32]()
+  var spin = initTable[int32, float32]()
+  for gj in j{"groups"}.getElems:
+    let id = gj{"id"}.getInt.int32
+    parent[id] = gj{"parent"}.getInt.int32
+    spin[id] = gj{"spin"}.getFloat.float32
+  var members: seq[SpinMember]
+  for e in j{"objects"}.getElems:
+    let k = e.getElems
+    if k.len == 3 and k[0].getStr == "PART" and k[1].getInt in particles:
+      members.add (k[1].getInt, k[2].getInt.int32, particles[k[1].getInt])
+  collectSpins(g, parent, spin, members)
+
+proc writeSpinParticles*(spins: seq[SpinGroup], path: string): int =
+  ## spinparticles.bin for Arklite (spin_particle.c), sorted by object id: the
+  ## particles of the spinning groups, each with its group's axis and turn. No
+  ## file without any. Returns the record count.
+  if fileExists(path): removeFile(path)
+  var recs: seq[(uint32, float32, float32, float32)]
+  for s in spins:
+    for id in s.particles:
+      recs.add (id.uint32, s.seconds, s.center.x, s.center.z)
+  if recs.len == 0: return
+  recs.sort(proc(a, b: (uint32, float32, float32, float32)): int = cmp(a[0], b[0]))
+  var o = newStringStream()
+  o.write SpinParticleMagic
+  o.write SpinParticleVersion
+  o.write recs.len.uint32
+  for r in recs:
+    o.write r[0]
+    o.write r[1]
+    o.write r[2]
+    o.write r[3]
+  createDir(path.parentDir)
+  writeFile(path, o.data)
+  recs.len
+
+proc withoutSpinning*(g: Geometry, spins: seq[SpinGroup]): Geometry =
+  ## g without the spinning groups' faces (they share g's points).
+  var gone: HashSet[int]
+  for s in spins:
+    for fi in s.faces: gone.incl fi
+  result = Geometry(points: g.points, pieces: g.pieces)
+  for i, f in g.faces:
+    if i notin gone: result.faces.add f
+
+proc spinSamplers(s: SpinGroup): string =
+  ## The node's turn as a Collada animation: one turn, ending one tick short of
+  ## the start, so the loop's jump back to frame 0 is a normal step.
+  let ticks = spinTicks(s.seconds)
+  let last = 360 * (ticks - 1) / ticks * (if s.seconds < 0: -1.0 else: 1.0)
+  let t = &"0 {(ticks - 1).float / 60:.5f}"
+  result.add "<library_animations><animation id=\"turn\">"
+  result.add &"<source id=\"t\"><float_array id=\"t_a\" count=\"2\">{t}</float_array><technique_common>" &
+    "<accessor source=\"#t_a\" count=\"2\" stride=\"1\"><param name=\"TIME\" type=\"float\"/></accessor></technique_common></source>"
+  result.add &"<source id=\"v\"><float_array id=\"v_a\" count=\"2\">0 {last:.5f}</float_array><technique_common>" &
+    "<accessor source=\"#v_a\" count=\"2\" stride=\"1\"><param name=\"ANGLE\" type=\"float\"/></accessor></technique_common></source>"
+  result.add "<source id=\"i\"><Name_array id=\"i_a\" count=\"2\">LINEAR LINEAR</Name_array><technique_common>" &
+    "<accessor source=\"#i_a\" count=\"2\" stride=\"1\"><param name=\"INTERPOLATION\" type=\"name\"/></accessor></technique_common></source>"
+  result.add "<sampler id=\"s\"><input semantic=\"INPUT\" source=\"#t\"/><input semantic=\"OUTPUT\" source=\"#v\"/>" &
+    "<input semantic=\"INTERPOLATION\" source=\"#i\"/></sampler>"
+  result.add &"<channel source=\"#s\" target=\"{s.name}/turn.ANGLE\"/></animation></library_animations>\n"
+
+proc writeDae(path: string, g: Geometry, faces: seq[int], imageDir, markerDir: string,
+              spin = SpinGroup()) =
+  ## One geometry node; one polylist per material. With a spin the points are
+  ## relative to its center and the node carries the turn.
   var byMat: OrderedTable[string, seq[int]]
   for fi in faces:
     let f = g.faces[fi]
@@ -801,7 +1016,7 @@ proc writeDae(path: string, g: Geometry, faces: seq[int], imageDir, markerDir: s
     for v in g.faces[fi].verts:
       if v notin pointIndex:
         pointIndex[v] = pointIndex.len
-        let p = g.points[v]
+        let p = g.points[v] - spin.center
         pos.add &"{p.x:.4f} {p.y:.4f} {p.z:.4f}"
   var o = newStringOfCap(1 shl 16)
   o.add "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
@@ -853,13 +1068,50 @@ proc writeDae(path: string, g: Geometry, faces: seq[int], imageDir, markerDir: s
   o.add "<vertices id=\"vtx\"><input semantic=\"POSITION\" source=\"#pos\"/></vertices>\n"
   o.add polys
   o.add "</mesh></geometry>\n</library_geometries>\n"
-  o.add "<library_visual_scenes><visual_scene id=\"scene\"><node id=\"n\" name=\"n\"><instance_geometry url=\"#geo\"><bind_material><technique_common>\n"
+  let node = if spin.name.len > 0: spin.name else: "n"
+  if spin.name.len > 0: o.add spinSamplers(spin)
+  o.add &"<library_visual_scenes><visual_scene id=\"scene\"><node id=\"{node}\" name=\"{node}\">"
+  if spin.name.len > 0:
+    let c = spin.center
+    o.add &"<translate sid=\"move\">{c.x:.4f} {c.y:.4f} {c.z:.4f}</translate><rotate sid=\"turn\">0 1 0 0</rotate>"
+  o.add "<instance_geometry url=\"#geo\"><bind_material><technique_common>\n"
   for m in byMat.keys:
     let e = xmlEsc(m)
     o.add &"<instance_material symbol=\"{e}\" target=\"#{e}\"><bind_vertex_input semantic=\"uv\" input_semantic=\"TEXCOORD\" input_set=\"0\"/></instance_material>\n"
   o.add "</technique_common></bind_material></instance_geometry></node></visual_scene></library_visual_scenes>\n"
   o.add "<scene><instance_visual_scene url=\"#scene\"/></scene>\n</COLLADA>\n"
   writeFile(path, o)
+
+proc writeSpinSource*(g: Geometry, spins: seq[SpinGroup], dir, imageDir, markerDir: string): string =
+  ## The spinning groups as an object XML for -create:level; "" with none.
+  ## g is the geometry they were found in. Groups of particles alone have none.
+  if not spins.anyIt(it.faces.len > 0): return
+  createDir(dir)
+  var x = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<Oni>\n<Physics>\n"
+  for s in spins:
+    var parts: OrderedTable[string, seq[int]]
+    for fi in s.faces:
+      let m = markerMaterial(g.faces[fi])
+      parts.mgetOrPut(if m.len > 0: m else: g.faces[fi].texture, @[]).add fi
+    var n = 0
+    for _, faces in parts:
+      var part = s
+      part.name = s.name & "_" & $n
+      part.faces = faces
+      inc n
+      writeDae(dir / part.name & ".dae", g, faces, imageDir, markerDir, part)
+      x.add &"<Object><ScriptId>{s.scriptId}</ScriptId><Flags>NoCollision</Flags><Physics>Animated</Physics><Import Path=\"{part.name}.dae\">" &
+        &"<Animation Name=\"{part.name}\"><Flags>Loop AutoStart</Flags></Animation></Import></Object>\n"
+  x.add "</Physics>\n</Oni>\n"
+  result = dir / SpinSource
+  writeFile(result, x)
+
+proc textureHasAlpha*(path: string): bool =
+  ## Whether a texture's picture has see-through pixels (as the viewport's test).
+  if not fileExists(path): return false
+  try:
+    return readTga(readFile(path)).seeThrough
+  except CatchableError: discard
 
 proc writeLevelSource*(g: Geometry, dir, envName, sky, imageDir, markerDir: string,
                        roomDaes: seq[string], objectFiles: seq[string] = @[]): string =
@@ -868,9 +1120,18 @@ proc writeLevelSource*(g: Geometry, dir, envName, sky, imageDir, markerDir: stri
   ## are object XMLs OniSplit builds into the level (doors: their geometry).
   createDir(dir)
   var groups: OrderedTable[(uint32, int32), seq[int]]
+  var alphaTex: Table[string, bool]
   for i, f in g.faces:
     if f.verts.len < 3: continue
-    groups.mgetOrPut((f.flags and not (DerivedFlags or EditorFlags), f.scriptId), @[]).add i
+    var flags = f.flags and not (DerivedFlags or EditorFlags)
+    # Bungie's importer made every face with a see-through texture Transparent
+    # and Two-sided (Imp_Env2_Process.c): Oni then draws it in its alpha pass,
+    # after everything solid and sorted, as the viewport does. Without it the
+    # face blends in the solid pass, over whatever happens to be drawn yet.
+    if markerMaterial(f).len == 0 and not f.texture.startsWith("_marker"):
+      if f.texture notin alphaTex: alphaTex[f.texture] = textureHasAlpha(imageDir / f.texture & ".tga")
+      if alphaTex[f.texture]: flags = flags or gfTransparent or gfTwoSided
+    groups.mgetOrPut((flags, f.scriptId), @[]).add i
   var x = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<Oni>\n"
   x.add &"  <Level Name=\"{xmlEsc(envName)}\" SharedPath=\"{xmlEsc(dir / \"shared\")}\">\n"
   x.add "    <Environment>\n      <Model>\n"
@@ -891,7 +1152,10 @@ proc writeLevelSource*(g: Geometry, dir, envName, sky, imageDir, markerDir: stri
   # OniSplit always writes an ONSK link and throws on an empty name. Levels
   # without a sky (level 6) get a placeholder; only the AKEV output is used.
   let skyName = if sky.len > 0: sky else: "none"
-  x.add &"      </Rooms>\n    </Environment>\n    <Sky>{xmlEsc(skyName)}</Sky>\n    <Objects>"
+  # Not an empty element: OniSplit skips one without reading its attributes.
+  # Past MaxSize it would shrink the picture (see pictures.nim for the size).
+  x.add "      </Rooms>\n      <Textures MaxSize=\"1024\"> </Textures>\n    </Environment>\n"
+  x.add &"    <Sky>{xmlEsc(skyName)}</Sky>\n    <Objects>"
   for f in objectFiles: x.add &"\n      <Import>{xmlEsc(f)}</Import>"
   x.add (if objectFiles.len > 0: "\n    " else: "") & "</Objects>\n  </Level>\n</Oni>\n"
   result = dir / envName & ".xml"
@@ -1039,7 +1303,22 @@ proc hasAnims*(g: Geometry): bool =
   for f in g.faces:
     if f.animated or f.lightAnims.len > 0: return true
 
-proc writeVertexAnims*(model, built: Geometry, path: string): int =
+type LightEvent* = object
+  ## A light's sound: an impulse played when a flicker's failure starts, or each
+  ## pulse; or (soundObject > 0) the Sound object that plays a flickering light's
+  ## ambient, which Arklite lets play only while the flicker fails.
+  mode*: AnimMode
+  period*, offset*, stability*, fault*: float32  ## As its corners' records have them.
+  seed*: uint32
+  pitch*, pitchMax*, volume*: float32   ## Each play picks a pitch from pitch to pitchMax.
+  pos*: Vec3
+  positional*: bool                  ## False (directional lights): heard everywhere.
+  sound*: string                     ## Impulse name (an ambient's, for soundObject).
+  soundObject*: int                  ## Id of the SNDG that plays the light's ambient; 0 = impulse.
+  light*: int                        ## The light's own id: picks its ambient's pitches.
+
+proc writeVertexAnims*(model, built: Geometry, path: string,
+                       events: seq[LightEvent] = @[]): int =
   ## vertexlight.bin for Arklite (vertex_light.c): one record per animation
   ## of a corner of the built quads, by AGQG index, with its baked color: the
   ## corner's own animation, then one per animated light that reaches it (a
@@ -1059,12 +1338,10 @@ proc writeVertexAnims*(model, built: Geometry, path: string): int =
     for v in f.verts: own.incl cornerKey(model.points[v])
     for k, v in f.verts:
       var layers: seq[CornerAnim]
-      let unlit = f.animAt(k).unlit
-      let baked = [f.colors[k][0], f.colors[k][1], f.colors[k][2]]
       if f.animAt(k).mode != amNone: layers.add f.animAt(k)
       for l in f.lightAnims:
         if l.corner == k and l.anim.mode != amNone: layers.add l.anim
-      for m in layers.mitems: m.color = unlitColor(m.color, baked, unlit)   # as the built colors
+      for m in layers.mitems: m.color = f.animEnd(k, m.color)   # as the built colors
       if layers.len == 0: continue
       for (qi, qk) in byCorner.getOrDefault(cornerKey(model.points[v])):
         let q = built.faces[qi]
@@ -1076,7 +1353,7 @@ proc writeVertexAnims*(model, built: Geometry, path: string): int =
   proc put32(v: uint32) =
     for b in 0 .. 3: data.add char((v shr (8 * b)) and 255)
   put32 0x4c565743'u32   # "CWVL"
-  put32 3
+  put32 8
   put32 recs.len.uint32
   for r in recs:
     let m = r.m
@@ -1094,6 +1371,18 @@ proc writeVertexAnims*(model, built: Geometry, path: string): int =
     put32 cast[uint32](clamp(m.high, 0, 1))
     put32 cast[uint32](clamp(m.stability, 0, 1))
     put32 cast[uint32](max(m.faultLen, 0))
+    put32 m.seed
+  put32 events.len.uint32
+  for e in events:
+    put32 e.mode.ord.uint32
+    for v in [e.period, e.offset, e.stability, e.fault, e.pitch, e.volume, e.pos.x, e.pos.y, e.pos.z]:
+      put32 cast[uint32](v)
+    put32 e.positional.uint32
+    for i in 0 ..< 32: data.add (if i < min(e.sound.len, 31): e.sound[i] else: '\0')
+    put32 cast[uint32](e.pitchMax)
+    put32 e.seed
+    put32 e.soundObject.uint32
+    put32 e.light.uint32
   writeFile(path, data)
   recs.len
 

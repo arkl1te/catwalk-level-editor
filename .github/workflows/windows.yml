@@ -1,0 +1,64 @@
+# Builds the Windows release on every push with tools/windows.sh, the same
+# way it's built locally from Git Bash (as Majestic Media Player's is). What
+# ships (catwalk.exe, the README and licenses, see tools/windows.sh stage) is
+# attached to the run as an artifact; pushing a v* tag also publishes a
+# GitHub Release.
+name: Windows build
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write  # only used by the release step
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash  # Git Bash, which windows.sh expects
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner already has Visual Studio with the C++ workload and the
+      # Windows SDK (rc.exe, for the icon); only Nim is missing.
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.2.x'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build
+        run: tools/windows.sh build
+
+      - name: Package
+        id: pkg
+        run: |
+          name="catwalk-$(cat VERSION)-windows-x64"
+          [[ $GITHUB_REF == refs/tags/* ]] || name+="-${GITHUB_SHA::7}"
+          tools/windows.sh stage "$name"
+          7z a "$name.zip" "$name" >/dev/null
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.name }}/
+
+      # Release notes = the annotated tag's message ("What's new"). checkout
+      # only fetches the tagged commit, so the tag object itself is fetched
+      # to read its message.
+      - name: Release notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          git fetch --force --depth=1 origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          git tag -l --format='%(contents)' "$GITHUB_REF_NAME" > release-notes.md
+          cat release-notes.md
+
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.pkg.outputs.name }}.zip
+          body_path: release-notes.md

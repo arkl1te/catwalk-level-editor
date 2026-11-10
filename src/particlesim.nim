@@ -6,7 +6,7 @@
 ## their TGA frames). Decal textures are per level: they come from the
 ## project's own oni folder (levelTextureJob).
 ##
-## What the engine does, from the decompiled Oni.exe and the wiki's
+## What the engine does, from Oni.exe (addresses below) and the wiki's
 ## OBD:BINA/PAR3 pages:
 ## - A PART object creates its particle when the level loads unless its flags
 ##   have 0x02 (NotInitiallyCreated). The particle sits at the object, turned
@@ -22,12 +22,15 @@
 ##   velocity = speed × direction (+ the parent's velocity with
 ##   EmitWithParentVelocity). The new particle's frame comes from the
 ##   emitter's Orientation (its +Y) and OrientationUp (its +Z), X = Y × Z
-##   (FUN_0045b320).
+##   (FUN_0045b320). "Velocity" there is the emission's direction, whatever the
+##   speed and whether or not the class keeps a velocity.
 ## - Action handlers (table at 0x536078, 0xC0 bytes per type): gravity is
 ##   98 units/s² (0x52a054); air resistance and drift ease exponentially.
-## - Drawing (FUN_00461150): Scale is the half-width, YScale (when enabled)
-##   the half-length along the travel axis, ScaleToVelocity multiplies the
-##   scale by speed + 1. A texture's Speed is ticks per frame.
+## - Drawing (FUN_00461150, render.nim's spriteQuad): rotated sprites and beams
+##   follow the orientation's +Y if the class has one, else the velocity (which
+##   ScaleToVelocity then scales by speed + 1). Scale is the half-size along the
+##   sprite's X, YScale (when enabled) along its Y. A texture's Speed is ticks
+##   per frame.
 ##
 ## - Contrails (FUN_00461d20): a contrail particle draws a ribbon, Scale
 ##   wide, from where it is to the particle it links to (same class). A
@@ -41,7 +44,7 @@
 ##
 ## Not emulated: sounds, damage, attractors, characters, impact effects.
 
-import std/[os, strutils, tables, sets, math, random, xmlparser, xmltree, hashes]
+import std/[os, strutils, sequtils, tables, sets, math, random, xmlparser, xmltree, hashes]
 import vmath
 import geometry, lighting, render, jobs, project, collada
 
@@ -53,13 +56,13 @@ const
   MaxTicksPerFrame = 6           ## Behind by more than this, the rest is skipped.
   NotInitiallyCreated = 0x02     ## PART flag.
   RebuildEvery = 1.0             ## Seconds between rebuilding the collision grid after edits.
+  TinySq = 9.536743e-07'f32      ## Squared length below which a vector counts as zero.
   DecalReach = 16'f32            ## How far a placed decal looks for the surface it goes on.
+  LoopGap = 0.5'f32              ## Seconds between a looping play's end and the next one.
 
 # --- cache ------------------------------------------------------------------------
 
-proc particleDir*(): string =
-  let xdg = getEnv("XDG_CACHE_HOME")
-  (if xdg.len > 0: xdg else: getHomeDir() / ".cache") / "catwalk" / "particles"
+proc particleDir*(): string = particleCacheDir()
 
 proc hasParticleCache*(): bool =
   let v = particleDir() / "version"
@@ -92,18 +95,18 @@ proc particleCacheJob*(c: Config, logPath: string): Job =
       if dirExists(work): removeDir(work)
       for d in [oni, xml, txml, dae]: createDir(d)),
     command("Reading level 0", proc(): seq[string] =
-      @[c.mono, c.oniSplit, "-export", oni, c.gameData / "level0_Final.dat"]),
+      c.oniSplitCmd & @["-export", oni, c.gameData / "level0_Final.dat"]),
     command("Reading particle classes", proc(): seq[string] =
-      @[c.mono, c.oniSplit, "-extract:xml", xml, oni / "BINA3RAP*.oni"]),
+      c.oniSplitCmd & @["-extract:xml", xml, oni / "BINA3RAP*.oni"]),
     # Each model's .dae names its image after the model's TXMP.
     command("Extracting particle models", proc(): seq[string] =
-      result = @[c.mono, c.oniSplit, "-extract:dae", dae]
+      result = c.oniSplitCmd & @["-extract:dae", dae]
       for t in texturesOf(xml, "BINA3RAP", geometry = true):
         if fileExists(oni / "M3GM" & t & ".oni"): result.add oni / "M3GM" & t & ".oni"
       if result.len == 4: result = @["true"]),
     # OniSplit finds an animated texture's frames next to its TXMP.
     command("Extracting particle textures", proc(): seq[string] =
-      result = @[c.mono, c.oniSplit, "-extract:xml", txml]
+      result = c.oniSplitCmd & @["-extract:xml", txml]
       var names = texturesOf(xml, "BINA3RAP")
       for f in walkFiles(dae / "images" / "*.tga"): names.incl f.splitFile.name
       for t in names:
@@ -136,7 +139,7 @@ proc levelTextureJob*(c: Config, oniDir: string, names: seq[string], logPath: st
   newJob("Extracting the level's decal textures", logPath, @[
     action("Preparing", proc() = createDir(dst)),
     command("Extracting decal textures", proc(): seq[string] =
-      result = @[c.mono, c.oniSplit, "-extract:xml", dst]
+      result = c.oniSplitCmd & @["-extract:xml", dst]
       for n in names:
         if fileExists(oniDir / "TXMP" & n & ".oni"): result.add oniDir / "TXMP" & n & ".oni"
       if result.len == 4: result = @["true"]),
@@ -216,6 +219,7 @@ type
     invisible, scaleToVelocity, useYScale, edgeFade, oneSidedEdgeFade, lensFlare: bool
     scale, yScale, rotation, alpha, tint: Value
     edgeFadeMin, edgeFadeMax: float32
+    xOffset, xShorten: Value     ## Where the sprite sits along its X, and how much is cut off.
     hasContrail, contrailEmitter: bool  ## HasContrailData, IsContrailEmitter.
     maxContrail: Value           ## Longer segments aren't drawn (0 = no limit).
     varNames: seq[string]
@@ -411,8 +415,8 @@ proc parseEmitter(n: XmlNode, cls: PClass): Emitter =
   result.orient = n.text("Orientation")
   result.orientUp = n.text("OrientationUp")
 
-proc parseClass(path: string): PClass =
-  var s = readFile(path)
+proc parseClassXml(xml: string): PClass =
+  var s = xml
   if s.startsWith("\xEF\xBB\xBF"): s = s[3 .. ^1]
   let root = parseXml(s)
   let n = root.sub("Particle")
@@ -462,6 +466,8 @@ proc parseClass(path: string): PClass =
   cls.rotation = parseValue(a.sub("Rotation"), cls)
   cls.alpha = parseValue(a.sub("Alpha"), cls)
   cls.tint = parseValue(a.sub("Tint"), cls, color = true)
+  cls.xOffset = parseValue(a.sub("XOffset"), cls)
+  cls.xShorten = parseValue(a.sub("XShorten"), cls)
   let ev = n.sub("Events")
   var idx = 0
   for e, name in EventNames:
@@ -488,6 +494,8 @@ proc parseClass(path: string): PClass =
       if em.kind == xnElement and em.tag == "Emitter": cls.emitters.add parseEmitter(em, cls)
   cls
 
+proc parseClass(path: string): PClass = parseClassXml(readFile(path))
+
 proc parseTexture(path: string): TexInfo =
   var s = readFile(path)
   if s.startsWith("\xEF\xBB\xBF"): s = s[3 .. ^1]
@@ -507,6 +515,20 @@ proc parseTexture(path: string): TexInfo =
 # --- simulation -----------------------------------------------------------------
 
 type
+  SourceId* = tuple[id, nth: int]  ## An object's id, and which of the objects sharing it.
+
+  ParticleSource* = object
+    ## A Particle object, as the level places it.
+    id*: SourceId
+    cls*: string
+    pos*: Vec3
+    axes*: array[3, Vec3]
+    decalScale*: Vec2
+    flags*: int
+    started*: bool   ## Its script starts it at load (AutoStartTag): it gets Start too.
+    spin*: float32   ## Its group's seconds per turn, 0 = none.
+    pivot*: Vec3     ## On its group's axis.
+
   EmState = object
     on, fresh: bool
     count: int
@@ -523,6 +545,8 @@ type
     fade, fadeTime: float32      ## Fading out when fadeTime > 0.
     hidden, dead, dying, orientToVel: bool
     snapped: bool                ## A decal moved onto the surface behind it (sprites).
+    source: SourceId             ## The Particle object it came from, through any emitters.
+    placed: bool                 ## It's that object's own particle, not an emitted one.
     disabled: seq[bool]
     ems: seq[EmState]
     link: Particle
@@ -536,11 +560,18 @@ type
 
   ParticleSim* = ref object
     classes: Table[string, PClass]
+    edited: Table[string, string]      ## The project's edited classes, by lowercase name: their XML.
     missingClasses*: HashSet[string]
     textures: Table[string, TexInfo]
     missingTextures*: HashSet[string]  ## Not in level 0: looked for in the level (levelTextureDir).
     levelTextures*: string             ## That folder ("" = none).
     parts: seq[Particle]
+    placed: Table[SourceId, ParticleSource]  ## The objects they were started from.
+    current: SourceId                  ## The object whose particles are running.
+    played*: HashSet[SourceId]         ## Objects started by hand (play): they get Start, as a script would.
+    held*: HashSet[SourceId]           ## Objects stopped by hand (halt): they emit nothing.
+    loop*: bool                        ## Played objects start again when they finish.
+    spentAt: Table[SourceId, float32]  ## Sim time a looping object finished.
     rng: Rand
     time, pending: float32
     geo: Geometry
@@ -560,10 +591,11 @@ proc classOf(s: ParticleSim, name: string): PClass =
   if key.len == 0: return nil
   if key in s.classes: return s.classes[key]
   var cls: PClass
-  let f = particleDir() / "classes" / key & ".xml"
-  if fileExists(f):
-    try: cls = parseClass(f)
-    except CatchableError: cls = nil
+  let f = originalParticlePath(key)
+  try:
+    if key in s.edited: cls = parseClassXml(s.edited[key])
+    elif fileExists(f): cls = parseClass(f)
+  except CatchableError: cls = nil
   if cls == nil: s.missingClasses.incl key
   s.classes[key] = cls
   cls
@@ -579,6 +611,12 @@ proc textureOf(s: ParticleSim, name: string): TexInfo =
       if result.frames.len > 0: break
   if result.frames.len == 0: s.missingTextures.incl name
   s.textures[name] = result
+
+proc setEditedClasses*(s: ParticleSim, edited: Table[string, string]) =
+  ## The project's versions of classes, which win over level 0's.
+  s.edited = edited
+  s.classes.clear()
+  s.missingClasses.clear()
 
 proc forgetMissingTextures*(s: ParticleSim) =
   ## After the level's textures were extracted: look them up again.
@@ -609,16 +647,29 @@ proc rotateAround(v, axis: Vec3, deg: float32): Vec3 =
   v * cos(a) + cross(k, v) * sin(a) + k * dot(k, v) * (1 - cos(a))
 
 proc frame(dir, up: Vec3): array[3, Vec3] =
-  ## Y along dir, Z toward up, X = Y × Z (FUN_0045b320).
-  var y = if dir.length > 1e-6: dir.normalize else: vec3(0, 1, 0)
-  var z = up - y * dot(up, y)
-  if z.length < 1e-4:
-    let alt = if abs(y.y) < 0.9: vec3(0, 1, 0) else: vec3(1, 0, 0)
-    z = alt - y * dot(alt, y)
-  z = z.normalize
-  [cross(y, z), y, z]
+  ## Y along dir, Z toward up, X = Y × Z. With up along dir or zero, the world's
+  ## +Y stands in for it, and +Z makes X if dir is vertical (FUN_0045b320).
+  if dir.lengthSq < TinySq: return [vec3(1, 0, 0), vec3(0, 1, 0), vec3(0, 0, 1)]
+  let y = dir.normalize
+  var x = cross(y, up)
+  if x.lengthSq < TinySq:
+    x = vec3(-y.z, 0, y.x)
+    if x.lengthSq < TinySq: x = vec3(0, 0, 1)
+  x = x.normalize
+  [x, y, cross(x, y).normalize]
 
-proc axisChoice(name: string, parent: array[3, Vec3], vel, toEmitter: Vec3, fallback: Vec3): Vec3 =
+proc spiralAxes(p: Particle): (Vec3, Vec3) =
+  ## The axes a spiral turns in: the orientation's X and Z, else across the velocity.
+  if p.cls.hasOrientation: return (p.ax[0], p.ax[2])
+  if vec3(-p.vel.z, 0, p.vel.x).lengthSq < TinySq: return
+  let h = vec3(-p.vel.z, 0, p.vel.x).normalize
+  (h, cross(h, p.vel).normalize)
+
+proc axisChoice(name: string, parent: array[3, Vec3], dir, toEmitter: Vec3, up: bool): Vec3 =
+  ## A particle's Orientation or OrientationUp axis, from the emission's world
+  ## direction and offset. Only Orientation has fallbacks for the zero ones.
+  proc orZero(v, fallback: Vec3): Vec3 =
+    if up: v elif v.lengthSq < TinySq: fallback else: v.normalize
   case name
   of "LocalPosX": parent[0]
   of "LocalNegX": -parent[0]
@@ -632,11 +683,12 @@ proc axisChoice(name: string, parent: array[3, Vec3], vel, toEmitter: Vec3, fall
   of "WorldNegY": vec3(0, -1, 0)
   of "WorldPosZ": vec3(0, 0, 1)
   of "WorldNegZ": vec3(0, 0, -1)
-  of "Velocity": (if vel.length > 1e-6: vel.normalize else: fallback)
-  of "ReverseVelocity": (if vel.length > 1e-6: -vel.normalize else: fallback)
-  of "TowardsEmitter": (if toEmitter.length > 1e-6: toEmitter.normalize else: fallback)
-  of "AwayFromEmitter": (if toEmitter.length > 1e-6: -toEmitter.normalize else: fallback)
-  else: fallback
+  of "Velocity": orZero(dir, parent[1])
+  of "ReverseVelocity": orZero(-dir, parent[1])
+  of "TowardsEmitter": orZero(toEmitter, parent[2])
+  of "AwayFromEmitter": orZero(-toEmitter, parent[2])
+  elif up: parent[2]
+  else: parent[1]
 
 proc run(s: ParticleSim, p: Particle, ev: int): bool
 proc kill(s: ParticleSim, p: Particle)
@@ -649,7 +701,7 @@ proc create(s: ParticleSim, cls: PClass, pos: Vec3, ax: array[3, Vec3]): Particl
   ## A new particle (its create event is run by the caller once it's placed).
   if cls == nil or s.parts.len >= MaxParticles: return nil
   result = Particle(cls: cls, pos: pos, prev: pos, ax: ax, hidden: cls.initiallyHidden,
-                    decalScale: vec2(1, 1))
+                    decalScale: vec2(1, 1), source: s.current)
   s.initVars(result)
   result.life = max(0'f32, s.f(cls.lifetime, result))
   result.disabled = newSeq[bool](cls.actionCount)
@@ -734,9 +786,8 @@ proc emitOnce(s: ParticleSim, p: Particle, ei: int) =
     if cls.hasVelocity:
       c.vel = worldDir * speed
       if e.parentVel and p.cls.hasVelocity: c.vel += p.vel
-    let fallbackY = parentAx[1]
-    let y = axisChoice(if e.orient.len > 0: e.orient else: "LocalPosY", parentAx, c.vel, -worldLocal, fallbackY)
-    let z = axisChoice(if e.orientUp.len > 0: e.orientUp else: "LocalPosZ", parentAx, c.vel, -worldLocal, parentAx[2])
+    let y = axisChoice(e.orient, parentAx, worldDir, -worldLocal, up = false)
+    let z = axisChoice(e.orientUp, parentAx, worldDir, -worldLocal, up = true)
     c.ax = frame(y, z)
     c.orientToVel = e.orientToVel
     c.decalScale = p.decalScale
@@ -753,6 +804,7 @@ proc emitOnce(s: ParticleSim, p: Particle, ei: int) =
     if e.offAtThreshold and p.ems[ei].count >= e.threshold: p.ems[ei].on = false
 
 proc runEmitters(s: ParticleSim, p: Particle) =
+  if s.held.len > 0 and p.source in s.held: return
   for i, e in p.cls.emitters:
     template st: untyped = p.ems[i]
     if not st.on or p.dead: continue
@@ -912,14 +964,13 @@ proc run(s: ParticleSim, p: Particle, ev: int): bool =
     of akMoveGravity:
       if p.cls.hasVelocity: p.vel.y -= Gravity * s.f(a.p[0], p) * dt
     of akMoveSpiral:
-      if hasTgt(0) and p.cls.hasOffset:
+      if hasTgt(0) and p.cls.hasOffset and (p.cls.hasOrientation or p.cls.hasVelocity):
         tgt(0).x += s.f(a.p[1], p) * dt
         var r = s.f(a.p[0], p)
-        if r == 0: r = p.offset.length
-        let ahead = if p.vel.length > 1e-6: p.vel.normalize else: p.ax[1]
-        let fr = frame(ahead, p.ax[2])
+        if abs(r) < 0.01: r = p.offset.length
+        let (h, v) = p.spiralAxes
         let th = tgt(0).x.degToRad
-        p.offset = (fr[0] * cos(th) + fr[2] * sin(th)) * r
+        p.offset = (h * cos(th) + v * sin(th)) * r
     of akMoveResistance:
       let (res, minV) = (s.f(a.p[0], p), s.f(a.p[1], p))
       let v = p.vel.length
@@ -946,15 +997,17 @@ proc run(s: ParticleSim, p: Particle, ev: int): bool =
         let along = p.ax[1] * speed
         p.vel = if s.f(a.p[2], p) != 0: along else: p.vel - p.ax[1] * dot(p.vel, p.ax[1]) + along
     of akSpiralTangent:
-      let ahead = if p.vel.length > 1e-6: p.vel.normalize else: p.ax[1]
-      let fr = frame(ahead, p.ax[2])
-      let th = s.f(a.p[0], p).degToRad
-      let push = s.f(a.p[1], p) * s.f(a.p[2], p).degToRad
-      p.vel += (fr[2] * cos(th) - fr[0] * sin(th)) * push * dt
+      # Not scaled by the tick: the engine's handler adds this much each time it runs.
+      if p.cls.hasVelocity:
+        let (h, v) = p.spiralAxes
+        let th = s.f(a.p[0], p).degToRad
+        let push = s.f(a.p[1], p) * s.f(a.p[2], p).degToRad
+        p.vel -= (h * sin(th) + v * cos(th)) * push
     of akKillBeyondPoint:
       let d = int(s.f(a.p[0], p))
       let v = s.f(a.p[1], p)
-      let c = [p.pos.x, p.pos.y, p.pos.z][clamp(d div 2, 0, 2)]
+      let at = p.pos + (if p.cls.hasOffset: p.offset else: vec3(0, 0, 0))
+      let c = [at.x, at.y, at.z][clamp(d div 2, 0, 2)]
       if (d mod 2 == 0 and c > v) or (d mod 2 == 1 and c < v):
         s.kill(p)
         return true
@@ -1042,7 +1095,8 @@ proc tick(s: ParticleSim, p: Particle) =
   if p.link != nil and p.link.dead:
     p.link = nil
     if s.run(p, evBrokenLink): return
-  if p.orientToVel and p.vel.length > 1e-6: p.ax = frame(p.vel, p.ax[2])
+  if p.orientToVel and p.cls.hasOrientation and p.cls.hasVelocity and p.vel.length > 1e-6:
+    p.ax = frame(p.vel, p.ax[2])
   if p.cls.collideWalls and p.cls.hasVelocity and (p.pos - p.prev).length > 1e-5:
     let (hit, at, n) = s.firstHit(p.prev, p.pos)
     if hit:
@@ -1067,27 +1121,147 @@ proc tick(s: ParticleSim, p: Particle) =
   p.age += TickTime
   p.texTick += 1
 
-type ParticleSource* = object
-  ## A Particle object, as the level places it.
-  cls*: string
-  pos*: Vec3
-  axes*: array[3, Vec3]
-  decalScale*: Vec2
-  flags*: int
-  started*: bool   ## Its script starts it at load (AutoStartTag): it gets Start too.
+proc start(s: ParticleSim, src: ParticleSource) =
+  ## The object creates its particle.
+  s.placed[src.id] = src
+  let played = src.id in s.played
+  if src.id in s.held or ((src.flags and NotInitiallyCreated) != 0 and not played): return
+  s.current = src.id
+  let p = s.create(s.classOf(src.cls), src.pos, src.axes)
+  if p == nil: return
+  p.placed = true
+  p.decalScale = src.decalScale
+  if s.run(p, evCreate) or not (src.started or played): return
+  if s.run(p, evStart) or not played: return
+  # Explode-only classes: that's what a script would send them.
+  if p.cls.events[evStart].len == 0: discard s.run(p, evExplode)
+
+proc stop(s: ParticleSim, id: SourceId) =
+  ## The object's particles go, without their die events (those can emit).
+  s.placed.del id
+  s.parts.keepItIf(it.source != id)
+
+proc move(s: ParticleSim, old, src: ParticleSource) =
+  ## The object moved: what it has running goes with it, still running.
+  proc turn(v: Vec3): Vec3 =
+    src.axes[0] * dot(v, old.axes[0]) + src.axes[1] * dot(v, old.axes[1]) + src.axes[2] * dot(v, old.axes[2])
+  s.placed[src.id] = src
+  for p in s.parts:
+    if p.source != src.id: continue
+    p.pos = src.pos + turn(p.pos - old.pos)
+    p.vel = turn(p.vel)
+    p.offset = turn(p.offset)
+    for k in 0 .. 2: p.ax[k] = turn(p.ax[k])
+    if p.cls.display == dkDecal:
+      p.snapped = false
+      if p.placed:
+        p.pos = src.pos
+        p.ax = src.axes
+
+proc turnSpinning(s: ParticleSim) =
+  ## The objects in spinning groups turn with the sim's clock, as Arklite's
+  ## spin_particle.c turns them with the game's. Only the object's own particle
+  ## moves, not what it emitted. Decals stay.
+  let tick = int(s.time * 60 + 0.5)
+  for p in s.parts:
+    if not p.placed or p.cls.display == dkDecal: continue
+    let src = s.placed.getOrDefault(p.source)
+    if src.spin == 0: continue
+    let ticks = spinTicks(src.spin)
+    let deg = 360 * (tick mod ticks).float32 / ticks.float32 * (if src.spin < 0: -1'f32 else: 1'f32)
+    p.pos = src.pivot + rotateAround(src.pos - src.pivot, vec3(0, 1, 0), deg)
+    for k in 0 .. 2: p.ax[k] = rotateAround(src.axes[k], vec3(0, 1, 0), deg)
+    p.vel = vec3(0, 0, 0)
+    p.offset = vec3(0, 0, 0)
 
 proc reset*(s: ParticleSim, sources: seq[ParticleSource]) =
   ## Starts over: the level's Particle objects create their particles.
   s.parts.setLen 0
+  s.placed.clear()
   s.time = 0
   s.pending = 0
+  for src in sources: s.start(src)
+
+proc sync*(s: ParticleSim, sources: seq[ParticleSource]) =
+  ## Follows edits to the Particle objects, leaving the others running: a moved
+  ## one carries on, a new or otherwise changed one starts, a removed one goes.
+  var gone: HashSet[SourceId]
+  for id in s.placed.keys: gone.incl id
   for src in sources:
-    if (src.flags and NotInitiallyCreated) != 0: continue
-    let cls = s.classOf(src.cls)
-    let p = s.create(cls, src.pos, src.axes)
-    if p == nil: continue
-    p.decalScale = src.decalScale
-    if not s.run(p, evCreate) and src.started: discard s.run(p, evStart)
+    gone.excl src.id
+    if src.id notin s.placed:
+      s.start(src)
+      continue
+    let old = s.placed[src.id]
+    if old.cls != src.cls or old.flags != src.flags or old.decalScale != src.decalScale or
+       old.started != src.started or old.spin != src.spin:
+      s.stop(src.id)
+      s.start(src)
+    elif old.pos != src.pos or old.axes != src.axes:
+      s.move(old, src)
+    s.placed[src.id] = src
+  for id in gone:
+    s.stop(id)
+    s.played.excl id
+    s.held.excl id
+
+proc play*(s: ParticleSim, src: ParticleSource) =
+  ## Starts the object over, as its script would, whatever it was doing.
+  s.held.excl src.id
+  s.played.incl src.id
+  s.spentAt.del src.id
+  s.stop(src.id)
+  s.start(src)
+
+proc quiet(p: Particle): bool =
+  ## Nothing more will happen to it by itself.
+  if p.life > 0 or p.fadeTime > 0: return false
+  for i, e in p.cls.emitters:
+    if p.ems[i].on and e.rate != rNone: return false
+  true
+
+proc halt*(s: ParticleSim, id: SourceId) =
+  ## Stops the object's emission, as its script would. What's flying finishes;
+  ## particles that would stay forever go, without their die events.
+  s.played.excl id
+  s.spentAt.del id
+  s.held.incl id
+  s.current = id
+  var i = 0
+  while i < s.parts.len:   # Stop events can emit.
+    let p = s.parts[i]
+    if p.source == id and not p.dead and not s.run(p, evStop) and p.life <= 0 and p.fadeTime <= 0:
+      p.dead = true
+    inc i
+
+proc alive*(s: ParticleSim, id: SourceId): bool =
+  ## Any of the object's particles are still around.
+  for p in s.parts:
+    if p.source == id and not p.dead: return true
+
+proc spent(s: ParticleSim, id: SourceId): bool =
+  ## The object's run is over: nothing left but particles that just sit there,
+  ## if those had something to do (a lone sprite would restart for nothing).
+  var emitters = false
+  var any = false
+  for p in s.parts:
+    if p.source != id or p.dead: continue
+    if not p.quiet: return false
+    any = true
+    if p.cls.emitters.len > 0: emitters = true
+  emitters or not any
+
+proc finishPlays(s: ParticleSim) =
+  ## Played objects that finished: done, or, looping, again after a moment.
+  for id in s.played.toSeq:
+    if not s.spent(id):
+      s.spentAt.del id
+    elif not s.loop:
+      s.played.excl id
+      s.spentAt.del id
+    elif s.time - s.spentAt.mgetOrPut(id, s.time) >= LoopGap and id in s.placed:
+      var src = s.placed[id]   # A copy: play drops it from placed.
+      s.play(src)
 
 proc particleCount*(s: ParticleSim): int = s.parts.len
 
@@ -1098,8 +1272,10 @@ proc step*(s: ParticleSim, dt: float, g: Geometry, now: float) =
   while s.pending >= TickTime:
     s.pending -= TickTime
     s.time += TickTime
+    s.turnSpinning()
     var i = 0
     while i < s.parts.len:   # New particles join this tick's loop.
+      s.current = s.parts[i].source
       s.tick(s.parts[i])
       inc i
     var n = 0
@@ -1108,6 +1284,7 @@ proc step*(s: ParticleSim, dt: float, g: Geometry, now: float) =
         s.parts[n] = p
         inc n
     s.parts.setLen n
+  if s.played.len > 0: s.finishPlays()
 
 proc frameOf(s: ParticleSim, t: TexInfo, p: Particle): string =
   let n = t.frames.len
@@ -1149,6 +1326,12 @@ proc sprites*(s: ParticleSim, camPos: Vec3): seq[SpriteInst] =
     if cls.display == dkDecal and not p.snapped: s.snapDecal(p)
     if p.dead or p.hidden or cls.invisible or cls.texture.len == 0 or
        cls.display in {dkGeometry, dkContrail, dkOrientedContrail}: continue
+    # What it's drawn along. The engine refuses a class without what its display needs.
+    let oriented = cls.hasOrientation
+    let directed = cls.display in {dkRotatedSprite, dkBeam} or (cls.display == dkSprite and cls.edgeFade)
+    if not oriented and (cls.display in {dkArrow, dkFlat, dkDiscus} or
+                         (directed and not cls.hasVelocity)): continue
+    let byVelocity = directed and not oriented
     let t = s.textureOf(cls.texture)
     if t.frames.len == 0: continue
     var alpha = s.f(cls.alpha, p, 1)
@@ -1162,18 +1345,25 @@ proc sprites*(s: ParticleSim, camPos: Vec3): seq[SpriteInst] =
       let (hit, _, _) = s.firstHit(camPos, pos)
       if hit and (camPos - pos).length > 1: continue
     var scale = s.f(cls.scale, p, 1)
-    if cls.scaleToVelocity: scale *= p.vel.length + 1
+    if cls.scaleToVelocity and byVelocity: scale *= p.vel.length + 1
     let yscale = if cls.useYScale: s.f(cls.yScale, p, 1) else: scale
-    var dir = if cls.hasVelocity and p.vel.length > 1e-6: p.vel.normalize else: p.ax[1]
-    if cls.display in {dkArrow, dkFlat, dkDiscus, dkDecal} or not cls.hasVelocity: dir = p.ax[1]
+    let heading = if not byVelocity: p.ax[1]
+                  elif p.vel.lengthSq > 1e-8: p.vel.normalize
+                  else: vec3(0, 0, 0)
+    let perp = case cls.display
+               of dkArrow: p.ax[0]
+               of dkDiscus: p.ax[2]
+               of dkDecal: -p.ax[1]
+               else: heading
     var sx = scale
     var sy = yscale
     if cls.display == dkDecal:
       sx *= p.decalScale.x
       sy *= p.decalScale.y
     result.add SpriteInst(
-      pos: pos, mode: ord(cls.display), ax: [p.ax[0], dir, p.ax[2]],
+      pos: pos, mode: ord(cls.display), ax: [p.ax[0], heading, p.ax[2]], perp: perp,
       scale: sx, yscale: sy, rot: s.f(cls.rotation, p),
+      xOffset: s.f(cls.xOffset, p), xShorten: s.f(cls.xShorten, p),
       col: [uint8(clamp(tint.x, 0, 1) * 255), uint8(clamp(tint.y, 0, 1) * 255),
             uint8(clamp(tint.z, 0, 1) * 255), uint8(a * 255)],
       tex: s.frameOf(t, p), additive: t.additive, flare: cls.lensFlare,

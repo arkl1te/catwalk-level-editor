@@ -65,7 +65,7 @@ proc addGeometry*(m: var ThumbMesh, g: Geometry, imagePath: proc(texture: string
       for (j, c) in [(0, 0), (1, k), (2, k + 1)]:
         tri.p[j] = g.points[f.verts[c]]
         tri.uv[j] = f.uvs[c]
-        tri.col[j] = f.colors[c]
+        tri.col[j] = f.shownColor(c)
       m.tris.add tri
 
 proc render*(m: ThumbMesh, size = ThumbSize, cutouts = true): Image =

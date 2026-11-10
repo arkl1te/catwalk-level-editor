@@ -18,7 +18,7 @@ proc defaultDock*(): DockNode =
   dockSplit(true, 0.78,
     dockSplit(false, 0.82, dockLeaf(pkViewport), dockLeaf(pkConsole, pkIssues)),
     dockSplit(false, 0.55, dockLeaf(pkProperties, pkMap, pkFiles, pkClasses),
-              dockLeaf(pkEntityBrowser, pkTextureBrowser)))
+              dockLeaf(pkEntityBrowser, pkTextureBrowser, pkTextureCollections)))
 
 proc isLeaf*(n: DockNode): bool = n.kids.len == 0
 
@@ -102,6 +102,7 @@ proc showPanel*(a: App, kind: PanelKind) =
     of pkIssues: @[pkConsole]
     of pkEntityBrowser: @[pkTextureBrowser, pkProperties, pkMap, pkFiles]
     of pkTextureBrowser: @[pkEntityBrowser, pkProperties, pkMap, pkFiles]
+    of pkTextureCollections: @[pkTextureBrowser, pkEntityBrowser, pkProperties, pkMap]
     of pkClasses: @[pkFiles, pkMap, pkProperties]
     of pkScripts: @[]
     else: @[pkProperties, pkClasses, pkMap, pkFiles, pkEntityBrowser, pkTextureBrowser]

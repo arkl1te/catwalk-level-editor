@@ -21,6 +21,8 @@ const iconPaths = {
   "arrow": (24, "M9.5 7l5 5-5 5z"),
   "arrowleft": (24, "M14.5 7l-5 5 5 5z"),
   "expand": (24, "M7 9.5l5 5 5-5z"),
+  "foldshut": (24, "M7 3.5l11 8.5-11 8.5z"),
+  "foldopen": (24, "M3.5 7h17L12 18z"),
   "film": (24, "M18 4l2 4h-3l-2-4h-2l2 4h-3l-2-4H8l2 4H7L5 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4h-4z"),
   "music": (24, musicPath),
   "nofile": (24, "M6 2c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6H6zm7 7V3.5L18.5 9H13z"),
@@ -34,11 +36,14 @@ const iconPaths = {
   "rect": (24, "M3 5h18v14H3zM5 7v10h14V7z"),
   "rectoff": (24, "M3 5h18v14H3zM5 7v10h14V7zM3.4 2l18.6 18.6-1.4 1.4L2 3.4z"),
   "folder": (24, "M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z"),
+  "up": (24, "M7.41 15.41L12 10.83l4.59 4.58L18 14l-6-6-6 6z"),
+  "down": (24, "M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6z"),
   "plus": (24, "M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"),
   "eyedropper": (24, "M20.71 5.63l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-3.12 3.12-1.93-1.91-1.41 1.41 1.42 1.42L3 16.25V21h4.75l8.92-8.92 1.42 1.42 1.41-1.41-1.92-1.92 3.12-3.12c.4-.4.4-1.03.01-1.42zM6.92 19L5 17.08l8.06-8.06 1.92 1.92L6.92 19z"),
   "code": (24, "M9.4 16.6L4.8 12l4.6-4.6L8 6l-6 6 6 6 1.4-1.4zm5.2 0l4.6-4.6-4.6-4.6L16 6l6 6-6 6-1.4-1.4z"),
   "close": (24, "M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"),
   # View headers: realtime preview and render modes
+  "gizmo": (24, "M8 2l4 6H9v7h7v-3l6 4-6 4v-3H7V8H4z"),
   "gamepad": (24, "M15 7.5V2H9v5.5l3 3 3-3zM7.5 9H2v6h5.5l3-3-3-3zM9 16.5V22h6v-5.5l-3-3-3 3zM16.5 9l-3 3 3 3H22V9h-5.5z"),
   "bulb": (24, "M9 21c0 .55.45 1 1 1h4c.55 0 1-.45 1-1v-1H9v1zm3-19C8.14 2 5 5.14 5 9c0 2.38 1.19 4.47 3 5.74V17c0 .55.45 1 1 1h6c.55 0 1-.45 1-1v-2.26c1.81-1.27 3-3.36 3-5.74 0-3.86-3.14-7-7-7z"),
   "image": (24, "M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"),
@@ -172,6 +177,10 @@ proc addIcons*(builder: AtlasBuilder, scale = 1'f32) =
   for (name, path) in letterPaths:
     discard builder.addImage(name & "32", renderLetter(path, px(32)))
   discard builder.addImage("ring16", ringIcon(px(16)))
+  # The point of a breadcrumb arrow, and the notch at its tail (see drawClassTrail).
+  let tip = newImage(px(10), px(24))
+  tip.fillPath(parsePath("M0 0L" & $tip.width & " " & $(tip.height / 2) & "L0 " & $tip.height & "z"), color(1, 1, 1, 1))
+  discard builder.addImage("crumbtip", tip)
   for (_, spec) in mouseIcons:
     discard builder.addImage(spec[0], mouseIcon(px(16), spec[1], spec[2]))
 
@@ -181,5 +190,5 @@ proc appIcon*(): Image =
   let ctx = newContext(result)
   ctx.fillStyle = parseHtmlColor("#17181c")
   ctx.fillRoundedRect(rect(0, 0, 64, 64), 14)
-  result.fillPath(parsePath(crownPath), parseHtmlColor("#9d8cff"),
+  result.fillPath(parsePath(crownPath), parseHtmlColor("#8cb1ff"),
     translate(vec2(8, 6)) * scale(vec2(2, 2)))

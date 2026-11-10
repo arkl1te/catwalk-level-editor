@@ -1,18 +1,22 @@
 ## Background jobs: a list of steps, each either an external command (run
-## without blocking the UI; output goes to the job's log file) or a short
-## in-process action. The editor calls poll() once per frame; it runs at most
-## one action per call.
+## without blocking the UI; output goes to the job's log file), a command per
+## item of a list, or a short in-process action. The editor calls poll() once
+## per frame; it runs at most one action per call.
 
 import std/[osproc, os, strutils, times]
+when defined(windows): import std/strtabs
 
 type
-  StepKind = enum skCommand, skAction
+  StepKind = enum skCommand, skCommands, skAction
 
   Step* = object
     label*: string
     case kind: StepKind
-    of skCommand:
+    of skCommand, skCommands:
       args: proc(): seq[string]    ## Evaluated when the step starts.
+      argsList: proc(): seq[seq[string]]
+        ## skCommands: the commands, run one after another (evaluated when the
+        ## step starts); the first that fails fails the step.
       explain: proc(output: string): string
         ## Optional: turns the failed command's output into a readable error
         ## ("" keeps the generic one).
@@ -29,12 +33,18 @@ type
     error*: string
     logPath*: string
     process: Process
+    queued: seq[seq[string]]       ## skCommands: the step's commands still to run.
     outputStart: int               ## Log size when the running command began.
     started*: float
 
 proc command*(label: string, args: proc(): seq[string],
               explain: proc(output: string): string = nil): Step =
   Step(label: label, kind: skCommand, args: args, explain: explain)
+
+proc commandEach*(label: string, argsList: proc(): seq[seq[string]],
+                  explain: proc(output: string): string = nil): Step =
+  ## Runs each command of the list in turn (none: the step just passes).
+  Step(label: label, kind: skCommands, argsList: argsList, explain: explain)
 
 proc action*(label: string, fn: proc()): Step =
   Step(label: label, kind: skAction, action: fn)
@@ -66,6 +76,49 @@ proc fail(j: Job, msg: string) =
   j.error = msg
   j.log "FAILED: " & msg
 
+when defined(windows):
+  proc cmdQuote*(s: string): string =
+    ## s as one argument of a command line that cmd.exe passes on: always in
+    ## quotes, so cmd leaves & | < > ^ in paths alone, with the backslash rules
+    ## the program's own command-line parser (MSVCRT, .NET) undoes.
+    result = "\""
+    var slashes = 0
+    for c in s:
+      if c == '\\':
+        inc slashes
+      elif c == '"':
+        result.add repeat('\\', slashes + 1)  # N already added: 2N + 1 in all
+        result.add '"'
+        slashes = 0
+        continue
+      else:
+        slashes = 0
+      result.add c
+    result.add repeat('\\', slashes)
+    result.add '"'
+
+  proc startCmd*(args: seq[string], redirect: string, workingDir = "",
+                 env: StringTableRef = nil): Process =
+    ## Runs args through cmd.exe, which applies redirect ("> NUL" and such),
+    ## without a console window (poDaemon). /s: cmd takes the line between
+    ## its outer quotes as it is.
+    var line = ""
+    for a in args: line.add cmdQuote(a) & " "
+    line.add redirect
+    startProcess(getEnv("ComSpec", "cmd.exe") & " /d /s /c \"" & line & "\"",
+                 workingDir = workingDir, env = env, options = {poEvalCommand, poDaemon})
+
+proc startCommand(j: Job, args: seq[string]) =
+  ## Starts args with its output (stdout and stderr) appended to the log.
+  j.log "$ " & quoteShellCommand(args)
+  j.outputStart = int(getFileSize(j.logPath))
+  when defined(windows):
+    # cmd does the redirection, as sh does below.
+    j.process = startCmd(args, ">> " & cmdQuote(j.logPath) & " 2>&1")
+  else:
+    let sh = quoteShellCommand(args) & " >> " & quoteShell(j.logPath) & " 2>&1"
+    j.process = startProcess("/bin/sh", args = ["-c", sh], options = {})
+
 proc poll*(j: Job) =
   ## Advances the job as far as it can without blocking.
   while j.state == jsRunning:
@@ -85,6 +138,13 @@ proc poll*(j: Job) =
         j.fail(if msg.len > 0: s.label & ": " & msg
                else: s.label & " exited with code " & $code)
         return
+      if j.queued.len > 0:
+        try: j.startCommand(j.queued[0])
+        except CatchableError as e:
+          j.fail(j.steps[j.current].label & ": " & e.msg)
+          return
+        j.queued.delete(0)
+        return
       inc j.current
       continue
     if j.current >= j.steps.len:
@@ -103,11 +163,18 @@ proc poll*(j: Job) =
       return
     of skCommand:
       try:
-        let args = s.args()
-        j.log "$ " & quoteShellCommand(args)
-        j.outputStart = int(getFileSize(j.logPath))
-        let sh = quoteShellCommand(args) & " >> " & quoteShell(j.logPath) & " 2>&1"
-        j.process = startProcess("/bin/sh", args = ["-c", sh], options = {})
+        j.startCommand(s.args())
+        return
+      except CatchableError as e:
+        j.fail(s.label & ": " & e.msg)
+    of skCommands:
+      try:
+        j.queued = s.argsList()
+        if j.queued.len == 0:
+          inc j.current
+          continue
+        j.startCommand(j.queued[0])
+        j.queued.delete(0)
         return
       except CatchableError as e:
         j.fail(s.label & ": " & e.msg)

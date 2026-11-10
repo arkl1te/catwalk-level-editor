@@ -14,7 +14,7 @@ deps:
 	./tools/fetch_deps.sh
 	touch vendor/.stamp
 
-$(BIN): VERSION deps.lock $(wildcard tools/*.sh) $(wildcard patches/*.patch) $(wildcard src/*.nim) assets/fonts/IBMPlexSans-Regular.ttf assets/fonts/IBMPlexMono-Regular.ttf assets/catwalk.svg assets/logo-paths.svg
+$(BIN): VERSION config.nims deps.lock $(wildcard tools/*.sh) $(wildcard patches/*.patch) $(wildcard src/*.nim) assets/fonts/IBMPlexSans-Regular.ttf assets/fonts/IBMPlexMono-Regular.ttf assets/catwalk.svg assets/logo-paths.svg
 	@./tools/build.sh $(NIM) c $(NIMFLAGS) -o:$(BIN) $(SRC)
 
 # Pixie can't render <text> and only takes whole-pixel sizes, so the logo is built

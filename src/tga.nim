@@ -68,6 +68,16 @@ proc readTga*(data: string): TgaImage =
     let sy = if topFirst: y else: h - 1 - y
     copyMem(result.rgba[y * w * 4].addr, src[sy * w * 4].addr, w * 4)
 
+proc seeThrough*(img: TgaImage): bool =
+  ## Whether the picture has see-through pixels: the one test the viewport
+  ## (blended pass), the Texture Browser (Alpha filter) and Build (Transparent
+  ## flag) share. Alpha 250 and up counts as opaque, so export noise doesn't
+  ## turn a solid texture into a blended one.
+  var i = 3
+  while i < img.rgba.len:
+    if img.rgba[i] < 250: return true
+    i += 4
+
 proc makeOpaque*(data: var string) =
   ## Sets every pixel's alpha to 255 in place (32-bit images; others have none).
   if data.len < 18 or data[16].uint8 != 32 or data[2].uint8 notin [2'u8, 10]: return

@@ -1,232 +1,70 @@
 # Catwalk
 
-A level editor for Oni, laid out and controlled like TrenchBroom. It edits a level's
-geometry (brushes, plus the shipped level meshes) and its objects (characters,
-furniture, doors, consoles, triggers, ...). **Play** builds the level and starts Oni
-in it.
+A level editor for [Oni](https://oni.bungie.org/), laid out and controlled like
+[TrenchBroom](https://trenchbroom.github.io), with [Silky](https://github.com/treeform/silky)
+UI, vibecoded in Nim.
 
-Built like Majestic: Nim with Silky/Windy/OpenGL. `ui.nim`, `theme.nim`, `icons.nim`,
-`dialogs*.nim` and `xwin*.nim` come from Majestic.
+Catwalk's aim is to make Oni levels as easy to build as Quake maps.
 
-## Build and run
+> [!IMPORTANT]
+> **Catwalk needs [Arklite](https://github.com/arkl1te/arklite-oni-patch).** Maps made in
+> Catwalk load through Arklite's Custom Game menu, so you and anyone you share a map with
+> need it installed.
 
-```fish
+## Features
+
+- **Start from scratch or from the game's own levels**: an empty level, or an editable copy of any of Oni's.
+- **Play with one key** (F5): Catwalk builds the level and starts Oni in it, from the beginning or from a save point.
+- **TrenchBroom's tools**: brushes, vertex, edge, face, clip, rotate and scale, CSG, groups and linked groups. Faces can be cut, extended, joined and separated.
+- **Groups that spin** in the game, particles included.
+- **An Entity Browser** of ready-made characters, weapons, power-ups, furniture, doors, consoles, turrets and particles, with previews of their models. Drag one into the level.
+- **Every object's fields** in Properties: characters, flags, triggers, consoles, sounds and the rest, with lists of the values the game knows.
+- **Character and particle classes** edited for this level only, with a live particle preview in the views.
+- **Textures**: the game's own by collection, and your own pictures up to 1024×1024.
+- **Skies**: the game's, or your own from six pictures or from one panorama through the Skybox Converter, with brightness, blend and tint.
+- **Baked lighting** from point, spot and directional lights, with soft shadows, lights that pulse, flicker or break down (and can make a sound when they do), and face tints.
+- **Music and sounds**: the game's music, any single recording, your own sounds and your own ambient sounds.
+- **A script editor** for Oni's BSL that knows the game's commands and the level's objects.
+- **Claude Code can drive it** through an optional MCP server.
+
+Hold Ctrl, Shift or Alt and the status bar shows what else you can do. Try right-clicking everything, too!
+
+## Install
+
+### Linux from source (CachyOS / Arch)
+
+You need Oni with the Anniversary Edition and [Arklite](https://github.com/arkl1te/arklite-oni-patch)
+(the [Oni installer](https://github.com/arkl1te/oni-game-installer) sets all three up),
+plus Nim 2.2+, git, Wine, mono and, to import sounds, ffmpeg.
+
+```sh
+git clone https://github.com/arkl1te/catwalk-level-editor.git
+cd catwalk-level-editor
 make
-./catwalk [project folder]
+make install
 ```
 
-It needs `mono` (to run OniSplit from the AE install). Play also needs the Custom
-Game menu, which is part of Arklite (`../arklite`).
+Then search for **Catwalk** in your application launcher. The first time, it asks where
+Oni's Anniversary Edition is, and finds the usual Wine, Lutris, Heroic, Bottles and Steam
+installs by itself.
 
-`make install` puts the binary in `~/.local/bin` and adds an app-menu entry with
-the icon (`assets/catwalk.svg`); `make uninstall` removes them.
+To update, `git pull` and run `make install` again. `make uninstall` removes it.
 
-## Window
+### Windows
 
-- **Toolbar:** tools, duplicate and flips, UV lock, snap and grid. On the right are
-  the start point (beginning or a save point), **Build** and **Play**.
-- **Tool options strip:** settings for the current tool (with no tool: the shape new
-  brushes get, and Move objects by). **View options** is on its right.
-- **Map views:** 1–4 panes (View menu), in the **Viewport** panel with the tool
-  options strip. The 2D views share zoom and pan.
-- **Panels:** Viewport, Properties, Map, Files, Classes, Entity Browser, Texture Browser, Console,
-  Issues and Scripts. Drag a panel's tab onto another panel's tabs (or its middle) to tab it
-  there, or onto a side of a panel or of the whole window to split that side off. View >
-  Panels turns each panel on or off and resets the layout, which Catwalk remembers.
-  Every panel scrolls with a slim scrollbar over its right edge.
-  - **Console / Issues:** below the views by default (Ctrl+4).
-  - **Properties** (Ctrl+2; Ctrl+5 turns it on or off): what's selected, as rows of
-    name and value under a header that names it:
-    - **Level** (nothing selected): its name in the Custom Game list, sky, music and
-      lighting.
-    - An object's type (**Character**, **Point light**, ...): its fields, with a search;
-      several of one type show the fields they share, and several types show counts.
-    - **Face** (faces or pieces): texture shift, scale and rotation, flips and World
-      align, script id, shade and surface flags.
-    - **Vertex** (handles in the vertex, edge or face tool): the corners' vertex color,
-      unlit factor, Override lights and light animation.
-  - **Map** (Ctrl+1): layers as a tree (geometry and each object type, with counts). Open a
-    layer to see its pieces or objects; click, Ctrl+click and Shift+click select,
-    double-click focuses. Eye and lock icons hide and lock.
-  - **Classes** (Ctrl+3) edits character classes: the values every
-    character of a type (Konoko, each striker, ...) starts with, such as Health, AI and
-    sounds. Pick a class from the searchable list, or select a character (its class opens);
-    the class's fields have their own search. Edited classes are saved in the project's
-    `classes/` folder and only affect this level. "Use game values" puts a class back.
-    A character's AdditionalHealth adds to its class's Health.
-  - **Entity Browser:** ready-to-use entities in collapsible groups, with a search field. Drag one into a view, or click to place it.
-    Built in: a generic object of each type, the game's characters (players, enemies,
-    TCTF, civilians, with their usual team and weapon), weapons, power-ups, turrets and
-    particles (lights, fire, steam, sparks, weather, decals). Furniture, consoles, doors
-    and triggers come from the entity library, which the browser's button builds from the
-    game files (about 30 s, into `~/.local/share/catwalk/library/`). The game has no
-    furniture classes: each piece is level geometry linked to its object, so the library
-    keeps that geometry and its textures, and placing one adds them to the level.
-    The slider next to the search field sets the preview size: all the way left is a
-    compact list of names; further right shows each entity's model (characters in
-    their idle pose, weapons, power-ups, turrets, doors, furniture, consoles and
-    triggers), as TrenchBroom does. Particles show a still frame of what they emit
-    (glows, fire, smoke, sparks, decals). The library build renders these previews,
-    by itself the first time they're needed.
-  - **Texture Browser:** red border: current texture, yellow: used in the level. Click one
-    to apply it to the selected faces.
-  - **Scripts** (Ctrl+6; opens beside the views): a code editor for the level's scripts,
-    the `.bsl` files in `IGMD/<level>/` that Oni reads when the level loads (double-click
-    one in Files, or pick it from Open...). It colors the language and the game's own
-    commands and variables, which it reads from your Oni.exe with their descriptions and
-    argument lists. Hover a word to see what it does. Typing lists what fits there
-    (Ctrl+Space asks), including the level's characters, trigger volumes, patrol paths,
-    flags, doors and the like for the arguments that name them, and the values the game's
-    own scripts use. The line above the cursor shows the argument the command expects next.
-    Names of the level's objects are drawn in their type's color: Ctrl+click one to select
-    it, show its Properties and its Map row, and frame it in the views. Ctrl+click or F12
-    on a function goes to where it's declared, in any of the level's files. Problems the
-    game would report (unknown commands, arguments it can't convert, missing braces) get
-    a wavy underline. Click the count in the status line to go to the next one. Ctrl+F finds,
-    Ctrl+/ comments lines, Tab / Shift+Tab indent, Ctrl+wheel changes the text size (Ctrl+0
-    resets it). Ctrl+S (or Save) writes the scripts along
-    with the project. Fields that name a script function (a character's Scripts, a trigger
-    volume's Entry/Inside/Exit, an event's Function) have a `<>` button that opens the
-    function.
-- **Status bar:** while Ctrl, Shift or Alt is held, it lists what the mouse and keys
-  do with those modifiers (scroll it with the wheel).
+From the next release on, the [releases page](https://github.com/arkl1te/catwalk-level-editor/releases)
+has a `catwalk-VERSION-windows-x64.zip`: unpack it anywhere and run `catwalk.exe`. You need Oni with
+the Anniversary Edition and Arklite, as on Linux, and ffmpeg on your PATH to import sounds.
+To build it yourself, see [TECHNICAL.md](TECHNICAL.md#windows).
 
-Every divider between panes and panels can be dragged.
+## More reading
 
-## New projects
+- [Guide](Guide.draft.md): how to use each part of Catwalk, every shortcut, and what happens to a level on Build.
+- [TECHNICAL.md](TECHNICAL.md): building by hand, what Catwalk can't do yet, logs and crash reports, and setting up the MCP server.
 
-The welcome screen (File ▸ New project, Ctrl+N) starts a project in two ways:
+## Credits
 
-- **Empty level:** like a new map in TrenchBroom: one floor brush and a player start
-  (Konoko, `IsPlayer`) at the origin, plus a `main()` script. Pick the game levels whose
-  environment textures go into the texture browser (all of them by default) and a sky
-  from level 0 (afternoon, sunset, night, crapsky, or none; Level in Properties can
-  change it later). Character classes, weapons and skies are linked by name from level 0.
-- **Copy of an Oni level:** an editable copy of one of the game's levels.
-
-Either kind of level can play one of the game's music tracks (from level 0) from the
-moment it loads: pick it and its volume under Level in Properties (nothing selected). Build adds the
-`sound_music_start` line to the built copy of `main()`; the project's scripts are left as
-they are. The play button next to the track previews it (intro, then its loop pieces in
-random order, as Oni plays them) through `pw-cat`, `paplay` or `aplay`. The first preview
-extracts level 0's music into `~/.cache/catwalk/music` (about 36 MB, a few seconds).
-
-## Baked lighting
-
-Oni lights its levels with colors baked into every face corner (texture × vertex color).
-Catwalk can bake them from lights you place from the view's context menu (Create object ▸
-Point light / Directional light) or the entity browser:
-
-- **Point light:** `Color` (0–255 each), `Intensity`, `Radius` (its light fades to nothing
-  there; the selected light shows it as a sphere) and `Shadows` (1 or 0).
-- **Directional light:** a sun: the same light everywhere, coming from one direction, with
-  `Color`, `Intensity` and `Shadows`. Its gizmo is a sun with an arrow pointing the way the
-  light travels; turn it with its Rotation (X tilts it down, Y turns its heading).
-
-Color fields (a light's, a flag's, a trigger's laser, Ambient) have a number field for
-each of red, green and blue (like the XYZ fields: type, or scroll over one), a swatch that
-opens a color picker (saturation/value square, hue bar, RGB, HSV and hex) and an eyedropper that
-takes the color of anything in Catwalk's window: click it, then click any pixel (Esc or a
-right click cancels). Each channel field takes a number or arithmetic (`200+16`); with
-several objects selected, one whose values differ is blank and setting it changes only
-that channel. Picker changes show live; closing the picker leaves one undo step, and Esc
-puts the color back.
-
-Each light has an **Enabled** checkbox at the top of its Properties: an off light is drawn
-dimmed and left out of the bake. Under Level in Properties (nothing selected):
-
-- **Ambient:** the color every face gets before the lights' light.
-- **Bake automatically:** on, every change to a light (moving, rotating, enabling), the
-  ambient color or the geometry rebakes at once (big levels rebake a few times a second
-  while you drag). Off, the lighting changes only when you press **Bake light**, which is
-  one undo step.
-
-A bake replaces the vertex colors of every visible face, including an original level's
-own lighting. Lights are Catwalk's own: they're kept in the project's `lights.xml` and are
-never built into the level; only the colors they bake are.
-
-## How a level goes through Catwalk
-
-| Step | What happens |
-|---|---|
-| Import | `OniSplit -export` copies the level's instances. Objects become XML. The environment (AKEV) is dumped to XML and turned into `geometry.json`, keeping every face's UVs, baked lighting, flags, script id and object link. |
-| Edit | Objects are edited as XML. Geometry is edited in Catwalk's own model. Furniture, doors, consoles, turrets and triggers own their geometry, which moves, duplicates and deletes with them. |
-| Build (F7) | Objects are compiled with `OniSplit -create`. If the geometry changed, Catwalk writes it as `.dae` files grouped by flags and script id, plus a level XML; `OniSplit -create:level` rebuilds the environment (collision, octree, AI rooms); Catwalk then puts the object links back into the binary. Everything is packed into `AE/GameDataFolder/CustomLevels/<project>/`. |
-| Build, empty level | `OniSplit -create:level` makes the whole level from `geometry.json`: environment, ONLV and the textures used. AI rooms are generated, one per walkable floor face. Objects are compiled as above. It is packed as `level50_Final.dat` (Custom Game mounts it under a free number). |
-| Play (F5) | Build, then run `oni-ae-game.sh` with `ARKLITE_AUTOSTART=<project>` and `ARKLITE_SAVEPOINT=<n>`. |
-
-Starting at a save point uses your saved game for that save point from the original
-level, so you need to have reached it there. Without one, the level starts from the
-beginning; `AE/Arklite.log` says which happened. Level 1 from the beginning is
-Chapter 00 (Combat Training); Chapter 01 is save point 1.
-
-## Controls (TrenchBroom defaults)
-
-As in TrenchBroom, a left press is a click until the mouse moves, then a drag. With
-no tool active:
-
-| | |
-|---|---|
-| Click | Select a piece or object (empty space: select nothing) |
-| Ctrl+click | Add to / remove from the selection |
-| Double-click | Everything in that layer (Ctrl: add) |
-| Shift+click, Ctrl+Shift+click | Select a face, add/remove a face |
-| Shift+double-click, Shift+Alt+double-click | All faces of a piece, connected coplanar faces (Shift+Alt with one face selected: see below) |
-| Alt+click, Alt+drag, Alt+double-click | With one face selected: copy its texture, flags and alignment to the clicked face, to every face the mouse passes over while the button is held, or to the whole piece (Alt+Ctrl: texture only; Alt+Shift: the alignment wraps around corners) |
-| Drag the selection | Move (Alt: vertically in 3D, Shift: lock to one axis, Ctrl: duplicate first) |
-| Ctrl+drag | Paint select (Ctrl+Shift: faces) |
-| Drag with nothing selected | Draw a brush in the chosen shape. 2D: its depth comes from the last selection. 3D: on the surface under the mouse, one grid step high; Alt changes the height, Shift makes it square, Shift+Alt a cube. |
-| Shift+drag a selected brush's face | Extrude it, along with the other selected brushes' faces on the same plane (Ctrl: split off a new brush, Alt: move the face, Ctrl+Alt: stamp a new brush) |
-| Right click | View menu: create objects there, select all of a type, reveal a texture, hide, isolate |
-| Ctrl+wheel (3D) | Select the next thing behind / in front |
-| Ctrl+Alt+wheel | Grid size |
-
-Tools (press the key again or Esc to leave; Shift+Esc always leaves):
-
-| | |
-|---|---|
-| B | Brush tool: click faces to place points, double-click a face for its corners, drag for a rectangle, Shift+drag to stretch the shape; Enter builds the brush |
-| V, E, F | Vertex, edge, face tools: click/drag handles (Ctrl toggles), drag empty space to lasso, arrows move them, Delete removes corners. Brushes stay convex. |
-| C | Clip: click or drag points (2D anywhere, 3D on faces), drag them to adjust, double-click a face to clip along it; Enter applies, Ctrl+Enter switches the side kept, Delete removes the last point |
-| R | Rotate: drag the ring(s) around the center handle, drag the center to move it, or Apply an angle |
-| T | Scale: drag the box's sides, edges or corners (Shift: proportional, Alt: from the center), or Apply a size |
-
-Keys:
-
-| | |
-|---|---|
-| Esc | Cancel the drag in progress, then the tool's points or handles, then the tool, then the selection |
-| Ctrl+J / K / Shift+K / L | CSG merge / subtract / hollow (walls one grid step thick) / intersect |
-| Arrows, PgUp/PgDn | Move the selection one grid step (Ctrl: duplicate and move). With only faces selected, they move and rotate textures (Shift coarse, Ctrl fine). |
-| Alt+arrows, Alt+PgUp/PgDn | Yaw, roll, pitch by 90° (by the rotate tool's angle about its center while it is active) |
-| Ctrl+D, Ctrl+X/C/V, Ctrl+Alt+V, Del | Duplicate in place, cut/copy, paste under the mouse, paste at the original position, delete |
-| Ctrl+F, Ctrl+Alt+F | Flip horizontally / vertically (textures, with only faces selected) |
-| Shift+R | Reset texture alignment |
-| Ctrl+B, Ctrl+T, Ctrl+E | Select siblings; select what the selected brushes touch / contain (the brushes are removed) |
-| Ctrl+Alt+M | Move objects by a typed offset |
-| + −, 1–9, 0, Alt+0 | Grid size, show grid, snap |
-| Ctrl+I, Ctrl+Alt+I, Ctrl+Shift+I | Isolate, hide, show all |
-| Ctrl+U, Ctrl+Shift+U | Focus on selection, reset cameras |
-| Space, Ctrl+Space | Switch the view under the mouse, maximize it |
-| Z (hold) | Render mode pie: point toward a mode, let go of Z or click. Tap Z to keep it open; 1–9 pick by numpad direction, Esc cancels |
-| 3D view | WASD walk (no modifiers, nothing typed into), RMB look, LMB+RMB carry the selection while looking/flying (grid-snapped; Esc puts it back), RMB+WASD/QE fly (wheel: speed), Alt+RMB orbit, MMB pan, wheel forward/back, Shift+wheel zoom (Ctrl+Alt+Z resets) |
-| 2D views | RMB/MMB pan, wheel zoom |
-| Ctrl+Z / Ctrl+Shift+Z | Undo / redo (objects and geometry) |
-
-Number fields accept arithmetic (`64*3`).
-
-## Limits
-
-- CSG works on convex brushes only (brushes you draw, or pieces shaped like one).
-  The shipped level meshes are edited with the vertex, edge, face and clip tools.
-- AI rooms (BNV) are rebuilt from the level's original room data, so large geometry
-  changes may need room edits that Catwalk can't do yet. Empty levels get one room per
-  floor face. Nothing links the rooms yet, so AI may not path from one floor to another.
-- Empty levels: furniture, doors, consoles, turrets and triggers have no geometry of
-  their own yet, and there is no save point to start from.
-- Objects are drawn as filled boxes; furniture and doors also show their geometry.
-- Only the Y rotation of object boxes is drawn.
-- Not from TrenchBroom (yet): the shear and sweep tools, groups and linked groups,
-  the graphical UV editor, and shapes other than cuboid, cylinder, cone and stairs.
-- Trigger volume boxes are drawn from Position to Position + Size; the game's exact
-  reading of Size isn't confirmed.
+Catwalk's layout, tools and controls follow [TrenchBroom](https://github.com/TrenchBroom/TrenchBroom).
+Levels are read and built with OniSplit, from the Anniversary Edition. Its UI is shared
+with [Majestic Media Player](https://github.com/arkl1te/majestic-media-player). Catwalk
+isn't affiliated with or endorsed by Bungie or the TrenchBroom project.

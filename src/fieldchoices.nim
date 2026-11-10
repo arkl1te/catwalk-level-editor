@@ -9,14 +9,15 @@
 ## carry that id. Free-form fields say what they take and list the values
 ## other objects in the level use.
 
-import std/[os, strutils, tables, sets, algorithm, xmlparser, re, uri, bitops, times, sequtils]
-import levelobjects, presets
+import std/[os, strutils, tables, sets, algorithm, xmlparser, xmltree, re, uri, bitops, times, sequtils]
+import levelobjects, presets, fieldtypes, particleevents, ambients
 
 type
   Choice* = object
     value*: string
     note*: string           ## Shown dimmed on the right (numeric value, object name...).
     hint*: bool             ## A line of explanation, not a value.
+    command*: bool          ## An action (Import sound...): picking it runs FieldDrop.command.
 
   Catalog* = ref object
     level0: Table[string, seq[string]]   ## Level 0 instance names by tag ("ONCC" -> [...]).
@@ -25,6 +26,7 @@ type
     combat, melee: seq[(int, string)]    ## Level 0's combat / melee profiles: (id, name).
     projDir: string
     projNames: Table[string, seq[string]]
+    ownAmbients: HashSet[string]         ## The project's ambients.json names, lower case.
     scripts: seq[string]
     scriptsStamp: string
 
@@ -78,6 +80,13 @@ const
     "LockDoor": "DOOR", "UnlockDoor": "DOOR"}.toTable
 
 proc newCatalog*(): Catalog = Catalog()
+
+proc objectFieldType*(o: LevelObject, path, attr: string): FieldType =
+  ## fieldType for this object: a point or spot light's Sound is an ambient when its
+  ## SoundKind says so.
+  result = fieldType(o.tag, path, attr)
+  if result.kind == fkSound and attr.len == 0 and path == "OSD/Animation/Sound" and o.lightSoundAmbient:
+    result.impulse = false
 
 # --- game data ---------------------------------------------------------------
 
@@ -159,11 +168,20 @@ proc readLevel0(c: Catalog, gameData: string) =
 proc readProject(c: Catalog, projDir: string) =
   c.projDir = projDir
   c.projNames.clear()
+  c.ownAmbients.clear()
   for f in walkFiles(projDir / "oni" / "*.oni"):
     let n = decodeUrl(f.extractFilename.changeFileExt(""))
     if n.len > 4: c.projNames.mgetOrPut(n[0 ..< 4], @[]).add n[4 .. ^1]
+  # Its own ambients, which Build defines (ambients.nim).
+  for n in ambientNames(projDir / "ambients.json"):
+    c.projNames.mgetOrPut("OSBD", @[]).add n & ".amb"
+    c.ownAmbients.incl n.toLowerAscii
   for _, v in c.projNames.mpairs: v.sort(cmpIgnoreCase)
   c.scriptsStamp = ""
+
+proc forgetProject*(c: Catalog) =
+  ## The project's oni/ changed (imported sounds): the next refresh reads it again.
+  c.projDir = ""
 
 proc refresh*(c: Catalog, gameData, projDir: string) =
   ## Reads what changed since the last call (cheap when nothing did).
@@ -211,6 +229,21 @@ proc names(c: Catalog, tag: string, prefix = "", suffix = ""): seq[string] =
         result.add v
   result.sort(cmpIgnoreCase)
 
+proc recordingChoices*(c: Catalog): seq[Choice] =
+  ## Every SNDD recording (without .aif) a sound group can play: level 0's and the project's.
+  var own: HashSet[string]
+  for n in c.projNames.getOrDefault("SNDD"): own.incl n.toLowerAscii
+  for n in c.names("SNDD", suffix = ".aif"):
+    result.add Choice(value: n.toLowerAscii,
+                      note: if (n & ".aif").toLowerAscii in own: "imported recording" else: "recording")
+
+proc soundNamesTaken*(c: Catalog): HashSet[string] =
+  ## Every OSBD name (without .amb, .grp or .imp), lower case: a new ambient needs another.
+  for n in c.names("OSBD"):
+    let low = n.toLowerAscii
+    let dot = low.rfind('.')
+    result.incl(if dot > 0: low[0 ..< dot] else: low)
+
 proc instanceNames*(c: Catalog, tag: string, prefix = "", suffix = ""): seq[string] =
   ## names, for the Scripts panel's completion.
   c.names(tag, prefix, suffix)
@@ -240,6 +273,17 @@ proc enumChoices(e: EnumDef): seq[Choice] =
 proc nameChoices(items: seq[string], empty = ""): seq[Choice] =
   if empty.len > 0: result.add Choice(value: "", note: empty)
   for n in items: result.add Choice(value: n)
+
+proc soundChoices(c: Catalog, items: seq[string], empty = ""): seq[Choice] =
+  ## A sound field's ambients or impulses, then every single recording.
+  result = nameChoices(items, empty)
+  for ch in result.mitems:
+    if ch.value.toLowerAscii in c.ownAmbients: ch.note = "this level's ambient"
+  var own: HashSet[string]
+  for n in c.projNames.getOrDefault("SNDD"): own.incl n.toLowerAscii
+  for n in c.names("SNDD", suffix = ".aif"):
+    let note = if (n & ".aif").toLowerAscii in own: "imported recording" else: "recording"
+    result.add Choice(value: RecordingPrefix & n, note: note)
 
 proc idChoices(objs: seq[LevelObject], tag, field: string, none = ""): seq[Choice] =
   if none.len > 0: result.add Choice(value: "0", note: none)
@@ -351,6 +395,18 @@ proc choices*(c: Catalog, o: LevelObject, path, attr, value: string,
     result = nameChoices(@["Ammo", "EnergyCell", "Hypo", "Shield", "Invisibility", "LSI"])
   of "PART OSD/Class": result = nameChoices(c.names("BINA", prefix = "3RAP"))
   of "PART OSD/Flags": result = enumChoices(ParticleFlags)
+  of "Particle Appearance/DisplayType":
+    result = nameChoices(@["Sprite", "RotatedSprite", "Beam", "Arrow", "Flat", "OrientedContrail",
+                           "Contrail", "Discus", "Vector", "Decal", "Geometry"])
+  of "Particle Options/DisableDetailLevel": result = nameChoices(@["Never", "Medium", "Low"])
+  of "Particle Appearance/TexGeom":
+    # Geometry particles name a model.
+    let geometry = o.node.xpath("Appearance/DisplayType").str.strip == "Geometry"
+    result = nameChoices(if geometry: c.names("M3GM") else: textures)
+    fixed = false
+  of "Particle Emitters/Emitter/Class", "Particle Attractor/Class":
+    result = nameChoices(c.names("BINA", prefix = "3RAP"))
+    fixed = false   # An attractor can name a tag.
   of "FURN OSD/Class":
     var cls: seq[string]
     for p in presets:
@@ -370,10 +426,10 @@ proc choices*(c: Catalog, o: LevelObject, path, attr, value: string,
       if n.endsWith(".amb") and n[0 ..< ^4].toLowerAscii notin seen:
         seen.incl n[0 ..< ^4].toLowerAscii
         own.add n[0 ..< ^4]
-    result = nameChoices(c.loops & own)
+    result = c.soundChoices(c.loops & own)
   of "NEUT OSD/Speech/Trigger", "NEUT OSD/Speech/Abort", "NEUT OSD/Speech/Enemy",
      "NEUT OSD/DialogLines/DialogLine/SpeechName":
-    result = nameChoices(ambient, "silent")
+    result = c.soundChoices(ambient, "silent")
   of "NEUT OSD/Flags": result = enumChoices(NeutralFlags)
   of "NEUT OSD/Rewards/Other": result = enumChoices(NeutralItems)
   of "NEUT OSD/DialogLines/DialogLine/Flags": result = enumChoices(NeutralDialogLineFlags)
@@ -407,6 +463,9 @@ proc choices*(c: Catalog, o: LevelObject, path, attr, value: string,
      "SUNL OSD/Animation/Interpolation":
     result = @[Choice(value: "Smooth", note: "eases in and out"), Choice(value: "Linear", note: "steady rate"),
                Choice(value: "Step", note: "jumps at once")]
+  of "LITE OSD/Animation/SoundKind", "SPOT OSD/Animation/SoundKind":
+    result = @[Choice(value: LightSoundKinds[0], note: "a one-off sound at each flicker failure or pulse"),
+               Choice(value: LightSoundKinds[1], note: "a loop at the light while a flicker fails, else while it's on")]
   of "SPOT OSD/Softness":
     result = @[hint("0: a hard edge; 1: fades from the middle of the cone")]
     for v in ["0", "0.15", "0.3", "0.5", "1"]: result.add Choice(value: v)
@@ -415,7 +474,49 @@ proc choices*(c: Catalog, o: LevelObject, path, attr, value: string,
   of "PATR OSD/Points/LockFacing .Facing": result = enumChoices(PatrolPathFacing)
   of "PATR OSD/Points/IgnorePlayer .Value": result = @[Choice(value: "Yes"), Choice(value: "No")]
   else:
-    if key.startsWith("CHAR OSD/Scripts/"):
+    let ft = objectFieldType(o, path, attr)
+    if ft.kind == fkSound:
+      result = c.soundChoices(if ft.impulse: c.names("OSBD", suffix = ".imp") else: ambient, "no sound")
+    elif ft.kind == fkColor:
+      # A particle's color can be one of its variables.
+      result = @[hint("One of the class's color variables, or Red Green Blue")]
+      let vars = o.node.xpath("Variables")
+      if vars != nil:
+        for v in vars:
+          if v.kind == xnElement and v.tag == "Color": result.add Choice(value: v.attr("Name"))
+    elif o.tag == ParticleTag and eventParam(path) != pkFloat:
+      let kind = eventParam(path)
+      case kind
+      of pkVar, pkPingPong:
+        # The action's variable: a color action's Target is a Color.
+        let want = if kind == pkPingPong: "PingPongState"
+                   elif "/ColorInterpolate" in path: "Color"
+                   else: "Float"
+        let vars = o.node.xpath("Variables")
+        if vars != nil:
+          for v in vars:
+            if v.kind == xnElement and (v.tag == want or ("/SetVariable" in path and v.tag == "Color")):
+              result.add Choice(value: v.attr("Name"), note: v.innerText.strip)
+      of pkEmitter:
+        let ems = o.node.xpath("Emitters")
+        if ems != nil:
+          var i = 0
+          for em in ems:
+            if em.kind == xnElement:
+              result.add Choice(value: $i, note: em.child("Class").innerText.strip)
+              inc i
+      of pkAction:
+        for i, (ev, act) in o.node.classActions:
+          result.add Choice(value: $i, note: ev & ": " & act.tag)
+      of pkClass:
+        result = nameChoices(c.names("BINA", prefix = "3RAP"))
+        fixed = false
+      of pkImpact:
+        result = @[hint("The name of an impact type, such as Shrapnel")]
+        fixed = false
+      else:
+        for (v, name) in paramChoices(kind): result.add Choice(value: v, note: name)
+    elif key.startsWith("CHAR OSD/Scripts/"):
       result = scripts
     elif key.startsWith("CHAR OSD/Inventory/"):
       for v in 0 .. 10: result.add Choice(value: $v)

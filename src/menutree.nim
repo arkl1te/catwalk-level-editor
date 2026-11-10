@@ -155,11 +155,14 @@ proc captureInput*(m: MenuSystem, ui: Ui) =
     m.bounds = rect((mon.pos.vec2 - m.origin) / ui.scale, mon.size.vec2 / ui.scale)
   if m.overMenu(m.mouse) or m.input.anyPressed or m.sliding:
     ui.captured = true
-  elif ui.window.buttonPressed[MouseLeft] or ui.window.buttonPressed[MouseRight] or
-       ui.window.buttonPressed[MouseMiddle]:
+  elif ui.window.buttonPressed[MouseLeft]:
     m.close()
     ui.consumeClick()
     ui.captured = true
+  elif ui.window.buttonPressed[MouseRight] or ui.window.buttonPressed[MouseMiddle]:
+    # Closes the menu and still counts: a held right or middle button moves the
+    # camera, and the first press after a menu mustn't be lost to closing it.
+    m.close()
   if ui.window.buttonPressed[KeyEscape]:
     m.close()
 

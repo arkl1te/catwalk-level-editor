@@ -8,6 +8,10 @@
 ## (Face.lightAnims): the corner's color with that light at the other end of
 ## its animation, which Arklite plays in the game.
 ##
+## A corner buried under a solid touching its face (a sign on a wall, a buttress)
+## can't see any light, and being black would darken the whole visible face
+## around it, so it takes its light from the nearest uncovered spots beside it.
+##
 ## Shadow rays run against a uniform grid of the geometry's triangles, which
 ## is kept until the geometry's shape changes; corners are split across threads.
 ## The realtime sound preview casts its occlusion rays through the same kind of
@@ -16,6 +20,11 @@
 import std/[math, strutils, cpuinfo, typedthreads, algorithm]
 import vmath
 import geometry
+
+# The bake is tight number crunching run during drags: stack traces (see
+# config.nims) would double its time, and a crash in it is still reported from
+# bakeLighting's caller.
+{.push stackTrace: off, lineTrace: off.}
 
 type
   LightKind* = enum lkPoint, lkSpot, lkDirectional
@@ -50,19 +59,23 @@ type
     lights: ptr UncheckedArray[Light]
     lightCount: int
     far: float32          ## Directional shadow rays: past the whole level.
-    pos, nrm: ptr UncheckedArray[Vec3]
+    pos, nrm, toCenter: ptr UncheckedArray[Vec3]
     twoSided: ptr UncheckedArray[bool]
     outSum: ptr UncheckedArray[Vec3]
     slot: ptr UncheckedArray[int32]     ## Per light: its column in outAnim, or -1 (not animated).
     slots: int
     outAnim: ptr UncheckedArray[float32] ## Per corner and animated light: how much of its light arrives.
     ambient: Vec3
+    soft: float32         ## Soft shadows: how far around a corner it takes its light from.
 
   Slice = tuple[work: ptr Work, first, last: int]
 
 const
   RayLift = 0.05'f32        ## Shadow rays start this far off the surface...
   CornerInset = 0.5'f32     ## ...and up to this far in from the corner, toward the face's center.
+  BuriedDepth = 32'f32      ## A corner is buried if this close above it is the inside of a solid.
+  UncoverSteps = [2'f32, 4, 8, 16, 32] ## How far beside a buried corner to look for uncovered spots.
+  UncoverSpots = 8          ## Spots tried at each of those distances, around the corner.
   MaxCells = 4_000_000
 
 var
@@ -241,46 +254,103 @@ proc crossings*(gr: ptr Grid, o, target: Vec3, stamp: var seq[int32], ray: int32
       inc n
   result.setLen n
 
+proc insideSolid(gr: ptr Grid, o, d: Vec3, len: float32, stamp: var seq[int32], ray: int32): bool =
+  ## Whether the nearest triangle within len of o, along the unit vector d, is
+  ## one seen from behind.
+  var nearest = len
+  var hit = -1'i32
+  for c in cellsAlong(gr, o, d, len):
+    for k in gr.start[c] ..< gr.start[c + 1]:
+      let ti = gr.items[k]
+      if stamp[ti] == ray: continue
+      stamp[ti] = ray
+      let t = gr.tris[ti].hitTri(o, d, nearest)
+      if t >= 0:
+        nearest = t
+        hit = ti
+  hit >= 0 and dot(cross(gr.tris[hit].e1, gr.tris[hit].e2), d) > 0
+
 proc shade(w: ptr Work, first, last: int) =
   var stamp = newSeq[int32](w.grid.tris.len)
   var ray = 0'i32
+  template nextRay() =
+    inc ray
+    if ray == int32.high:
+      for s in stamp.mitems: s = 0
+      ray = 1
+  template buried(q, n: Vec3): bool =
+    nextRay()
+    insideSolid(w.grid, q + n * RayLift, n, BuriedDepth, stamp, ray)
   for i in first ..< last:
-    let p = w.pos[i]
     let n = w.nrm[i]
     var sum = w.ambient
-    for k in 0 ..< w.lightCount:
-      let lt = w.lights[k]
-      var l: Vec3                   # toward the light
-      var fall = 1'f32
-      if lt.kind in {lkPoint, lkSpot}:
-        let toL = lt.pos - p
-        let d2 = dot(toL, toL)
-        if d2 >= lt.radius * lt.radius or d2 < 1e-8: continue
-        l = toL / sqrt(d2)
-        fall = 1 - d2 / (lt.radius * lt.radius)   # (1 - (d/r)²)², smooth to zero at the radius
-        fall *= fall
-        if lt.kind == lkSpot:
-          let off = -dot(l, lt.dir)                # cosine of the angle off the spot's axis
-          if off <= lt.cosOuter: continue
-          if lt.cosInner > lt.cosOuter + 1e-6:
-            let e = clamp((off - lt.cosOuter) / (lt.cosInner - lt.cosOuter), 0, 1)
-            fall *= e * e * (3 - 2 * e)
-      else:
-        l = -lt.dir
-      var nd = dot(n, l)
-      let side = if nd >= 0: n else: -n
-      if w.twoSided[i]: nd = abs(nd)
-      if nd <= 0: continue
-      if lt.shadows and w.grid.tris.len > 0:
-        inc ray
-        if ray == int32.high:
-          for s in stamp.mitems: s = 0
-          ray = 1
-        let o = p + side * RayLift
-        let target = if lt.kind == lkDirectional: o + l * w.far else: lt.pos
-        if blocked(w.grid, o, target, stamp, ray): continue
-      sum += lt.color * (nd * fall)
-      if w.slot[k] >= 0: w.outAnim[i * w.slots + w.slot[k]] = nd * fall
+    template gather(p: Vec3, share: float32) =
+      for k in 0 ..< w.lightCount:
+        let lt = w.lights[k]
+        var l: Vec3                   # toward the light
+        var fall = 1'f32
+        if lt.kind in {lkPoint, lkSpot}:
+          let toL = lt.pos - p
+          let d2 = dot(toL, toL)
+          if d2 >= lt.radius * lt.radius or d2 < 1e-8: continue
+          l = toL / sqrt(d2)
+          fall = 1 - d2 / (lt.radius * lt.radius)   # (1 - (d/r)²)², smooth to zero at the radius
+          fall *= fall
+          if lt.kind == lkSpot:
+            let off = -dot(l, lt.dir)                # cosine of the angle off the spot's axis
+            if off <= lt.cosOuter: continue
+            if lt.cosInner > lt.cosOuter + 1e-6:
+              let e = clamp((off - lt.cosOuter) / (lt.cosInner - lt.cosOuter), 0, 1)
+              fall *= e * e * (3 - 2 * e)
+        else:
+          l = -lt.dir
+        var nd = dot(n, l)
+        let side = if nd >= 0: n else: -n
+        if w.twoSided[i]: nd = abs(nd)
+        if nd <= 0: continue
+        if lt.shadows and w.grid.tris.len > 0:
+          nextRay()
+          let o = p + side * RayLift
+          let target = if lt.kind == lkDirectional: o + l * w.far else: lt.pos
+          if blocked(w.grid, o, target, stamp, ray): continue
+        sum += lt.color * (nd * fall * share)
+        if w.slot[k] >= 0: w.outAnim[i * w.slots + w.slot[k]] += nd * fall * share
+    let u = cross(n, if abs(n.x) < 0.7: vec3(1, 0, 0) else: vec3(0, 1, 0)).normalize
+    let v = cross(n, u)
+    if w.soft > 0 and w.grid.tris.len > 0:
+      # The corner and the spots around it that nothing stands between: a
+      # shadow's edge becomes a ramp, which corners can show; a hard one comes
+      # out in steps. All around, whichever face it's on: faces meeting at a
+      # corner have to agree on it.
+      var spots: array[UncoverSpots + 1, Vec3]
+      spots[0] = w.pos[i]
+      var found = 1
+      for s in 0 ..< UncoverSpots:
+        let ang = s.float32 * 2 * PI / UncoverSpots
+        let off = (u * cos(ang) + v * sin(ang)) * w.soft
+        nextRay()
+        if blocked(w.grid, w.pos[i] + n * RayLift, w.pos[i] + off + n * RayLift, stamp, ray): continue
+        if not buried(w.pos[i] + off, n):
+          spots[found] = w.pos[i] + off
+          inc found
+      for s in 0 ..< found: gather(spots[s], 1 / found.float32)
+    else:
+      gather(w.pos[i], 1'f32)
+    if sum == w.ambient and w.grid.tris.len > 0 and not w.twoSided[i] and buried(w.pos[i], n):
+      # Beside it on its own face's side, not past a wall it's under: that's another room.
+      for step in UncoverSteps:
+        var spots: array[UncoverSpots, Vec3]
+        var found = 0
+        for s in 0 ..< UncoverSpots:
+          let ang = s.float32 * 2 * PI / UncoverSpots
+          let off = (u * cos(ang) + v * sin(ang)) * step
+          if dot(off, w.toCenter[i]) < 0: continue
+          if not buried(w.pos[i] + off, n):
+            spots[found] = w.pos[i] + off
+            inc found
+        if found > 0:
+          for s in 0 ..< found: gather(spots[s], 1 / found.float32)
+          break
     w.outSum[i] = sum
 
 proc shadeSlice(s: Slice) {.thread.} = shade(s.work, s.first, s.last)
@@ -288,7 +358,39 @@ proc shadeSlice(s: Slice) {.thread.} = shade(s.work, s.first, s.last)
 proc rgb8(c: Vec3): array[3, uint8] =
   [uint8(clamp(c.x * 255, 0, 255)), uint8(clamp(c.y * 255, 0, 255)), uint8(clamp(c.z * 255, 0, 255))]
 
-proc bakeLighting*(g: Geometry, lights: seq[Light], ambient: Vec3): int =
+proc sampleLight*(g: Geometry, lights: seq[Light], ambient: Vec3, pos, nrm: seq[Vec3], soft = 0'f32): seq[Vec3] =
+  ## The light the bake would give points on surfaces facing nrm (before
+  ## rounding to 0..255, not clamped).
+  if pos.len == 0: return
+  let key = g.shapeKey
+  if key != gridShape:
+    gridCache = buildGrid(g, castsShadow)
+    gridShape = key
+  result = newSeq[Vec3](pos.len)
+  var pr = lights
+  for l in pr.mitems:
+    if l.kind != lkPoint: l.dir = if l.dir.length > 1e-6: l.dir.normalize else: vec3(0, -1, 0)
+  var slot = newSeq[int32](pr.len + 1)
+  for s in slot.mitems: s = -1
+  var two = newSeq[bool](pos.len)
+  var toCenter = newSeq[Vec3](pos.len)
+  var outAnim = @[0'f32]
+  var (p, n) = (pos, nrm)
+  var w = Work(grid: addr gridCache, lightCount: pr.len, ambient: ambient, soft: soft,
+               pos: cast[ptr UncheckedArray[Vec3]](p[0].addr),
+               nrm: cast[ptr UncheckedArray[Vec3]](n[0].addr),
+               toCenter: cast[ptr UncheckedArray[Vec3]](toCenter[0].addr),
+               twoSided: cast[ptr UncheckedArray[bool]](two[0].addr),
+               outSum: cast[ptr UncheckedArray[Vec3]](result[0].addr),
+               slot: cast[ptr UncheckedArray[int32]](slot[0].addr),
+               outAnim: cast[ptr UncheckedArray[float32]](outAnim[0].addr))
+  if pr.len > 0: w.lights = cast[ptr UncheckedArray[Light]](pr[0].addr)
+  if gridCache.tris.len > 0:
+    let d = vec3(gridCache.dims[0].float32, gridCache.dims[1].float32, gridCache.dims[2].float32)
+    w.far = d.length * gridCache.cell
+  shade(w.addr, 0, pos.len)
+
+proc bakeLighting*(g: Geometry, lights: seq[Light], ambient: Vec3, soft = 0'f32): int =
   ## Sets every lit face corner's color to ambient (0..1) plus the lights'
   ## light, and its light layers to the animated lights' (corners that
   ## override the lights keep theirs and get none); returns how many corners
@@ -297,7 +399,7 @@ proc bakeLighting*(g: Geometry, lights: seq[Light], ambient: Vec3): int =
   if key != gridShape:
     gridCache = buildGrid(g, castsShadow)
     gridShape = key
-  var pos, nrm: seq[Vec3]
+  var pos, nrm, toCenter: seq[Vec3]
   var two: seq[bool]
   var at: seq[(int32, int32)]           # (face, corner) of each entry
   for fi, f in g.faces:
@@ -312,6 +414,7 @@ proc bakeLighting*(g: Geometry, lights: seq[Light], ambient: Vec3): int =
       let dc = toC.length
       pos.add(if dc > 1e-6: p + toC * (min(CornerInset, dc * 0.05) / dc) else: p)
       nrm.add n
+      toCenter.add toC
       two.add (f.flags and gfTwoSided) != 0
       at.add (fi.int32, k.int32)
   var layers = newSeq[seq[LightLayer]](g.faces.len)
@@ -333,9 +436,10 @@ proc bakeLighting*(g: Geometry, lights: seq[Light], ambient: Vec3): int =
       slot[k] = animated.len.int32
       animated.add k
   var outAnim = newSeq[float32](pos.len * animated.len + 1)
-  var w = Work(grid: addr gridCache, lightCount: pr.len, ambient: ambient,
+  var w = Work(grid: addr gridCache, lightCount: pr.len, ambient: ambient, soft: soft,
                pos: cast[ptr UncheckedArray[Vec3]](pos[0].addr),
                nrm: cast[ptr UncheckedArray[Vec3]](nrm[0].addr),
+               toCenter: cast[ptr UncheckedArray[Vec3]](toCenter[0].addr),
                twoSided: cast[ptr UncheckedArray[bool]](two[0].addr),
                outSum: cast[ptr UncheckedArray[Vec3]](outSum[0].addr),
                slot: cast[ptr UncheckedArray[int32]](slot[0].addr), slots: animated.len,
@@ -374,3 +478,5 @@ proc bakeLighting*(g: Geometry, lights: seq[Light], ambient: Vec3): int =
       g.faces[fi].lightAnims = move layers[fi]
       inc result
   if result > 0: g.bump()
+
+{.pop.}

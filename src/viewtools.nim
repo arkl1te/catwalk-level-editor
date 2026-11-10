@@ -6,14 +6,15 @@
 ## mouse moves 2 pixels, then a drag; drags shorter than 0.1 s are dropped.
 ## With no modal tool active, a click selects, a drag on the selection moves
 ## it (Ctrl duplicates), Shift+drag on a selected brush's face extrudes it (and the selection's faces on its plane),
-## Ctrl+drag paints a selection and a drag anywhere else with nothing selected
+## Ctrl+drag paints a selection, Ctrl+Shift+drag with faces selected cuts them from the nearest edge,
+## and a drag anywhere else with nothing selected
 ## draws a new brush. Modal tools (brush, vertex/edge/face, clip, rotate,
 ## scale) switch the moving, extruding and drawing off while they are active.
 
 import std/[strutils, strformat, math, tables, sets, algorithm, sequtils, times, hashes]
 import silky, vmath, bumpy, pixie
 import theme, ui, menutree
-import levelobjects, camera, render, geometry, geomops, appstate, presets, library, objtemplates
+import levelobjects, camera, render, geometry, geomops, appstate, presets, library, objtemplates, sky, project
 
 const
   DragThreshold = 2'f32     ## Pixels a press moves before it becomes a drag.
@@ -135,7 +136,7 @@ proc candidates*(a: App, vi: int, mouse: Vec2): seq[Cand] =
   let r = a.viewRay(vi, mouse)
   var byObj: Table[LevelObject, int]
   for o in a.objects:
-    if not a.pickable(o): continue
+    if not a.viewPickable(o): continue
     let (lo, hi) = o.pickBox
     let t = o.pickRay(r)
     if t >= 0:
@@ -143,7 +144,7 @@ proc candidates*(a: App, vi: int, mouse: Vec2): seq[Cand] =
       result.add Cand(obj: o, piece: -1, face: -1, t: t, area: a.projectedArea(vi, lo, hi))
   if a.geometryVisible:
     var byPiece: Table[int32, int]
-    let hittable = a.facePickable
+    let hittable = a.facePickable(vi, r)
     for i, f in a.geo.faces:
       if f.verts.len < 3 or not hittable(i): continue
       let p0 = a.geo.points[f.verts[0]]
@@ -205,7 +206,7 @@ proc faceUnder*(a: App, vi: int, mouse: Vec2): (int, Vec3) =
   result = (-1, vec3(0, 0, 0))
   if not a.geometryEditable: return
   let r = a.viewRay(vi, mouse)
-  let (fi, t) = a.geo.pickFace(r, a.facePickable)
+  let (fi, t) = a.geo.pickFace(r, a.facePickable(vi, r))
   if fi >= 0: result = (fi, r.origin + r.dir * t)
 
 proc isSelected(a: App, c: Cand): bool =
@@ -266,9 +267,6 @@ type Handle* = object
   id*: string
   pos*: Vec3
   corners*: seq[Vec3]    ## Positions the handle moves.
-
-proc pkey*(p: Vec3): string =
-  $int(round(p.x * 16)) & "," & $int(round(p.y * 16)) & "," & $int(round(p.z * 16))
 
 proc handleId(tool: Tool, corners: seq[Vec3]): string =
   case tool
@@ -590,27 +588,31 @@ proc alongAxis(r: Ray, origin, e: Vec3): (bool, float32) =
   if denom < 1e-6: return (false, 0)
   (true, (b * r.dir.dot(w0) - e.dot(w0)) / denom)
 
-# --- sound volume handles -------------------------------------------------------------------------
-# A selected sound's Box gets a handle in the middle of each face, like the
-# face tool's. Dragging one moves that face (its Min or Max) along its axis.
+# --- volume handles -------------------------------------------------------------------------------
+# A selected sound's Box or trigger volume gets a handle in the middle of each
+# face, like the face tool's. Dragging one moves that face along its axis.
 
 proc boxHandles(a: App, vi: int): seq[tuple[obj: LevelObject, face: int, pos: Vec3]] =
-  ## face = axis * 2 + 0 (the Min side) or 1 (the Max side). 2D views leave
-  ## out the two faces they see head-on.
+  ## face = axis * 2 + 0 (the Min side) or 1 (the Max side), in the volume's
+  ## own axes. 2D views leave out the two faces they see head-on.
   if a.tool != toolSelect: return
   let cam = a.views[vi].cam
-  let depth = if cam.kind == vk3D: -1 else: axisIndex(cam.kind.axes.toViewer)
+  var toViewer = vec3(0, 0, 0)
+  if cam.kind != vk3D: toViewer[axisIndex(cam.kind.axes.toViewer)] = 1
   for o in a.selection:
-    if o.tag != "SNDG" or not a.visible(o): continue
-    let (has, lo, hi) = o.extentBox
+    if o.tag notin ["SNDG", "TRGV"] or not a.visible(o): continue
+    let (has, lo, hi) = o.volumeRange
     if not has: continue
+    let turn = o.volumeTurn
     let c = (lo + hi) / 2
     for f in 0 .. 5:
       let ax = f div 2
-      if ax == depth: continue
+      var e = vec3(0, 0, 0)
+      e[ax] = 1
+      if abs((turn * e).dot(toViewer)) > 0.999: continue
       var p = c
       p[ax] = if f mod 2 == 0: lo[ax] else: hi[ax]
-      result.add (o, f, p)
+      result.add (o, f, o.pos + turn * p)
 
 proc boxHandleAt(a: App, vi: int, m: Vec2): int =
   ## Index into boxHandles of the handle under the mouse, or -1.
@@ -625,15 +627,15 @@ proc boxHandleAt(a: App, vi: int, m: Vec2): int =
       result = k
 
 proc pruneBoxFaces(a: App) =
-  ## Drops selected face handles whose sound isn't selected and shown any more.
-  a.selBoxFaces.keepItIf(it.obj.selected and it.obj.tag == "SNDG" and a.visible(it.obj))
+  ## Drops selected face handles whose object isn't selected and shown any more.
+  a.selBoxFaces.keepItIf(it.obj.selected and a.visible(it.obj))
 
 proc boxFaceSelected(a: App, o: LevelObject, f: int): bool = (obj: o, face: f) in a.selBoxFaces
 
 # --- rectangle selection --------------------------------------------------------------------------
 # With entities selected, a drag from empty space (or from something not
 # selected) draws a rectangle, like the vertex tool's lasso. Whichever it
-# touches first, sound face handles or entities, is what it selects.
+# touches first, volume face handles or entities, is what it selects.
 
 proc selRect(a: App, m: Vec2): Rect =
   let b = a.views[a.drag.view].viewBody
@@ -650,7 +652,7 @@ proc rectBoxFaces(a: App, r: Rect): seq[tuple[obj: LevelObject, face: int]] =
 proc rectObjects(a: App, r: Rect): seq[LevelObject] =
   ## Entities whose pick box, on screen, overlaps r.
   for o in a.objects:
-    if not a.pickable(o): continue
+    if not a.viewPickable(o): continue
     let (lo, hi) = o.pickBox
     var (slo, shi) = (vec2(Inf.float32), vec2(-Inf.float32))
     var any = false
@@ -749,6 +751,68 @@ proc extrudeFaceAt*(a: App, vi: int, m: Vec2): int =
     if d < best:
       best = d
       result = drag
+
+proc cutEdgeAt*(a: App, vi: int, m: Vec2): (int, Vec3, Vec3) =
+  ## The selected face Ctrl+Shift+drag would cut and the edge the cut would
+  ## leave from: the edge nearest the mouse of the face under it, else of any
+  ## selected face. Face -1 when there's none, so the drag paints.
+  result[0] = -1
+  if a.geo == nil or a.selFaces.len == 0 or a.hasNodeSelection or a.tool != toolSelect: return
+  let r = a.viewRay(vi, m)
+  var under = -1
+  var bestT = Inf.float32
+  for fi in a.selFaces:
+    let f = a.geo.faces[fi]
+    if f.objectId != -1 or f.verts.len < 3: continue
+    let p0 = a.geo.points[f.verts[0]]
+    for k in 1 ..< f.verts.len - 1:
+      let t = r.rayTriangle(p0, a.geo.points[f.verts[k]], a.geo.points[f.verts[k + 1]])
+      if t >= 0 and t < bestT:
+        bestT = t
+        under = fi
+  var best = Inf.float32
+  for fi in a.selFaces:
+    if under >= 0 and fi != under: continue
+    let f = a.geo.faces[fi]
+    if f.objectId != -1 or f.verts.len < 3: continue
+    for k in 0 ..< f.verts.len:
+      let (p, q) = (a.geo.points[f.verts[k]], a.geo.points[f.verts[(k + 1) mod f.verts.len]])
+      let (o1, p1) = a.toScreen(vi, p)
+      let (o2, p2) = a.toScreen(vi, q)
+      if not (o1 and o2) or (q - p).length < 1e-3: continue
+      let d = segDist(m, p1, p2)
+      if d < best:
+        best = d
+        result = (fi, p, q)
+
+proc cutAxis(a: App, fi: int, p, q: Vec3): Vec3 =
+  ## From face fi's edge p..q into the face, along its plane.
+  let f = a.geo.faces[fi]
+  result = a.geo.normal(f).cross(q - p).normalize
+  if result.dot(a.geo.center(f) - p) < 0: result = -result
+
+proc cutGroup*(a: App, fi: int, p, q: Vec3): seq[(int, Vec3, Vec3)] =
+  ## The edge and the selected faces' other edges at the same distance, leading
+  ## out of their faces the same way (what extrudeGroup is to faces): they
+  ## extend together. Not an edge two selected faces share: it isn't open.
+  result = @[(fi, p, q)]
+  let axis = a.cutAxis(fi, p, q)
+  let line = plane(axis, p)
+  var used: HashSet[(string, string)]
+  for i in a.selFaces:
+    let f = a.geo.faces[i]
+    for k in 0 ..< f.verts.len:
+      used.incl (pkey(a.geo.points[f.verts[k]]), pkey(a.geo.points[f.verts[(k + 1) mod f.verts.len]]))
+  for i in a.selFaces:
+    let f = a.geo.faces[i]
+    if f.objectId != -1 or f.verts.len < 3: continue
+    if abs(a.geo.normal(f).dot(axis)) > 0.01 or line.dist(a.geo.center(f)) <= 0.01: continue
+    for k in 0 ..< f.verts.len:
+      let (u, v) = (a.geo.points[f.verts[k]], a.geo.points[f.verts[(k + 1) mod f.verts.len]])
+      if abs(line.dist(u)) > 0.02 or abs(line.dist(v)) > 0.02 or (u - v).length < 1e-3: continue
+      if (pkey(v), pkey(u)) in used: continue
+      if i == fi and pkey(u) == pkey(p) and pkey(v) == pkey(q): continue
+      result.add (i, u, v)
 
 proc extrudeGroup*(a: App, fi: int): seq[int] =
   ## fi and the selected pieces' faces on its plane and facing the same way:
@@ -924,11 +988,17 @@ proc clipPreview(a: App): ClipPreview =
   ## What the clip would keep and cut off (TrenchBroom draws both, the cut
   ## part see-through).
   let (ok, pl) = a.clipPlane
-  if not ok or a.selPieces.len == 0 or a.geo == nil: return
-  let key = &"{a.geo.version}|{a.clipPoints}|{a.clipFace}|{a.clipSide}|{toSeq(a.selPieces).sorted}"
+  if not ok or (a.selPieces.len == 0 and a.selFaces.len == 0) or a.geo == nil: return
+  let faces = toSeq(a.selFaces).sorted
+  let key = &"{a.geo.version}|{a.clipPoints}|{a.clipFace}|{a.clipSide}|{toSeq(a.selPieces).sorted}|{faces}"
   if key == clipCache.key: return clipCache.preview
   proc part(side: Side): Geometry =
     result = a.geo.clone
+    if a.selPieces.len == 0:
+      let left = result.clipFaces(faces, pl, side)
+      var g = result
+      result.faces = left.mapIt(g.faces[it])
+      return
     var others: HashSet[int32]
     for pc in 0 ..< result.pieces.len:
       if pc.int32 notin a.selPieces: others.incl pc.int32
@@ -984,6 +1054,7 @@ proc buildOverlays*(a: App) =
   r.overlayTris.setLen 0
   r.overlayLines.setLen 0
   r.modelInstances.setLen 0
+  r.arrows.setLen 0
   # After an in-place duplicate the selection's lines start white and fade back.
   let flash = clamp(1 - (epochTime() - a.dupFlashAt) / DupFlashTime, 0, 1)
   proc sel(c: array[4, uint8]): array[4, uint8] =
@@ -1012,10 +1083,11 @@ proc buildOverlays*(a: App) =
           transform: cast[M4](objectMatrix(o.pos, o.rot)),
           tint: (if o.selected: vec4(1, 0.6, 0.6, 1) else: vec4(1, 1, 1, 1)),
           wire: [l.col[0], l.col[1], l.col[2], 120'u8])
+    if not a.entityGizmo(o): continue
     if o.tag == DirLightTag:
       let c = if o.lightOn: l.col else: [l.col[0] div 3 + 60, l.col[1] div 3 + 60, l.col[2] div 3 + 60, 150'u8]
-      if o.selected: r.overlayLines.sunGizmo(o.pos, o.lightDir, sel(rgba(255, 70, 70)))
-      else: r.lines.sunGizmo(o.pos, o.lightDir, c)
+      if o.selected: r.overlayLines.sunGizmo(o.pos, sel(rgba(255, 70, 70)))
+      else: r.lines.sunGizmo(o.pos, c)
     elif o.tag == SpotLightTag:
       let c = if o.lightOn: l.col else: [l.col[0] div 3 + 60, l.col[1] div 3 + 60, l.col[2] div 3 + 60, 150'u8]
       let (outer, inner) = o.spotAngles
@@ -1041,19 +1113,14 @@ proc buildOverlays*(a: App) =
     else:
       if not hasModel: r.tris.solidBox(k, [l.col[0], l.col[1], l.col[2], 70'u8])
       r.lines.wireBox(k, (if hasModel: [l.col[0], l.col[1], l.col[2], 150'u8] else: l.col))
-    if o.tag in ["CHAR", "NEUT", "FLAG", "TURR"]:
-      let ang = o.rot.y.float64.degToRad
-      let fwd = vec3(sin(ang).float32, 0, cos(ang).float32)
-      let base = o.pos + vec3(0, l.lift, 0)
-      if o.selected: r.overlayLines.line(base, base + fwd * 14, sel(rgba(255, 70, 70)))
-      else: r.lines.line(base, base + fwd * 14, l.col)
-    elif o.tag == "PART":
-      # The emitter's direction: local +Y (Oni's cone and ring directions are about it).
-      let t = objectMatrix(o.pos, o.rot)
-      let (base, tip) = (t * vec3(0, l.lift, 0), t * vec3(0, l.lift + 8, 0))
-      if o.selected: r.overlayLines.line(base, tip, sel(rgba(255, 70, 70)))
-      else: r.lines.line(base, tip, l.col)
-    elif o.tag == PointLightTag and o.selected:
+    if a.showDirections:
+      let (points, dir) = if o.tag in [SpotLightTag, DirLightTag]: (true, o.lightDir) else: o.pointing
+      if points:
+        let base = if o.tag == "PART": objectMatrix(o.pos, o.rot) * vec3(0, l.lift, 0)
+                   else: o.pos + vec3(0, l.lift, 0)
+        r.arrows.add DirArrow(base: base, dir: dir, onTop: o.selected,
+                              col: if o.selected: sel(rgba(255, 70, 70)) else: l.col)
+    if o.tag == PointLightTag and o.selected:
       # How far its light reaches.
       r.overlayLines.wireSphere(o.pos, o.light.radius, [l.col[0], l.col[1], l.col[2], 200'u8])
     elif o.tag == "SNDG" and o.selected and o.node.xpath("OSD/Sphere") != nil:
@@ -1062,10 +1129,9 @@ proc buildOverlays*(a: App) =
       for (path, alpha) in [("OSD/Sphere/MinRadius", 200'u8), ("OSD/Sphere/MaxRadius", 110'u8)]:
         let radius = try: parseFloat(o.node.xpath(path).str.strip) * 3 except ValueError: 0.0
         if radius > 0: r.overlayLines.wireSphere(o.pos, radius.float32, [l.col[0], l.col[1], l.col[2], alpha])
-    let (has, lo, hi) = o.extentBox
+    let (has, lo, hi) = o.volumeRange
     if has and (o.selected or o.tag == "TRGV"):
-      let half = (hi - lo) / 2
-      let kk = boxCorners((lo + hi) / 2, vec3(abs(half.x), abs(half.y), abs(half.z)), 0)
+      let kk = o.volumeCorners(lo, hi)
       if o.selected: r.overlayLines.wireBox(kk, sel(rgba(255, 70, 70)))
       else: r.lines.wireBox(kk, [l.col[0], l.col[1], l.col[2], 110'u8])
     if o.selected and a.geo != nil and o.objectCode != -1:
@@ -1080,11 +1146,14 @@ proc buildOverlays*(a: App) =
         r.tris.faceFill(a.geo, f, rgba(255, 60, 60, 60))
         r.overlayLines.faceOutline(a.geo, f, sel(rgba(255, 70, 70)))
       elif i in a.selFaces:
+        if clipping: continue
         r.tris.faceFill(a.geo, f, rgba(255, 60, 60, 110))
         r.overlayLines.faceOutline(a.geo, f, sel(rgba(255, 110, 110)))
     for fi in a.extrudeHoverFaces:
       if fi < a.geo.faces.len:
         r.overlayLines.faceOutline(a.geo, a.geo.faces[fi], rgba(255, 220, 40))
+    for (_, p, q) in a.cutHover: r.overlayLines.line(p, q, rgba(255, 220, 40))
+    for (p, q) in a.drag.cutLines: r.overlayLines.line(p, q, rgba(255, 220, 40))
     if a.drag.kind in {dkExtrude, dkSlide, dkSplit, dkStamp} and a.drag.face >= 0 and
        a.drag.geoBefore != nil:
       # The dragged faces where they are now: found by plane, as rebuilding a
@@ -1173,7 +1242,7 @@ proc buildGrid(a: App, vi: int, body: Rect) =
   let lo = cam.pixelToPlane(0, body.h, body.w, body.h)
   let hi = cam.pixelToPlane(body.w, 0, body.w, body.h)
   # Alphas are for the default opacity 0.5 (Settings > View > Grid opacity).
-  let prefs = if a.settingsOpen or a.optionsOpen: a.settingsEdit else: a.cfg
+  let prefs = if a.settingsOpen: a.settingsEdit else: a.cfg
   let op = prefs.gridOpacity / 0.5
   proc alpha(v: float): int = int(clamp(v * op, 0, 255))
   let gc = prefs.gridColor
@@ -1203,8 +1272,8 @@ proc drawViews*(a: App) =
   var opts = a.opts
   if not a.geometryVisible and opts.mode.wireframe: opts.mode = rmDynamicLight
   a.rend.grid3D = (if a.showGrid: a.grid else: 0)
-  # The settings and options dialogs preview their values until Save or Cancel.
-  let prefs = if a.settingsOpen or a.optionsOpen: a.settingsEdit else: a.cfg
+  # The settings dialog previews their values until Save or Cancel.
+  let prefs = if a.settingsOpen: a.settingsEdit else: a.cfg
   a.rend.showTriangles = prefs.showTriangles
   a.rend.gridColor = vec3(prefs.gridColor[0].float32, prefs.gridColor[1].float32,
                           prefs.gridColor[2].float32) / 255
@@ -1212,7 +1281,9 @@ proc drawViews*(a: App) =
   a.rend.gridAlpha = prefs.gridOpacity.float32
   a.rend.brightness = prefs.brightness.float32
   a.rend.setTextureFilter(prefs.linearFilter)
-  a.rend.setSky(if a.proj != nil: a.proj.sky else: "")
+  let proj = a.proj
+  a.rend.setSky(if proj != nil: proj.sky else: "", proc(sky, face: string): string = proj.skyImage(sky, face))
+  if proj != nil: a.rend.skyGrade = proj.skyGrade
   for i in 0 .. 3:
     let v = a.views[i]
     if v.rect.w < 2: continue
@@ -1234,6 +1305,35 @@ proc uiLine*(ui: Ui, p, q: Vec2, col: ColorRGBX, w = 1.5'f32) =
   let uv = vec2(e.x.float32 + e.width.float32 / 2, e.y.float32 + e.height.float32 / 2)
   ui.sk.drawTriangle([p + n, q + n, q - n], [uv, uv, uv], [col, col, col])
   ui.sk.drawTriangle([p + n, q - n, p - n], [uv, uv, uv], [col, col, col])
+
+proc dashedLine*(ui: Ui, p, q: Vec2, color: ColorRGBX, dash, gap: float32, t = 1'f32,
+                 clip = rect(0, 0, 0, 0)) =
+  ## With a clip rect, only the part inside it is dashed (the pattern still
+  ## starts at p). A corner just in front of the 3D camera projects millions
+  ## of pixels away: dashing all of it took seconds a frame, and past ~2.7e8 px
+  ## `s += dash + gap` stops changing in float32 and never ends.
+  let len = (q - p).length
+  if not (len >= 0.5 and len < Inf): return   # NaN fails both
+  let d = (q - p) / len
+  var s0 = 0'f32
+  var s1 = len
+  if clip.w > 0:
+    # Liang–Barsky, in pixels along the line.
+    for (dk, lo, hi, pk) in [(d.x, clip.x, clip.x + clip.w, p.x), (d.y, clip.y, clip.y + clip.h, p.y)]:
+      if abs(dk) < 1e-9:
+        if pk < lo or pk > hi: return
+      else:
+        var ta = (lo - pk) / dk
+        var tb = (hi - pk) / dk
+        if ta > tb: swap(ta, tb)
+        s0 = max(s0, ta)
+        s1 = min(s1, tb)
+    if s0 >= s1: return
+  let period = dash + gap
+  var s = floor(s0 / period) * period
+  while s < s1:
+    ui.uiLine(p + d * max(s, s0), p + d * min(s + dash, s1), color, t)
+    s += period
 
 proc uiTriangle*(ui: Ui, p, q, s: Vec2, col: ColorRGBX) =
   let e = ui.sk.atlas.entries[WhiteTileKey]
@@ -1311,9 +1411,16 @@ proc headerButton(a: App, r: Rect, icon: string, on: bool, tip: string, alt = fa
     ui.consumeClick()
     result = true
 
+proc partsOutline(a: App, r: Rect, on, all: bool) =
+  ## A header button with parts to choose from: solid while all of them are
+  ## on, dashed with only some, nothing while it's off.
+  if not on: return
+  if all: a.ui.roundedBorder(r, colAccent, 2, 2)
+  else: a.ui.dashedBorder(r, colAccent, 4, 3, 2)
+
 proc drawViewHeader(a: App, vi: int, h: Rect, hot: bool) =
   ## The view's name (and the 3D render mode), then, like UnrealEd's viewport
-  ## bar: Realtime preview, the view kind (Top, Front, Side, Perspective) and
+  ## bar: Realtime preview, Gizmos, Invisible faces, the view kind (Top, Front, Side, Perspective) and
   ## the render modes. A mode button pressed again switches to its alternate
   ## (Lighting / Solid, Wireframe / Lit Wireframe).
   let ui = a.ui
@@ -1331,24 +1438,43 @@ proc drawViewHeader(a: App, vi: int, h: Rect, hot: bool) =
   proc next(): Rect =
     result = rect(x, h.y + 3, bw, h.h - 6)
     x += bw + 4
-  # Right click: what it plays. Some of it only: a dashed outline while on.
+  proc separator() =
+    x += 7
+    ui.rect(rect(x, h.y + 11, 1, h.h - 22), colSeparator)
+    x += 10
+  # Right click: what it plays.
   let rt = next()
   let clicked = a.headerButton(rt, "gamepad", a.realtime,
                     "Realtime preview: animated vertex lighting plays, Sound objects can be heard " &
                     "from the 3D camera and the level music plays. Right click to choose which")
-  if a.realtime and a.previewParts != {PreviewPart.low .. PreviewPart.high}:
-    ui.dashedBorder(rt, colAccent, 4, 3, 2)
+  a.partsOutline(rt, a.realtime, a.previewParts == {PreviewPart.low .. PreviewPart.high})
   if clicked:
     if a.proj != nil: a.toggleRealtime()
   elif ui.hover(rt) and ui.pressed(MouseRight):
     a.ctx = CtxMenu(pos: ui.mouse, view: -1, face: -1, realtime: true)
     a.menuSys.openContext(ui.mouse)
-  x += 16
+  # Right click: which object types.
+  let gz = next()
+  let gzClicked = a.headerButton(gz, "gizmo", a.showGizmos,
+                    "Gizmos: the objects' boxes, light shapes, direction arrows and volumes. " &
+                    "Selected objects keep theirs. Right click to choose which types")
+  a.partsOutline(gz, a.showGizmos, a.gizmoHidden.len == 0)
+  if gzClicked:
+    if a.proj != nil: a.showGizmos = not a.showGizmos
+  elif ui.hover(gz) and ui.pressed(MouseRight):
+    a.ctx = CtxMenu(pos: ui.mouse, view: -1, face: -1, gizmos: true)
+    a.menuSys.openContext(ui.mouse)
+  if a.headerButton(next(), "eye", a.opts.invisible,
+                    "Invisible faces: the light cyan faces flagged Invisible (invisible walls, " &
+                    "stair ramps). Hidden ones can't be clicked either"):
+    a.opts.invisible = not a.opts.invisible
+    if a.geo != nil: a.geo.bump()
+  separator()
   for (letter, k, name) in [("T", vkTop, "Top"), ("F", vkFront, "Front"), ("S", vkSide, "Side"),
                             ("P", vk3D, "Perspective (3D)")]:
     if a.headerButton(next(), "letter" & letter, kind == k, name & " view", outline = true):
       a.setViewKind(vi, k)
-  x += 16
+  separator()
   let mode = a.opts.mode
   for (m, alt, icon, altIcon) in [(rmDynamicLight, rmDynamicLight, "bulb", "bulb"),
                                   (rmUnlit, rmUnlit, "image", "image"),
@@ -1359,7 +1485,7 @@ proc drawViewHeader(a: App, vi: int, h: Rect, hot: bool) =
       of rmDynamicLight: "Dynamic Light: textures lit by the vertex lighting"
       of rmUnlit: "Unlit: textures at full brightness"
       of rmLighting: "Lighting: the vertex lighting alone, no textures. " &
-                     "Press again for Solid: plain faces at full brightness"
+                     "Press again for Solid: plain faces, brighter the more they face the view, with cavity"
       else: "Wireframe: edges only. Press again for Lit Wireframe: edges in their vertex lighting colors"
     if a.headerButton(next(), (if isAlt: altIcon else: icon), mode in [m, alt], tip, isAlt):
       a.opts.mode = if mode == m: alt elif mode == alt: m else: m
@@ -1370,7 +1496,7 @@ proc drawViewOverlays*(a: App) =
   let ui = a.ui
   let (sok, slo, shi) = a.selectionBounds
   # Group boxes: the selected groups' and the open ones', named.
-  var boxes: seq[(Vec3, Vec3, string, ColorRGBX)]
+  var boxes, dashed: seq[(Vec3, Vec3, string, ColorRGBX)]
   if a.proj != nil and a.groups.len > 0:
     for u in a.selectedUnits[0]:
       let (ok, lo, hi) = a.groupBounds(u)
@@ -1379,6 +1505,10 @@ proc drawViewOverlays*(a: App) =
     for g in a.openGroups:
       let (ok, lo, hi) = a.groupBounds(g)
       if ok: boxes.add (lo, hi, a.groupName(g) & " (open)", pm(120, 200, 255))
+    # The linked copies an edit of the selection reaches: dashed.
+    for g in a.linkedOutlines:
+      let (ok, lo, hi) = a.groupBounds(g)
+      if ok: dashed.add (lo, hi, a.groupName(g) & " (linked)", pm(255, 170, 60))
   for i in 0 .. 3:
     let v = a.views[i]
     if v.rect.w < 2: continue
@@ -1465,7 +1595,7 @@ proc drawViewOverlays*(a: App) =
         ui.uiTriangle(q, neck + side * 5, neck - side * 5, col)
         ui.text(["X", "Y", "Z"][axis], q + dir * 6 + vec2(-4, -8), col, FontSmall)
       if arrows.len > 0: ui.uiCircle(arrows[0].base, 3, pm(235, 235, 235), filled = true)
-    # Sound volume face handles.
+    # Volume face handles.
     for k, (o, f, p) in a.boxHandles(i):
       let (ok, q) = a.toScreen(i, p)
       if not ok: continue
@@ -1476,10 +1606,13 @@ proc drawViewOverlays*(a: App) =
       if active:
         ui.uiCircle(q, 7, pm(255, 60, 60), 1.5)
         let ax = f div 2
-        let (lo, hi) = (parseVec3(o.node.xpath("OSD/Box/Min").str), parseVec3(o.node.xpath("OSD/Box/Max").str))
-        let side = (if f mod 2 == 0: "Min " else: "Max ") & ["X", "Y", "Z"][ax]
-        ui.chip(side & ": " & fmtNum(p[ax] - o.pos[ax]) & "  (size " & fmtNum(hi[ax] - lo[ax]) & ")",
-                q + vec2(0, -18), pm(200, 30, 30, 235), colWhite)
+        let (_, lo, hi) = o.volumeRange
+        let letter = ["X", "Y", "Z"][ax]
+        let label = if o.tag == "TRGV": "Size " & letter & ": " & fmtNum(hi[ax] - lo[ax])
+                    else: (if f mod 2 == 0: "Min " else: "Max ") & letter & ": " &
+                          fmtNum(if f mod 2 == 0: lo[ax] else: hi[ax]) &
+                          "  (size " & fmtNum(hi[ax] - lo[ax]) & ")"
+        ui.chip(label, q + vec2(0, -18), pm(200, 30, 30, 235), colWhite)
     # Brush tool: the shape's corners as handles, and a brush's size in 3D
     # (TrenchBroom shows its bounds there).
     if a.tool == toolBrush:
@@ -1529,7 +1662,8 @@ proc drawViewOverlays*(a: App) =
       let (lo, hi) = a.drawExtent
       a.sizeLabels(i, lo, hi)
     else: discard
-    for (lo, hi, name, col) in boxes:
+    for bi, (lo, hi, name, col) in boxes & dashed:
+      let dash = bi >= boxes.len
       var k: array[8, (bool, Vec2)]
       for c in 0 .. 7:
         k[c] = a.toScreen(i, vec3(if (c and 1) != 0: hi.x else: lo.x, if (c and 2) != 0: hi.y else: lo.y,
@@ -1537,7 +1671,9 @@ proc drawViewOverlays*(a: App) =
       for c in 0 .. 7:
         for bit in [1, 2, 4]:
           let d = c or bit
-          if d != c and k[c][0] and k[d][0]: ui.uiLine(k[c][1], k[d][1], col, 1.0)
+          if d != c and k[c][0] and k[d][0]:
+            if dash: ui.dashedLine(k[c][1], k[d][1], col, 6, 4, clip = v.viewBody)
+            else: ui.uiLine(k[c][1], k[d][1], col, 1.0)
       var top = vec2(Inf.float32, Inf.float32)
       for c in 0 .. 7:
         if k[c][0] and k[c][1].y < top.y: top = k[c][1]
@@ -1545,13 +1681,14 @@ proc drawViewOverlays*(a: App) =
     if a.openGroups.len > 0:
       var path: seq[string]
       for g in a.openGroups: path.add a.groupName(g)
-      ui.chip("Group: " & path.join(" ▸ ") & "  (Esc or double-click outside to close)",
+      ui.chip("Group: " & path.join(" > ") & "  (Esc or double-click outside to close)",
               vec2(b.x + b.w / 2, b.y + 14), pm(30, 60, 90, 235), colWhite)
     # Object names in 2D: selected and hovered ones (all with View ▸ Object names).
     if not is3D:
       var n = 0
       for o in a.objects:
-        if not (o.selected or o == a.hoverObj or a.showObjectNames) or not a.visible(o): continue
+        if not (o.selected or o == a.hoverObj or (a.showObjectNames and a.entityGizmo(o))) or
+           not a.visible(o): continue
         let (ok, p) = a.toScreen(i, o.pos)
         if ok and p.inside(b): ui.text(o.label, p + vec2(8, -18), colText, FontSmall)
         inc n
@@ -1566,6 +1703,47 @@ proc drawViewOverlays*(a: App) =
     ui.rect(r, colAccentDim)
     ui.border(r, colAccent)
     ui.popClip()
+
+proc particlePanelRect*(a: App): Rect =
+  ## Where the particle panel goes, while Particle objects are selected: over
+  ## the 3D view (they only draw there), else the first view showing.
+  if a.proj == nil or not a.selection.anyIt(it.tag == "PART"): return
+  var view = -1
+  for i in 0 .. 3:
+    if a.views[i].rect.w < 2: continue
+    if view < 0 or a.views[i].cam.kind == vk3D and a.views[view].cam.kind != vk3D: view = i
+  if view < 0: return
+  let b = a.views[view].viewBody
+  let (w, h) = (3 * 36 + 2 * 4 + 12 + 12'f32, 38 + 12'f32)
+  if b.w < w + 24 or b.h < h + 24: return
+  rect(b.x + b.w - w - 12, b.y + b.h - h - 12, w, h)
+
+proc drawParticlePanel*(a: App) =
+  ## The selected Particle objects' Play, Stop and Loop.
+  let r = a.particlePanelRect
+  if r.w == 0: return
+  let ui = a.ui
+  ui.roundedRect(rect(r.x + 1, r.y + 3, r.w, r.h), colShadow, 6)
+  ui.roundedRect(r, colPanel, 6)
+  ui.roundedBorder(r, colBorder, 6)
+  let sources = a.particleSources(a.selection.filterIt(it.tag == "PART"))
+  var x = r.x + 6
+  proc next(): Rect =
+    result = rect(x, r.y + 6, 36, 38)
+    x += 40
+  let playing = a.particleSim != nil and sources.anyIt(it.id in a.particleSim.played)
+  if a.headerButton(next(), "play", playing,
+                    "Play: emits from the start, as the level's script would, with or without Realtime preview"):
+    for s in sources:
+      a.particlePlaying.incl s.id
+      a.particlePlayNext.add s.id
+  if a.headerButton(next(), "stop", false, "Stop: ends the emission. What's already flying finishes"):
+    for s in sources: a.particleHaltNext.add s.id
+  x += 6
+  ui.rect(rect(x, r.y + 12, 1, r.h - 24), colSeparator)
+  x += 7
+  if a.headerButton(next(), "loop", a.particleLoop, "Loop: plays again when it finishes"):
+    a.particleLoop = not a.particleLoop
 
 # --- shared helpers for drags -----------------------------------------------------------------
 
@@ -1616,7 +1794,7 @@ proc snapOnFace(a: App, p: Vec3, fi: int): Vec3 =
 proc startGeometryDrag(a: App, kind: DragKind, vi: int, mouse: Vec2, world: Vec3,
                        points: HashSet[int32]) =
   a.drag = Drag(kind: kind, view: vi, startMouse: mouse, startWorld: world, startTime: epochTime(),
-                face: -1, piece: -1)
+                face: -1, piece: -1, xform: identityAffine())
   for o in a.selection:
     a.drag.objs.add o
     a.drag.startPose.add (o.pos, o.rot)
@@ -1624,6 +1802,12 @@ proc startGeometryDrag(a: App, kind: DragKind, vi: int, mouse: Vec2, world: Vec3
   if a.geo != nil:
     a.drag.geoBefore = a.geo.clone
     for v in points: a.drag.startPoints[v] = a.geo.points[v]
+    if kind in {dkMove, dkRotate, dkScale}:
+      # Only selected geometry: objects' own geometry is their model.
+      var faces: HashSet[int]
+      for fi in a.selectedFaceSet:
+        if a.geo.faces[fi].verts.allIt(it in points): faces.incl fi
+      a.drag.texHold = a.holdTextures(faces)
 
 proc beginMove(a: App, vi: int, mouse: Vec2, world: Vec3) =
   var points: HashSet[int32]
@@ -1660,7 +1844,7 @@ proc cancelDrag*(a: App) =
   of dkClipNew, dkClipPoint: a.clipPoints = d.clipBefore
   of dkBox: a.selHandles = d.handlesBefore
   else:
-    if d.kind in {dkSplit, dkStamp}: a.restoreSelection(d.selBefore)
+    if d.kind in {dkSplit, dkStamp, dkCut}: a.restoreSelection(d.selBefore)
     for i, o in d.objs:
       if i < d.objBefore.len: o.restore(d.objBefore[i])
     if d.geoBefore != nil and a.geo != nil: a.restoreGeometry(d.geoBefore)
@@ -1726,30 +1910,40 @@ proc applyClip*(a: App) =
   let (ok, pl) = a.clipPlane
   if not ok: return
   let pieces = a.selPieces
+  if pieces.len == 0 and a.selFaces.len > 0:
+    let before = a.geo.clone
+    let left = a.geo.clipFaces(toSeq(a.selFaces).sorted, pl, a.clipSide)
+    if a.geo.faces == before.faces:
+      a.geo = before
+      a.say("Clip: the plane doesn't change the selected faces", true)
+      return
+    a.push geoCmd("Clip faces", before, a.geo)
+    a.selFaces.clear()
+    for fi in left: a.selFaces.incl fi
+    a.resetClip()
+    a.say "Clipped faces"
+    return
   if pieces.len == 0:
-    a.say("Clip: select the pieces to cut first", true)
+    a.say("Clip: select the pieces or faces to cut first", true)
     return
   let before = a.geo.clone
-  # The cut pieces are replaced by new ones appended at the end (compaction
-  # keeps the other pieces that have faces in order), so the result is the
-  # tail past those.
-  var used = newSeq[bool](a.geo.pieces.len)
-  for f in a.geo.faces:
-    if f.piece >= 0 and f.piece < used.len: used[f.piece] = true
-  var kept = 0
-  for pc, u in used:
-    if u and pc.int32 notin pieces: inc kept
+  # The cut pieces are replaced by new ones appended at the end (the old ones
+  # stay, empty, so nothing renumbers).
+  let first = a.geo.pieces.len
   a.geo.clipPieces(pieces, pl, a.clipSide, a.densityFn)
+  # Before the push: it appends the linked copies' pieces after these.
+  let tail = a.geo.pieces.len
   a.push geoCmd("Clip", before, a.geo)
   a.selPieces.clear()
-  for pc in kept ..< a.geo.pieces.len: a.selPieces.incl pc.int32
+  for pc in first ..< tail: a.selPieces.incl pc.int32
   a.resetClip()
   a.say "Clipped"
 
 proc mergeFaces(a: App) =
   ## TrenchBroom's convex merge of selected faces: one new brush, the convex hull
-  ## of their corners, textured with the current texture. The faces' own pieces
-  ## stay (any piece's faces work, not only brushes').
+  ## of their corners. TB textures it with the current texture; here it looks
+  ## like the faces (hullLike), so each one runs on across its plane. The
+  ## faces' own pieces stay (any piece's faces work, not only brushes').
   if a.selFaces.len < 2:
     a.say("Convex merge: select at least two faces", true)
     return
@@ -1757,7 +1951,7 @@ proc mergeFaces(a: App) =
   for fi in a.selFaces:
     for v in a.geo.faces[fi].verts: pts.add a.geo.points[v]
   let before = a.geo.clone
-  let pc = a.geo.addHull(pts, a.newFaceAttr, a.densityFn)
+  let pc = a.geo.hullLike(pts, toSeq(a.selFaces).sorted, a.densityFn)
   if pc < 0:
     a.geo = before
     a.say("Convex merge: the faces span no volume", true)
@@ -1766,6 +1960,50 @@ proc mergeFaces(a: App) =
   a.clearSelection()
   a.selPieces.incl pc
   a.say "CSG merge"
+
+proc joinPlanarFaces(a: App): bool =
+  ## Ctrl+J on faces that all lie on one plane: one face where they make a
+  ## convex shape. False when they don't lie on one plane (a convex merge then).
+  let faces = toSeq(a.selFaces).sorted
+  let f0 = a.geo.faces[faces[0]]
+  let pl = a.geo.facePlane(f0)
+  for fi in faces:
+    let q = a.geo.facePlane(a.geo.faces[fi])
+    if q.n.dot(pl.n) < 0.9999 or abs(q.d - pl.d) >= 0.1: return false
+  result = true
+  if faces.anyIt(a.geo.faces[it].objectId != -1):
+    a.say("Join faces: faces of objects can't be joined", true)
+    return
+  let before = a.geo.clone
+  let kept = a.geo.joinFaces(faces)
+  if kept.len == 0:
+    a.say("Join faces: they must touch along an edge, have the same flags and make a convex shape", true)
+    return
+  a.clearSelection()
+  for fi in kept: a.selFaces.incl fi
+  a.push geoCmd("Join faces", before, a.geo)
+  a.say &"Joined faces on one plane: {faces.len} selected, {kept.len} result(s)"
+
+proc separateSelection*(a: App) =
+  ## Selected pieces fall apart into one piece per face; selected faces leave
+  ## their pieces together, as one new piece. What comes out stays selected.
+  if a.geo == nil: return
+  a.expandGroupSelection()
+  let before = a.geo.clone
+  var made: seq[int32]
+  if a.selPieces.len > 0:
+    made = a.geo.separatePieces(toSeq(a.selPieces).sorted)
+  else:
+    let faces = toSeq(a.selFaces).sorted.filterIt(a.geo.faces[it].objectId == -1)
+    if faces.len == 0:
+      a.say("Separate: select pieces or faces first", true)
+      return
+    made = @[a.geo.separateFaces(faces)]
+  a.push geoCmd("Separate", before, a.geo)
+  a.selFaces.clear()
+  a.selPieces.clear()
+  for pc in made: a.selPieces.incl pc
+  a.say &"Separated into {made.len} piece(s)"
 
 proc joinSelection*(a: App) =
   ## Joins two selected meshes (pieces, or objects that own geometry such as
@@ -1795,12 +2033,16 @@ proc joinSelection*(a: App) =
 proc csg*(a: App, op: string) =
   if a.geo == nil: return
   if op == "merge" and a.selFaces.len > 0:
-    a.mergeFaces()
+    if a.selFaces.len < 2 or not a.joinPlanarFaces(): a.mergeFaces()
     return
   var pieces = toSeq(a.selPieces)
   pieces.sort
   if pieces.len == 0:
     a.say("CSG: select brushes first", true)
+    return
+  if a.closedGroupSelected:
+    # TrenchBroom's canDoCsg: the selection has to be only brushes.
+    a.say("CSG: open the group first, it can't take a closed group", true)
     return
   let byPiece = a.geo.pieceFaces
   for pc in pieces:
@@ -1810,7 +2052,7 @@ proc csg*(a: App, op: string) =
   let before = a.geo.clone
   var ok = true
   # Pieces each op consumes; its results are appended after the survivors.
-  var consumed = pieces.len
+  var consumed = toHashSet(pieces)
   case op
   of "merge": ok = a.geo.csgMerge(pieces, a.densityFn)
   of "intersect": ok = a.geo.csgIntersect(pieces, a.densityFn)
@@ -1832,16 +2074,26 @@ proc csg*(a: App, op: string) =
     if others.len == 0:
       a.say("Subtract: no brushes touch the selection", true)
       return
-    consumed = others.len
+    consumed = toHashSet(others)
     ok = a.geo.csgSubtract(others, pieces, a.densityFn) >= 0
   else: discard
   if not ok:
     a.geo = before
     a.say("CSG " & op & " produced nothing", true)
     return
+  # Survivors keep their order; empty pieces (left by group edits) are
+  # dropped too, so count them rather than subtract from the old total.
+  var used = newSeq[bool](before.pieces.len)
+  for f in before.faces:
+    if f.verts.len >= 3 and f.piece >= 0 and f.piece < used.len: used[f.piece] = true
+  var kept = 0
+  for pc, u in used:
+    if u and pc.int32 notin consumed: inc kept
+  # Before the push: it appends the linked copies' pieces after these.
+  let tail = a.geo.pieces.len
   a.push geoCmd("CSG " & op, before, a.geo)
   a.selPieces.clear()
-  for pc in before.pieces.len - consumed ..< a.geo.pieces.len: a.selPieces.incl pc.int32
+  for pc in kept ..< tail: a.selPieces.incl pc.int32
   a.say "CSG " & op
 
 proc createShape(a: App, lo, hi: Vec3, dir: Vec3) =
@@ -1905,7 +2157,7 @@ proc deleteHandles*(a: App): bool =
   true
 
 proc copyTextureTo(a: App, src, fi: int, m: UVMap, textureOnly: bool, wrap = false) =
-  ## The source face's texture (and, unless textureOnly, its flags and
+  ## The source face's texture (and, unless textureOnly, its flags, tint and
   ## alignment) onto face fi. wrap (Alt+Shift) folds the alignment about the
   ## edge the two faces' planes meet on, so it runs on around corners.
   if fi == src: return
@@ -1915,6 +2167,7 @@ proc copyTextureTo(a: App, src, fi: int, m: UVMap, textureOnly: bool, wrap = fal
   else:
     a.geo.faces[fi].texture = sf.texture
     a.geo.faces[fi].flags = sf.flags
+    a.geo.faces[fi].untint = sf.untint
     let n = a.geo.normal(a.geo.faces[fi])
     let m = if wrap: m.wrapUVMap(a.geo.facePlane(sf), a.geo.facePlane(a.geo.faces[fi])) else: m
     if m.ok and abs(m.n.dot(n)) > 0.999:
@@ -2036,6 +2289,83 @@ proc selectSiblings*(a: App) =
     if o.tag in tags and a.pickable(o): o.selected = true
   if geo and a.geometryEditable:
     for pc in a.worldPieces: a.selPieces.incl pc
+
+proc faceSelectable(a: App, fi: int): bool =
+  ## A face the selection-by-look commands may take: visible, and not in a
+  ## locked group (TrenchBroom's collectSelectableBrushFaces).
+  let f = a.geo.faces[fi]
+  a.faceVisible(fi) and not (f.objectId == -1 and a.pieceLocked(f.piece))
+
+proc selectFacesWithTexture*(a: App, tex: string) =
+  ## TrenchBroom's texture browser "Select Faces": the selection becomes every
+  ## selectable face with that texture (case-blind, as TB's materials).
+  if a.geo == nil or not a.geometryEditable: return
+  let key = tex.toLowerAscii
+  a.clearSelection()
+  for i, f in a.geo.faces:
+    if f.texture.toLowerAscii == key and a.faceSelectable(i):
+      a.selFaces.incl i
+      a.lastFace = i
+  a.say(if a.selFaces.len == 0: tex & " is on no selectable face"
+        else: &"Selected {a.selFaces.len} face(s) with {tex}")
+
+proc selectPiecesWithTexture*(a: App, tex: string) =
+  ## TrenchBroom's "Select Brushes": the level pieces with a selectable face
+  ## using the texture. Pieces are taken one by one, even in closed groups, so
+  ## no piece without it comes along (TB does the same for entities).
+  if a.geo == nil or not a.geometryEditable: return
+  let key = tex.toLowerAscii
+  a.clearSelection()
+  for i, f in a.geo.faces:
+    if f.objectId == -1 and f.texture.toLowerAscii == key and a.faceSelectable(i):
+      a.selPieces.incl f.piece
+  a.say(if a.selPieces.len == 0: tex & " is on no selectable piece"
+        else: &"Selected {a.selPieces.len} piece(s) with {tex}")
+
+proc sameFrame(x, y: TexFrame): bool =
+  ## Two texture mappings the Face tab would show alike. Shifts wrap at 1.
+  if x.ok != y.ok: return false
+  if not x.ok: return true
+  const Tol = 1e-3
+  for k in 0 .. 1:
+    let d = abs(x.shift[k] - y.shift[k])
+    if min(d, 1 - d) > Tol or abs(x.scale[k] - y.scale[k]) > Tol: return false
+  abs(x.rot - y.rot) <= 0.01
+
+proc sameLook(a: App, f: Face, fr: TexFrame, g: Face, gr: TexFrame): bool =
+  ## The Face tab's properties but shade (baked light, different on nearly
+  ## every face): texture, mapping, flags, script id and tint.
+  f.texture.toLowerAscii == g.texture.toLowerAscii and f.flags == g.flags and
+    f.scriptId == g.scriptId and f.untint == g.untint and sameFrame(fr, gr)
+
+proc selectMatchingFaces*(a: App) =
+  ## The selected faces' looks pick every selectable face that looks exactly
+  ## like one of them; the selection becomes those faces.
+  if a.geo == nil or a.selFaces.len == 0: return
+  var refs: seq[(int, TexFrame)]
+  for fi in a.selFaces:
+    if fi notin 0 .. a.geo.faces.high: continue
+    let f = a.geo.faces[fi]
+    let fr = a.geo.texFrame(fi, a.density(f.texture))
+    if not refs.anyIt(a.sameLook(a.geo.faces[it[0]], it[1], f, fr)): refs.add (fi, fr)
+  if refs.len == 0: return
+  let keep = a.lastFace
+  var found: HashSet[int]
+  for i, f in a.geo.faces:
+    if not a.faceSelectable(i) and i notin a.selFaces: continue
+    # Cheap fields first: texFrame fits least squares per face.
+    if not refs.anyIt(a.geo.faces[it[0]].texture.toLowerAscii == f.texture.toLowerAscii and
+                      a.geo.faces[it[0]].flags == f.flags): continue
+    let fr = a.geo.texFrame(i, a.density(f.texture))
+    if refs.anyIt(a.sameLook(a.geo.faces[it[0]], it[1], f, fr)): found.incl i
+  a.clearSelection()
+  a.selFaces = found
+  a.lastFace = if keep in found: keep else: -1
+  if a.lastFace == -1:
+    for fi in found:
+      a.lastFace = fi
+      break
+  a.say &"Selected {found.len} face(s) with the same properties"
 
 proc drillSelection(a: App, vi: int, m: Vec2, farther: bool) =
   ## Ctrl+wheel in 3D: move the selection to the next thing under the mouse.
@@ -2224,7 +2554,7 @@ proc click(a: App, vi: int, m: Vec2) =
         a.assemblePoints.add a.snapOnFace(p, fi)
         return
   of toolSelect:
-    # Sound face handles: select one (Ctrl toggles); any other click first
+    # Volume face handles: select one (Ctrl toggles); any other click first
     # drops the selected ones, as the vertex tool does with its handles.
     a.pruneBoxFaces()
     if md.none or md.only(c = true):
@@ -2432,6 +2762,22 @@ proc beginExtrude(a: App, vi: int, m: Vec2, fi: int, kind: DragKind) =
   for g in a.extrudeGroup(fi):
     a.drag.snapLines.add a.faceSnapLines(g, kind in {dkSlide, dkStamp})
 
+proc beginCut(a: App, vi: int, m: Vec2, fi: int, p, q: Vec3) =
+  let f = a.geo.faces[fi]
+  let edges = a.cutGroup(fi, p, q)
+  a.startGeometryDrag(dkCut, vi, m, p, initHashSet[int32]())
+  let n = a.geo.normal(f)
+  let inward = a.cutAxis(fi, p, q)
+  # Grab the point under the mouse on the face, so only its movement counts.
+  let (ok, at) = a.viewRay(vi, m).planeHit(p, n)
+  if ok and (at - p).length < 100000: a.drag.startWorld = at
+  a.drag.face = fi
+  a.drag.axis = inward
+  a.drag.cutEdge = (p, q)
+  a.drag.cutEdges = edges
+  a.drag.selBefore = (a.selection, a.selPieces, a.selFaces)
+  a.drag.snapLines = @[(p, inward), (q, inward)]
+
 proc startLeftDrag(a: App, vi: int, pressPos: Vec2) =
   let md = a.mods
   let modal = a.tool != toolSelect
@@ -2447,7 +2793,7 @@ proc startLeftDrag(a: App, vi: int, pressPos: Vec2) =
                   geoBefore: a.geo.clone, maps: @[a.geo.uvMapOf(a.geo.faces[src])])
     a.paintTextureAlong(pressPos)
     return
-  # A sound volume's face handle: the selected faces (this one first, Ctrl
+  # A volume's face handle: the selected faces (this one first, Ctrl
   # adds it) along its axis, or freely when some lie on other axes.
   let bh = a.boxHandleAt(vi, pressPos)
   if bh >= 0 and (md.none or md.only(c = true)):
@@ -2458,6 +2804,7 @@ proc startLeftDrag(a: App, vi: int, pressPos: Vec2) =
       a.selBoxFaces.add (o, f)
     var e = vec3(0, 0, 0)
     e[f div 2] = 1
+    e = o.volumeTurn * e
     let (ok, s0) = a.viewRay(vi, pressPos).alongAxis(p, e)
     if ok:
       var d = Drag(kind: dkBoxFace, view: vi, startMouse: pressPos, startWorld: p, startTime: epochTime(),
@@ -2469,7 +2816,9 @@ proc startLeftDrag(a: App, vi: int, pressPos: Vec2) =
       for so in objs:
         d.objs.add so
         d.objBefore.add so.snapshot
-        d.boxStart.add (parseVec3(so.node.xpath("OSD/Box/Min").str), parseVec3(so.node.xpath("OSD/Box/Max").str))
+        let (_, lo, hi) = so.volumeRange
+        d.boxStart.add (lo, hi)
+        d.boxBase.add so.pos
       a.drag = d
       return
   # Gizmo: an arrow moves along its axis, a square on its plane (Ctrl: duplicate first).
@@ -2548,6 +2897,23 @@ proc startLeftDrag(a: App, vi: int, pressPos: Vec2) =
         a.drag.scaleAxes = sides
         return
   else: discard
+  # Cut a selected face (Ctrl+Shift) from its nearest edge.
+  if md.c and md.s and not md.al:
+    let (fi, p, q) = a.cutEdgeAt(vi, pressPos)
+    if fi >= 0:
+      a.beginCut(vi, pressPos, fi, p, q)
+      return
+  # Paint more faces into a face selection (Shift).
+  if md.only(s = true) and not modal and a.selFaces.len > 0 and not a.hasNodeSelection:
+    let (fi, _) = a.faceUnder(vi, pressPos)
+    if fi >= 0:
+      let before = (a.selection, a.selPieces, a.selFaces)
+      let faceBefore = (a.lastFace, a.faceTemplate)
+      a.selFaces.incl fi
+      a.lastFace = fi
+      a.drag = Drag(kind: dkPaintFaces, view: vi, startMouse: pressPos, startTime: epochTime(),
+                    selBefore: before, faceBefore: faceBefore, face: -1, piece: -1)
+      return
   # Extrude a selected brush's face (Shift), split (Ctrl), slide (Alt), stamp (Ctrl+Alt).
   if not modal and md.s and a.geo != nil:
     let fi = a.extrudeFaceAt(vi, pressPos)
@@ -2738,6 +3104,11 @@ proc extrudePiece(a: App, kind: DragKind, e: DragPiece, dist: float32, move: Vec
   let brush = e.planes.len > 0 and e.planeIndex >= 0
   var corners: seq[Vec3]
   for (c, _) in e.faces: corners.add c
+  # Split and stamp brushes join the group of the piece they come from.
+  let group = a.geo.pieces[pc].group
+  proc hull(pts: seq[Vec3], attr: FaceAttr) =
+    let np = a.geo.addHull(pts, attr, a.densityFn, e.maps)
+    if np >= 0: a.geo.pieces[np].group = group
   case kind
   of dkExtrude:
     if brush:
@@ -2767,18 +3138,18 @@ proc extrudePiece(a: App, kind: DragKind, e: DragPiece, dist: float32, move: Vec
         if not a.geo.replacePiece(pc, shrunk, e.maps, a.densityFn): return true
         slab.add moved.flipped
       let np = a.geo.pieces.len.int32
-      a.geo.pieces.add Piece(brush: true)
+      a.geo.pieces.add Piece(brush: true, group: group)
       if not a.geo.replacePiece(np, slab, e.maps, a.densityFn): a.geo.pieces.setLen np
     else:
       for (c, attr) in e.faces:
         var pts = c
         for p in c: pts.add p + move
-        discard a.geo.addHull(pts, attr, a.densityFn, e.maps)
+        hull(pts, attr)
   of dkStamp:
     for (c, attr) in e.faces:
       var pts = c
       for p in c: pts.add p + move
-      discard a.geo.addHull(pts, attr, a.densityFn, e.maps)
+      hull(pts, attr)
   else: discard
 
 proc selectSplitOff(a: App, outward: bool) =
@@ -2794,7 +3165,18 @@ proc selectSplitOff(a: App, outward: bool) =
   else:
     for pc in made: a.selPieces.incl pc
 
-proc updateExtrude(a: App, m: Vec2) =
+proc rebuildDue(a: App, move: Vec3, last: bool): bool =
+  ## A drag that rebuilds from geoBefore loses the bake: it does so only when
+  ## its move changes, on a frame the bake runs too, so no unlit frame is drawn
+  ## (they blink). last = the drag's end, which can't wait.
+  if a.drag.built and a.drag.builtMove == move: return false
+  if a.bakeWaits and not last: return false
+  a.drag.built = true
+  a.drag.builtMove = move
+  if last: a.bakeAt = 0
+  true
+
+proc updateExtrude(a: App, m: Vec2, last = false) =
   let d = a.drag
   var dist: float32
   var move: Vec3
@@ -2806,6 +3188,7 @@ proc updateExtrude(a: App, m: Vec2) =
     dist = a.extrudeDistance(m)
     move = d.axis * dist
   if abs(dist) > 1e-4: a.drag.moved = true
+  if not a.rebuildDue(move, last): return
   a.restoreGeometry(d.geoBefore)
   a.drag.lastDelta = vec3(0, 0, 0)
   if d.kind in {dkSplit, dkStamp}: a.restoreSelection(d.selBefore)
@@ -2819,7 +3202,8 @@ proc updateExtrude(a: App, m: Vec2) =
   a.drag.lastDelta = move
   if d.kind in {dkSplit, dkStamp}: a.selectSplitOff(dist > 0)
 
-proc finishExtrude(a: App) =
+proc finishExtrude(a: App, m: Vec2) =
+  a.updateExtrude(m, last = true)
   let d = a.drag
   if not d.moved:
     a.restoreGeometry(d.geoBefore)
@@ -2833,6 +3217,56 @@ proc finishExtrude(a: App) =
   a.push geoCmd(label, d.geoBefore, a.geo)
   a.drag = Drag(kind: dkNone, face: -1, piece: -1)
 
+proc updateCut(a: App, m: Vec2, last = false) =
+  ## The cut stays parallel to its edge and moves with the mouse, like an
+  ## extrude's face; it goes through every selected face it crosses. Dragged
+  ## the other way, out past the edge, it extends the face across its plane.
+  let d = a.drag
+  let dist = a.extrudeDistance(m)
+  if not a.rebuildDue(d.axis * dist, last): return
+  a.restoreGeometry(d.geoBefore)
+  a.restoreSelection(d.selBefore)
+  a.drag.cutLines.setLen 0
+  a.drag.moved = false
+  a.drag.cutOutward = dist < 0
+  if abs(dist) < 1e-4: return
+  if dist < 0:
+    # Out past the edge: a new face on the plane, instead of a cut.
+    let along = d.axis * dist
+    for (fi, p, q) in d.cutEdges:
+      let made = a.geo.extendFace(fi, p, q, along)
+      if made < 0: continue
+      a.selFaces.incl made
+      a.drag.moved = true
+      a.drag.cutLines.add [(p, p + along), (p + along, q + along), (q + along, q)]
+    a.geo.bump()
+    return
+  let pl = plane(d.axis, d.cutEdge[0] + d.axis * dist)
+  for fi in d.selBefore[2]:
+    if a.geo.faces[fi].objectId != -1: continue
+    let made = a.geo.cutFace(fi, pl)
+    if made < 0: continue
+    a.selFaces.incl made
+    a.drag.moved = true
+    let on = a.geo.faces[made].verts.filterIt(abs(pl.dist(a.geo.points[it])) < 0.02)
+    if on.len >= 2: a.drag.cutLines.add (a.geo.points[on[0]], a.geo.points[on[^1]])
+  a.geo.bump()
+
+proc finishCut(a: App, m: Vec2) =
+  a.updateCut(m, last = true)
+  let d = a.drag
+  if d.moved:
+    # A cut is this copy's own: its linked copies keep their faces.
+    var touched = d.selBefore[2].toSeq
+    for (fi, _, _) in d.cutEdges: touched.add fi
+    let separated = a.unlinkFaceGroups(d.geoBefore, touched)
+    a.push geoCmd(if d.cutOutward: "Extend face" else: "Cut face", d.geoBefore, a.geo)
+    if separated > 0:
+      let verb = if d.cutOutward: "Extended" else: "Cut"
+      a.say &"{verb} in this copy only: separated {separated} group(s) from their linked copies"
+    a.drag = Drag(kind: dkNone, face: -1, piece: -1)
+  else: a.cancelDrag()
+
 proc applyMoveDelta(a: App, delta: Vec3) =
   ## Moves the dragged objects and points to their start plus delta.
   if delta == a.drag.lastDelta: return
@@ -2842,6 +3276,7 @@ proc applyMoveDelta(a: App, delta: Vec3) =
     a.setPose(o, a.drag.startPose[i][0] + delta, a.drag.startPose[i][1])
   if a.geo != nil and a.drag.startPoints.len > 0:
     for v, p in a.drag.startPoints: a.geo.points[v] = p + delta
+    a.releaseTextures(a.drag.texHold, restore = true)
     a.geo.bump()
 
 proc camUp(c: Camera): Vec3 = c.right.cross(c.forward)
@@ -2903,6 +3338,7 @@ proc updateDrag(a: App, m: Vec2) =
     if a.snap: delta = a.snapV(delta)   # relative snapping, like TrenchBroom
     a.applyMoveDelta(delta)
   of dkExtrude, dkSlide, dkSplit, dkStamp: a.updateExtrude(m)
+  of dkCut: a.updateCut(m)
   of dkBoxFace:
     if (m - a.drag.startMouse).length > DragThreshold: a.drag.moved = true
     if not a.drag.moved: return
@@ -2912,28 +3348,27 @@ proc updateDrag(a: App, m: Vec2) =
       if a.snap: delta = a.snapV(delta)
     else:
       # The grabbed face lands on the grid (TrenchBroom snaps a resized face
-      # there); the other selected faces move as much.
-      let (ok, s) = a.viewRay(a.drag.view, m).alongAxis(a.drag.startWorld, a.drag.axis)
+      # there); the other selected faces move as much. On a turned volume no
+      # world grid lines up with the face, so the distance snaps instead.
+      let e = a.drag.axis
+      let (ok, s) = a.viewRay(a.drag.view, m).alongAxis(a.drag.startWorld, e)
       if not ok: return
-      let ax = a.drag.face div 2
-      var world = a.drag.startWorld[ax] + s - a.drag.along
-      if a.snap: world = snapTo(world, a.grid)
-      delta[ax] = world - a.drag.startWorld[ax]
+      let along = max(abs(e.x), max(abs(e.y), abs(e.z))) > 0.999
+      let start = if along: a.drag.startWorld.dot(e) else: 0'f32
+      var moved = s - a.drag.along
+      if a.snap: moved = snapTo(start + moved, a.grid) - start
+      delta = e * moved
     for i, o in a.drag.objs:
-      let bmin = o.node.xpath("OSD/Box/Min")
-      let bmax = o.node.xpath("OSD/Box/Max")
-      if bmin == nil or bmax == nil: continue
+      let local = o.volumeTurn.inverse * delta
       var (lo, hi) = a.drag.boxStart[i]
       # A face moved alone stays at least a unit from the opposite one.
       for k in 0 .. 2:
         let (mn, mx) = (a.boxFaceSelected(o, k * 2), a.boxFaceSelected(o, k * 2 + 1))
-        if mn: lo[k] += delta[k]
-        if mx: hi[k] += delta[k]
+        if mn: lo[k] += local[k]
+        if mx: hi[k] += local[k]
         if mx and not mn: hi[k] = max(hi[k], lo[k] + 1)
         elif mn and not mx: lo[k] = min(lo[k], hi[k] - 1)
-      bmin.setText(fmtVec3(lo))
-      bmax.setText(fmtVec3(hi))
-      o.file.dirty = true
+      a.setVolumeRange(o, a.drag.boxBase[i], lo, hi)
   of dkRotate:
     let (ok, c) = a.toScreen(a.drag.view, a.drag.pivot)
     if not ok: return
@@ -2954,6 +3389,7 @@ proc updateDrag(a: App, m: Vec2) =
       a.setPose(o, rotateAxis(a.drag.startPose[i][0], pivot, axis, deg), rot)
     if a.geo != nil and a.drag.startPoints.len > 0:
       for pv, p in a.drag.startPoints: a.geo.points[pv] = rotateAxis(p, pivot, axis, deg)
+      a.releaseTextures(a.drag.texHold, restore = true)
       a.geo.bump()
   of dkRotateCenter:
     var d = a.dragDelta(m, md.s)
@@ -3010,6 +3446,7 @@ proc updateDrag(a: App, m: Vec2) =
     for i, o in a.drag.objs: a.setPose(o, remap(a.drag.startPose[i][0]), a.drag.startPose[i][1])
     if a.geo != nil:
       for pv, q in a.drag.startPoints: a.geo.points[pv] = remap(q)
+      a.releaseTextures(a.drag.texHold, restore = true)
       a.geo.bump()
   of dkDraw: a.updateDraw(m)
   of dkBox: discard
@@ -3079,7 +3516,7 @@ proc updateDrag(a: App, m: Vec2) =
       var (fi, t) = (-1, 0'f32)
       if a.geometryEditable:
         let code = o.objectCode
-        let pickable = a.facePickable
+        let pickable = a.facePickable(vi, r)
         let app = a
         (fi, t) = a.geo.pickFace(r, proc(i: int): bool =
           (code == -1 or app.geo.faces[i].objectId != code) and pickable(i))
@@ -3098,8 +3535,9 @@ proc endDrag(a: App, m: Vec2) =
   of dkHandles: a.finishDrag($a.tool)
   of dkRotate: a.finishDrag("Rotate")
   of dkScale: a.finishDrag("Scale")
-  of dkBoxFace: a.finishDrag("Resize sound volume")
-  of dkExtrude, dkSlide, dkSplit, dkStamp: a.finishExtrude()
+  of dkBoxFace: a.finishDrag("Resize volume")
+  of dkExtrude, dkSlide, dkSplit, dkStamp: a.finishExtrude(m)
+  of dkCut: a.finishCut(m)
   of dkDraw:
     let (lo, hi) = d.extent
     a.drag = Drag(kind: dkNone, face: -1, piece: -1)
@@ -3127,7 +3565,7 @@ proc endDrag(a: App, m: Vec2) =
       elif a.rectObjects(r).len > 0: mode = 2
     case mode
     of 1:
-      # Sound face handles, toggled like the vertex tool's lasso.
+      # Volume face handles, toggled like the vertex tool's lasso.
       if not ctrl: a.selBoxFaces.setLen 0
       for h in a.rectBoxFaces(r):
         let k = a.selBoxFaces.find(h)
@@ -3184,7 +3622,8 @@ proc handleViews*(a: App, dt: float32) =
   let ui = a.ui
   let w = a.window
   let m = ui.mouse
-  let blocked = ui.captured or a.modalOpen or a.menuSys.isOpen or a.splitDrag.len > 0
+  let blocked = ui.captured or a.modalOpen or a.menuSys.isOpen or a.splitDrag.len > 0 or
+                m.inside(a.particlePanelRect)
   a.hoverView = if blocked: -1 else: a.viewAt(m)
   if a.drag.kind == dkPlace: a.hoverView = if blocked and a.menuSys.contextOpen: -1 else: a.viewAt(m)
   elif a.drag.kind != dkNone: a.hoverView = a.drag.view
@@ -3194,6 +3633,7 @@ proc handleViews*(a: App, dt: float32) =
   a.hoverObj = nil
   a.extrudeHover = -1
   a.extrudeHoverFaces.setLen 0
+  a.cutHover.setLen 0
 
   # Camera drags.
   case a.drag.kind
@@ -3293,8 +3733,15 @@ proc handleViews*(a: App, dt: float32) =
       if fi < 0:
         point = if a.is3D(p.view): a.viewRay(p.view, m).origin + a.viewRay(p.view, m).dir * 256
                 else: a.pointOnView(p.view, m, a.referenceBounds[1])
+      # The group under the click, looking past the selection (it can't be
+      # the group the selection joins, and it often sits in front of it).
+      var groupHit = 0'i32
+      for c in cs:
+        if a.isSelected(c): continue
+        groupHit = if c.obj != nil: a.objGroup(c.obj) else: a.pieceGroup(c.piece)
+        break
       a.ctx = CtxMenu(pos: m, view: p.view, point: point, face: fi,
-                      obj: (if cs.len > 0: cs[0].obj else: nil))
+                      obj: (if cs.len > 0: cs[0].obj else: nil), groupHit: groupHit)
       a.menuSys.openContext(m)
       return
 
@@ -3370,6 +3817,9 @@ proc handleViews*(a: App, dt: float32) =
       if md.s and a.selPieces.len > 0:
         a.extrudeHover = a.extrudeFaceAt(vi, m)
         if a.extrudeHover >= 0: a.extrudeHoverFaces = a.extrudeGroup(a.extrudeHover)
+      if md.c and md.s and not md.al:
+        let (fi, p, q) = a.cutEdgeAt(vi, m)
+        if fi >= 0: a.cutHover = a.cutGroup(fi, p, q)
     else: discard
     if not a.is3D(vi):
       let c = a.pick(vi, m)
@@ -3547,6 +3997,9 @@ proc focusFace*(a: App, fi: int, corner = -1) =
   a.layerHidden.excl GeometryLayer
   a.layerLocked.excl GeometryLayer
   if f.isMarkerFace: a.opts.markers = true
+  if f.isInvisibleFace and not a.opts.invisible:
+    a.opts.invisible = true
+    a.geo.bump()
   if f.piece >= 0 and f.piece < a.geo.pieces.len and a.geo.pieces[f.piece].hidden:
     a.geo.pieces[f.piece].hidden = false
     a.geo.bump()
@@ -3604,8 +4057,10 @@ proc rotateKeyed*(a: App, axis: Vec3, sign: float32, label: string) =
       a.setPose(o, rotateAxis(o.pos, pivot, axis, deg), turnRotation(o.rot, axis, deg))
     if geoSel:
       let faces = a.selectedFaceSet
+      let hold = a.holdTextures(faces)
       a.geo.detachPoints(faces)
       a.geo.transformPoints(a.geo.pointsOf(faces), proc(p: Vec3): Vec3 = rotateAxis(p, pivot, axis, deg))
+      a.releaseTextures(hold)
     a.transformSelectedGroups(affineOf(proc(p: Vec3): Vec3 = rotateAxis(p, pivot, axis, deg)))
     a.push editCmd(label, sel, before, geoBefore, a.geo)
   else:
@@ -3624,9 +4079,11 @@ proc scaleSelection*(a: App, f: Vec3) =
   for o in sel: a.setPose(o, sc(o.pos), o.rot)
   if geoSel:
     let faces = a.selectedFaceSet
+    let hold = a.holdTextures(faces)
     a.geo.detachPoints(faces)
     a.geo.transformPoints(a.geo.pointsOf(faces), sc)
     if f.x * f.y * f.z < 0: a.geo.reverseWinding(faces)
+    a.releaseTextures(hold)
   a.transformSelectedGroups(affineOf(sc))
   a.push editCmd("Scale", sel, before, geoBefore, a.geo)
 
@@ -3680,6 +4137,7 @@ proc handleKeys*(a: App, menuAction: proc(label: string): bool) =
   elif c and pressed(KeyS): run "Save"
   elif c and pressed(KeyO): run "Open project..."
   elif c and pressed(KeyN): run "New project..."
+  elif c and pressed(KeyW): run "Close project"
   elif c and pressed(KeyQ): run "Quit"
   elif c and al and pressed(KeyZ):
     for i in 0 .. 3:
@@ -3694,6 +4152,7 @@ proc handleKeys*(a: App, menuAction: proc(label: string): bool) =
   elif c and pressed(KeyX): run "Cut"
   elif c and pressed(KeyC): run "Copy"
   elif c and al and pressed(KeyV): run "Paste at original position"
+  elif c and sh and pressed(KeyV): run "Paste surface properties"
   elif c and pressed(KeyV): run "Paste"
   elif c and al and pressed(KeyA): run "Invert selection"
   elif c and sh and pressed(KeyA): a.clearSelection()
@@ -3711,11 +4170,12 @@ proc handleKeys*(a: App, menuAction: proc(label: string): bool) =
     if faceMode: a.flipTextures(false) else: a.flipSelection(a.flipAxis(vertical = true))
   elif c and pressed(KeyF):
     if faceMode: a.flipTextures(true) else: a.flipSelection(a.flipAxis(vertical = false))
-  elif c and sh and pressed(KeyU): a.frameAll()
-  elif c and pressed(KeyU): a.frameSelection()
+  elif sh and not c and pressed(KeyPeriod): a.resetCameras()
+  elif not c and not al and pressed(KeyPeriod): a.frameSelection()
   elif c and sh and pressed(KeyI): run "Show all"
   elif c and al and pressed(KeyI): run "Hide selection"
   elif c and pressed(KeyI): run "Isolate selection"
+  elif al and pressed(KeyI): run "Save screenshot..."
   elif c and al and pressed(KeyM): run "Move objects..."
   elif c and pressed(Key1): a.showPanel(pkMap)
   elif c and pressed(Key2): a.showPanel(pkProperties)
@@ -3785,7 +4245,7 @@ proc handleKeys*(a: App, menuAction: proc(label: string): bool) =
         a.rotCenter += dir * a.grid
         a.rotCenterText = fmtVec(a.rotCenter)
       elif c:
-        a.duplicateSelection(dir * a.grid)
+        a.duplicateSelection(dir * a.grid, linked = a.selectionIsLinked)
       else:
         a.moveSelection(dir * a.grid)
       return

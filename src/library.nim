@@ -374,20 +374,20 @@ proc levelSteps(c: Config, lib: Collector, n: int, lw: string): seq[Step] =
   let dat = c.gameData / "level" & $n & "_Final.dat"
   @[
     command("Reading level " & $n, proc(): seq[string] =
-      @[c.mono, c.oniSplit, "-export", lw / "oni", dat]),
+      c.oniSplitCmd & @["-export", lw / "oni", dat]),
     command("Extracting level " & $n, proc(): seq[string] =
-      result = @[c.mono, c.oniSplit, "-extract:xml", lw / "xml"]
+      result = c.oniSplitCmd & @["-extract:xml", lw / "xml"]
       for f in walkFiles(lw / "oni" / "AKEV*.oni"): result.add f
       for (_, fileName) in LibraryTypes:
         let f = lw / "oni" / "BINACJBO" & fileName & ".oni"
         if fileExists(f): result.add f),
     command("Extracting textures of level " & $n, proc(): seq[string] =
-      result = @[c.mono, c.oniSplit, "-extract:dae", lw / "env"]
+      result = c.oniSplitCmd & @["-extract:dae", lw / "env"]
       for f in walkFiles(lw / "oni" / "AKEV*.oni"): result.add f),
     action("Collecting level " & $n, proc() = lib.collectLevel(lw)),
     command("Extracting door textures of level " & $n, proc(): seq[string] =
       if lib.doorTextures.len == 0: return @["true"]
-      result = @[c.mono, c.oniSplit, "-extract:tga", lw / "doors"]
+      result = c.oniSplitCmd & @["-extract:tga", lw / "doors"]
       for (f, _) in lib.doorTextures: result.add f),
     action("Collecting door textures of level " & $n, proc() =
       # OniSplit names the images after the instance: TXMP<name>.tga.
@@ -492,14 +492,14 @@ proc libraryJob*(c: Config, logPath: string, onDone: proc()): Job =
       for d in [dir, libraryImages(), libraryOni(), work]: createDir(d)),
     # First: the levels' door objects need their classes.
     command("Reading level 0", proc(): seq[string] =
-      @[c.mono, c.oniSplit, "-export", l0 / "oni", c.gameData / "level0_Final.dat"]),
+      c.oniSplitCmd & @["-export", l0 / "oni", c.gameData / "level0_Final.dat"]),
     action("Collecting door classes", proc() = lib.collectDoorClasses())]
   for n in c.gameLevels: steps.add levelSteps(c, lib, n, work / $n)
   # Textures prefabs use that no level had as an image: level 0's.
   steps.add @[
     command("Extracting shared textures", proc(): seq[string] =
       # Instance names can differ in case from the quads' (TXMPeye for EYE).
-      result = @[c.mono, c.oniSplit, "-extract:tga", l0 / "tga"]
+      result = c.oniSplitCmd & @["-extract:tga", l0 / "tga"]
       for _, names in lib.doorWanted:   # No level had them.
         for t in names: lib.textures.incl t
       var byLower: Table[string, string]
@@ -532,7 +532,7 @@ proc libraryJob*(c: Config, logPath: string, onDone: proc()): Job =
         if p.thumbKey.len > 0: lib.previews.add p),
     command("Extracting particle classes", proc(): seq[string] =
       # OniSplit expands the pattern (921 paths are too long for one command).
-      @[c.mono, c.oniSplit, "-extract:xml", l0 / "particles", l0 / "oni" / "BINA3RAP*.oni"]),
+      c.oniSplitCmd & @["-extract:xml", l0 / "particles", l0 / "oni" / "BINA3RAP*.oni"]),
     action("Finding what particles show", proc() =
       for p in lib.previews:
         if p.tag != "PART": continue
@@ -543,7 +543,7 @@ proc libraryJob*(c: Config, logPath: string, onDone: proc()): Job =
           if g notin lib.particleGeometry: lib.particleGeometry.add g),
     command("Extracting particle textures", proc(): seq[string] =
       # Level 0's, or the decal textures the library keeps.
-      result = @[c.mono, c.oniSplit, "-extract:xml", l0 / "ptex"]
+      result = c.oniSplitCmd & @["-extract:xml", l0 / "ptex"]
       for t in lib.particleTextures:
         for f in [l0 / "oni" / "TXMP" & t & ".oni", libraryOni() / "TXMP" & t & ".oni"]:
           if fileExists(f):
@@ -551,7 +551,7 @@ proc libraryJob*(c: Config, logPath: string, onDone: proc()): Job =
             break
       if result.len == 4: result = @["true"]),
     command("Extracting character, weapon, power-up and particle models", proc(): seq[string] =
-      result = @[c.mono, c.oniSplit, "-extract:dae", l0 / "models"]
+      result = c.oniSplitCmd & @["-extract:dae", l0 / "models"]
       for p in lib.previews:
         let cls = p.presetClass
         let f = case p.tag
@@ -570,14 +570,14 @@ proc libraryJob*(c: Config, logPath: string, onDone: proc()): Job =
         makeOpaque(data)
         writeFile(f, data)),
     command("Extracting turret and door models", proc(): seq[string] =
-      result = @[c.mono, c.oniSplit, "-extract:xml", l0 / "classes"]
+      result = c.oniSplitCmd & @["-extract:xml", l0 / "classes"]
       for p in lib.previews:
         let f = l0 / "oni" / p.tag & p.presetClass & ".oni"
         if p.tag in ["TURR", "DOOR"] and fileExists(f): result.add f),
     command("Extracting console screens", proc(): seq[string] =
-      @[c.mono, c.oniSplit, "-extract:xml", l0 / "consoles", l0 / "oni" / "CONS*.oni"]),
+      c.oniSplitCmd & @["-extract:xml", l0 / "consoles", l0 / "oni" / "CONS*.oni"]),
     command("Extracting console screen textures", proc(): seq[string] =
-      @[c.mono, c.oniSplit, "-extract:tga", l0 / "screens", l0 / "oni" / "TXMP_CON_*.oni"]),
+      c.oniSplitCmd & @["-extract:tga", l0 / "screens", l0 / "oni" / "TXMP_CON_*.oni"]),
     action("Saving console screens", proc() =
       # Each class's ScreenGeometry, for the map views and the previews.
       createDir(l0 / "classes" / "screens")

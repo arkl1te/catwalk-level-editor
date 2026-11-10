@@ -1,2 +1,6 @@
 vendor/
 /catwalk
+ideas.txt
+/catwalk.exe
+*.pdb
+*.ilk

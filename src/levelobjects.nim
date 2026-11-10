@@ -26,8 +26,10 @@ type
     path*: string           ## e.g. "OSD/Scripts/Spawn"
     value*: string
     attr*: string           ## Non-empty for an attribute value.
+    label*: string          ## What to call it, when its path doesn't say.
 
 const
+  ParticleTag* = "Particle"  ## An open particle class (classes.nim).
   BOM = "\xEF\xBB\xBF"
 
   RespawnField* = "RespawnTime"
@@ -164,9 +166,12 @@ proc loadObjects*(dir: string): (seq[ObjectFile], seq[LevelObject]) =
 proc fields*(o: LevelObject): seq[ObjectField] =
   ## Every editable leaf under the object's OSD, depth-first. For a character
   ## class (tag ONCC, classes.nim) every leaf of the class but its links to
-  ## the parts packed with it ("#3").
-  let isClass = o.tag == "ONCC"
-  proc walk(n: XmlNode, prefix: string, acc: var seq[ObjectField]) =
+  ## the parts packed with it ("#3"). For a particle class (ParticleTag) every
+  ## value: an action or a rate with no value isn't a field, and a variable is
+  ## called by its name, which stays (the class's values refer to it).
+  let isParticle = o.tag == ParticleTag
+  let isClass = o.tag == "ONCC" or isParticle
+  proc walk(n: XmlNode, prefix: string, acc: var seq[ObjectField], named = "") =
     var total, seen: CountTable[string]
     for c in n:
       if c.kind == xnElement: total.inc c.tag
@@ -177,12 +182,19 @@ proc fields*(o: LevelObject): seq[ObjectField] =
         name.add "[" & $seen[c.tag] & "]"
         seen.inc c.tag
       let path = if prefix.len > 0: prefix & "/" & name else: name
+      let own = if isParticle: c.attr("Name") else: ""
       if c.attrsLen > 0:
-        for k, v in c.attrs.pairs: acc.add ObjectField(path: path, value: v, attr: k)
+        for k, v in c.attrs.pairs:
+          if isParticle and k == "Name": continue
+          acc.add ObjectField(path: path, value: v, attr: k, label: if named.len > 0: named & " " & k else: "")
       var hasChild = false
       for g in c:
         if g.kind == xnElement: hasChild = true
-      if hasChild: walk(c, path, acc)
+      if hasChild: walk(c, path, acc, own)
+      elif isParticle:
+        let v = c.innerText
+        if v.strip.len > 0 or c.attrsLen == 0 and (path.split('/')[0] in ["Options", "Appearance", "Attractor", "Events"] or c.tag == "LinkTo"):
+          acc.add ObjectField(path: path, value: v, label: own)
       elif c.attrsLen == 0:
         let v = c.innerText
         if not (isClass and v.startsWith("#")): acc.add ObjectField(path: path, value: v)
@@ -221,6 +233,17 @@ proc setField*(o: LevelObject, f: ObjectField, value: string) =
     n.setText(value)
   o.file.dirty = true
 
+proc setFlagElements*(o: LevelObject, group: string, known, names: openArray[string]) =
+  ## Of the elements in known under group (a particle class's flags), only names are on.
+  let n = o.node.xpath(group)
+  if n == nil: return
+  for t in known: n.removeChild(t)
+  for t in names:
+    let e = newElement(t)
+    e.add newText("true")
+    n.add e
+  o.file.dirty = true
+
 proc snapshot*(o: LevelObject): string = $o.node
 
 proc stripEditorFields*(f: ObjectFile): bool =
@@ -245,6 +268,49 @@ proc consoleMessage*(o: LevelObject): string =
 proc consoleMessageName*(o: LevelObject): string =
   ## The BSL function and TxtC page (without the tag) of a console's message.
   "cw_message_" & $o.id
+
+const
+  AmbientLightTags* = ["LITE", "SPOT"]
+    ## Lights whose OSD/Animation/Sound can be an ambient (SoundKind Ambient) instead of
+    ## an impact: a loop at the light, which Build places as a Sound sphere. A flickering
+    ## light's plays only while the flicker fails (Arklite gates the sphere by its id in
+    ## vertexlight.bin). A directional light has no place, so its sound is always an impact.
+  LightSoundKinds* = ["Impact", "Ambient"]
+
+proc lightSoundAmbient*(tag: string, node: XmlNode): bool =
+  ## Whether a light (its object element) plays its Sound as a looping ambient.
+  tag in AmbientLightTags and
+    node.xpath("OSD/Animation/SoundKind").str.strip.toLowerAscii == "ambient"
+
+proc lightSoundAmbient*(o: LevelObject): bool = lightSoundAmbient(o.tag, o.node)
+
+proc lightAmbientSound*(light: XmlNode, id: int): XmlNode =
+  ## The Sound object (SNDG sphere) that plays a point or spot light's ambient, or nil
+  ## when it has none (an impact, no sound, or the light is off). SoundMinRadius and
+  ## SoundMaxRadius are world units, like the light's Radius; Oni's sphere counts thirds
+  ## of a unit (heard to 3x MaxRadius), so they're divided by 3. SoundVolume goes in the
+  ## Sound object's Pitch, which Oni reads as its volume.
+  if not lightSoundAmbient(light.tag, light): return
+  let an = light.xpath("OSD/Animation")
+  let sound = an.xpath("Sound").str.strip
+  if sound.len == 0 or light.xpath("OSD/Enabled").str.strip.toLowerAscii in ["0", "false", "no", "off"]:
+    return
+  proc num(tag: string, default: float): float =
+    try: parseFloat(an.xpath(tag).str.strip) except ValueError: default
+  let maxR = max(0.0, num("SoundMaxRadius", 120))
+  let minR = clamp(num("SoundMinRadius", 30), 0, maxR)
+  let volume = clamp(num("SoundVolume", 1), 0, 1)
+  proc fmt(f: float): string =
+    result = formatFloat(f, ffDecimal, 4)
+    result.trimZeros()
+  proc el(tag: string, kids: varargs[XmlNode]): XmlNode = newXmlTree(tag, kids)
+  proc txt(tag, value: string): XmlNode = newXmlTree(tag, [newText(value)])
+  result = el("SNDG",
+    el("Header", el("Flags"), txt("Position", light.xpath("Header/Position").str.strip), txt("Rotation", "0 0 0")),
+    el("OSD", txt("Class", sound),
+       el("Sphere", txt("MinRadius", fmt(minR / 3)), txt("MaxRadius", fmt(maxR / 3))),
+       txt("Volume", "1"), txt("Pitch", fmt(volume))))
+  result.setAttr("Id", $id)
 
 proc respawnEntry*(o: LevelObject): string =
   ## level.ini [respawn] value for an item with its own respawn time: "WEAP x y z seconds",

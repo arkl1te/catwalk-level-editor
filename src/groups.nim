@@ -181,10 +181,12 @@ proc selectedUnits*(a: App): (seq[int32], bool) =
 
 proc expandGroupSelection*(a: App) =
   ## Once a frame: a selected member of a closed group selects the whole group
-  ## (TrenchBroom selects group nodes; select all, the layer tree and the
-  ## rest select members).
+  ## (TrenchBroom selects group nodes; select all and the rest select members.
+  ## The Map tab opens the group first to select one member: openTo).
   if a.groups.len == 0: return
   for u in a.selectedUnits[0]: a.selectGroup(u)
+
+proc closedGroupSelected*(a: App): bool = a.selectedUnits[0].len > 0
 
 proc onlyGroupsSelected*(a: App): bool =
   let (units, loose) = a.selectedUnits
@@ -217,7 +219,7 @@ proc memberCounts(a: App): Table[int32, (int, int)] =
 proc transformSelectedGroups*(a: App, x: Affine) =
   ## A selected closed group (and every group inside it) moved, turned or
   ## flipped whole: its xform follows, so linked copies keep their own place.
-  if a.groups.len == 0: return
+  if a.groups.len == 0 or abs(x.det) < 1e-6: return   # a drag that set no xform
   let counts = a.memberCounts
   for g in a.groups.mitems:
     if g.id in a.openGroups: continue
@@ -606,6 +608,14 @@ proc renameSelectedGroups*(a: App, name: string) =
   for u in units: a.groups[a.groupAt(u)].name = name
   a.push Cmd(label: (if units.len == 1: "Rename Group" else: "Rename Groups"), kind: ckEdit)
 
+proc renameGroup*(a: App, gid: int32, name: string) =
+  a.groups[a.groupAt(gid)].name = name
+  a.push Cmd(label: "Rename Group", kind: ckEdit)
+
+proc setGroupSpin*(a: App, gid: int32, seconds: float32) =
+  a.groups[a.groupAt(gid)].spin = seconds
+  a.push Cmd(label: "Group Spin", kind: ckEdit)
+
 proc canLinkedDuplicate*(a: App): bool =
   let (units, loose) = a.selectedUnits
   units.len == 1 and not loose and a.selFaces.len == 0
@@ -689,11 +699,55 @@ proc linkedCount*(a: App, gid: int32): int =
   for g in a.groups:
     if g.link == a.groups[i].link: inc result
 
+proc unlinkFaceGroups*(a: App, g: Geometry, faces: seq[int]): int =
+  ## Before an edit that should stay in its own copy (a face cut): every
+  ## linked group the faces' pieces sit in, up to the outermost, leaves its link
+  ## set, so the sync has nothing to copy. Groups inside it that the faces
+  ## aren't in stay linked. The number of groups separated.
+  if g == nil: return
+  var chain: HashSet[int32]
+  for fi in faces:
+    if fi < 0 or fi >= g.faces.len: continue
+    let pc = g.faces[fi].piece
+    if pc < 0 or pc >= g.pieces.len: continue
+    var id = g.pieces[pc].group
+    var guard = 0
+    while id != 0 and guard < 1000:
+      let i = a.groupAt(id)
+      if i < 0: break
+      chain.incl id
+      id = a.groups[i].parent
+      inc guard
+  for id in chain:
+    if a.linkedCount(id) > 1:
+      a.groups[a.groupAt(id)].link = a.newLink
+      inc result
+
 proc selectionIsLinked*(a: App): bool =
   ## Just one linked group selected: Ctrl+drag copies it as another linked duplicate.
   if not a.canLinkedDuplicate: return false
   let (units, _) = a.selectedUnits
   a.linkedCount(units[0]) > 1
+
+proc affectedLinks*(a: App): HashSet[string] =
+  ## Link sets an edit of the selection reaches: those of the selected groups
+  ## and of the groups inside them, when they have other members.
+  for u in a.selectedUnits[0]:
+    for id in a.subtree(u):
+      if a.linkedCount(id) > 1: result.incl a.groups[a.groupAt(id)].link
+
+proc linkedOutlines*(a: App): seq[int32] =
+  ## Groups the selection's links reach, minus the selected groups and the
+  ## groups inside them (the views dash their boxes).
+  let links = a.affectedLinks
+  if links.len == 0: return
+  let sel = toHashSet(a.selectedUnits[0])
+  for g in a.groups:
+    if g.link notin links: continue
+    var inSel = false
+    for u in sel:
+      if a.inside(g.id, u): inSel = true
+    if not inSel: result.add g.id
 
 proc openGroup*(a: App, gid: int32) =
   ## Double-click: edit inside the group; the rest is locked until it closes.
@@ -709,6 +763,22 @@ proc closeGroup*(a: App) =
   a.clearSelection()
   a.refreshOpenSet()
   a.say "Closed group " & a.groupName(gid)
+
+proc openTo*(a: App, gid: int32): bool =
+  ## Makes exactly gid and the groups around it open (0 = none), so what is
+  ## directly in gid can be selected by itself. True if that changed anything
+  ## (the selection is cleared then, as opening and closing do).
+  var path: seq[int32]
+  var g = gid
+  while g != 0 and a.groupAt(g) >= 0 and path.len < 1000:
+    path.insert(g, 0)
+    g = a.groups[a.groupAt(g)].parent
+  if path == a.openGroups: return false
+  a.clearSelection()
+  a.openGroups = path
+  a.refreshOpenSet()
+  a.say(if gid != 0: "Opened group " & a.groupName(gid) else: "Closed all groups")
+  true
 
 proc canRemoveFromGroup*(a: App): bool =
   a.openGroups.len > 0 and (a.selection.len > 0 or a.selPieces.len > 0)
@@ -743,13 +813,14 @@ proc removeSelectionFromGroup*(a: App) =
   a.selPieces = pieces
   a.say "Removed the selection from group " & name
 
-proc addSelectionToGroup*(a: App, gid: int32) =
-  ## TrenchBroom's Add Objects to Group (the group under the right click).
+proc addSelectionToGroup*(a: App, gid: int32, join = false) =
+  ## TrenchBroom's Add Objects to Group (the group under the right click);
+  ## join: the selection held nothing grouped (the menu's Join to group).
   if a.groupAt(gid) < 0: return
-  a.moveSelectionToGroup(gid, "Add Objects to Group")
+  a.moveSelectionToGroup(gid, if join: "Join Group" else: "Add Objects to Group")
   a.clearSelection()
   a.selectGroup(gid)
-  a.say "Added the selection to group " & a.groupName(gid)
+  a.say (if join: "Joined the selection to group " else: "Added the selection to group ") & a.groupName(gid)
 
 proc mergeSelectedGroups*(a: App, into: int32) =
   ## TrenchBroom's Merge Groups: the other selected groups' contents go into one.
@@ -773,6 +844,108 @@ proc mergeSelectedGroups*(a: App, into: int32) =
   a.push a.groupCmd("Merge Groups", geoBefore)
   a.selectGroup(into)
 
+proc groupPoints(a: App, gid: int32, ix: GroupIndex): seq[Vec3] =
+  ## Where a group's contents are, in the order replaceContents copies them:
+  ## object positions, then the corners of its level geometry.
+  let set = a.subtree(gid)
+  for o in a.objects:
+    if ix.objGroup.getOrDefault(o, 0) in set and ix.objGroup.getOrDefault(o, 0) != 0: result.add o.pos
+  for pc in 0 ..< ix.world.len:
+    let pg = a.geo.pieces[pc].group
+    if not ix.world[pc] or pg == 0 or pg notin set: continue
+    for fi in ix.byPiece[pc]:
+      if a.geo.faces[fi].objectId == -1:
+        for v in a.geo.faces[fi].verts: result.add a.geo.points[v]
+
+proc fitAffine(src, dst: seq[Vec3]): (bool, Affine) =
+  ## A move / turn / flip / even scale taking the corners src onto dst, as
+  ## sets (edits reorder faces): both sets' centers, then three corners of src
+  ## matched to corners of dst at the same distances.
+  proc key(p: Vec3): (int, int, int) = (int(round(p.x * 20)), int(round(p.y * 20)), int(round(p.z * 20)))
+  proc unique(q: seq[Vec3]): seq[Vec3] =
+    var seen: HashSet[(int, int, int)]
+    for p in q:
+      if not seen.containsOrIncl(p.key): result.add p
+  let s = unique(src)
+  let d = unique(dst)
+  if s.len != d.len or s.len == 0: return
+  var cs, cd = vec3(0, 0, 0)
+  for p in s: cs += p
+  for p in d: cd += p
+  cs /= s.len.float32
+  cd /= d.len.float32
+  var rs, rd = 0'f32
+  for p in s: rs += (p - cs).lengthSq
+  for p in d: rd += (p - cd).lengthSq
+  if rs < 1e-6: return
+  let scale = sqrt(rd / rs)
+  var dset: HashSet[(int, int, int)]
+  for p in d: dset.incl p.key
+  # Three corners of src spanning the most room around its center.
+  var k1, k2, k3 = 0
+  for i, p in s:
+    if (p - cs).length > (s[k1] - cs).length: k1 = i
+  let e1 = s[k1] - cs
+  for i, p in s:
+    if e1.cross(p - cs).length > e1.cross(s[k2] - cs).length: k2 = i
+  let n = e1.cross(s[k2] - cs)
+  if e1.length < 1e-3 or n.length < 1e-3: return
+  for i, p in s:
+    if abs(n.dot(p - cs)) > abs(n.dot(s[k3] - cs)): k3 = i
+  let flat = abs(n.normalize.dot(s[k3] - cs)) < 0.05
+  let tol = 0.05'f32 * max(scale, 1)
+  proc near(i: int): seq[Vec3] =
+    let r = (s[i] - cs).length * scale
+    for q in d:
+      if abs((q - cd).length - r) < tol: result.add q
+  let (c1, c2) = (near(k1), near(k2))
+  let c3 = if flat: @[vec3(0, 0, 0)] else: near(k3)
+  let sm = Affine(m: [e1, s[k2] - cs, (if flat: n.normalize * e1.length else: s[k3] - cs)], t: cs)
+  if abs(sm.det) < 1e-6: return
+  let si = sm.inverse
+  let d12 = (s[k1] - s[k2]).length * scale
+  var tries = 0
+  for b1 in c1:
+    for b2 in c2:
+      if abs((b1 - b2).length - d12) > tol * 2: continue
+      for b3 in c3:
+        inc tries
+        if tries > 200_000: return
+        let f1 = b1 - cd
+        let f2 = b2 - cd
+        let f3 = if flat: f1.cross(f2).normalize * f1.length else: b3 - cd
+        for mirror in (if flat: @[1'f32, -1] else: @[1'f32]):
+          let x = Affine(m: [f1, f2, f3 * mirror], t: cd) * si
+          var ok = true
+          for p in s:
+            if x.apply(p).key notin dset:
+              ok = false
+              break
+          if ok: return (true, x)
+
+proc repairXforms(a: App) =
+  ## A linked group whose xform got lost (all zeros: an old drag that set
+  ## none) gets it back by fitting its contents onto a linked copy's; left as
+  ## it was, every sync would squash its copy into a point.
+  var bad: seq[int]
+  for i, g in a.groups:
+    if abs(g.xform.det) < 1e-6: bad.add i
+  if bad.len == 0: return
+  let ix = a.groupIndex
+  var fixed = 0
+  for i in bad:
+    for g in a.groups:
+      if g.id == a.groups[i].id or g.link != a.groups[i].link or abs(g.xform.det) < 1e-6: continue
+      let (ok, x) = fitAffine(a.groupPoints(g.id, ix), a.groupPoints(a.groups[i].id, ix))
+      if ok:
+        a.groups[i].xform = x * g.xform
+        inc fixed
+        break
+    if abs(a.groups[i].xform.det) < 1e-6 and a.linkedCount(a.groups[i].id) == 1:
+      a.groups[i].xform = identityAffine()   # unlinked: nothing to place it by
+      inc fixed
+  if fixed < bad.len: a.say(&"Groups: {bad.len - fixed} linked group(s) have a broken placement", true)
+
 # --- saving -------------------------------------------------------------------------------------
 
 proc loadGroups(a: App) =
@@ -787,6 +960,7 @@ proc loadGroups(a: App) =
       for gj in j{"groups"}.getElems:
         a.groups.add Group(id: gj{"id"}.getInt.int32, name: gj{"name"}.getStr,
                            parent: gj{"parent"}.getInt.int32, link: gj{"link"}.getStr,
+                           spin: gj{"spin"}.getFloat.float32,
                            xform: if gj.hasKey("xform"): affineFrom(gj["xform"]) else: identityAffine())
       var byKey: Table[string, LevelObject]
       for o in a.objects: byKey[o.tag & ":" & $o.id] = o
@@ -799,6 +973,7 @@ proc loadGroups(a: App) =
           if i >= 0: a.groups[i].objs.add o
     except CatchableError as e:
       a.say("Could not read groups: " & e.msg, true)
+  if a.geo != nil: a.repairXforms()
   a.groupsRecorded = a.groups
   a.refreshOpenSet()
   a.storeLinkSigs()
@@ -813,7 +988,9 @@ proc saveGroups(a: App, dir: string) =
   var live: HashSet[LevelObject]
   for o in a.objects: live.incl o
   for g in a.groups:
-    gs.add %*{"id": g.id, "name": g.name, "parent": g.parent, "link": g.link, "xform": affineJson(g.xform)}
+    var gj = %*{"id": g.id, "name": g.name, "parent": g.parent, "link": g.link, "xform": affineJson(g.xform)}
+    if g.spin != 0: gj["spin"] = %g.spin
+    gs.add gj
     for o in g.objs:
       if o in live: objs.add %*[o.tag, o.id, g.id]
   try:

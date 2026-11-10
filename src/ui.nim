@@ -258,6 +258,10 @@ proc revealLater(ui: Ui, r, clip: Rect) =
   ui.revealRect = r
   ui.revealClip = clip
 
+proc revealArea*(ui: Ui, r: Rect) =
+  ## Next frame's scrollIntoView shows r, drawn in the current clip.
+  if ui.hitClips.len > 0: ui.revealLater(r, ui.hitClips[^1])
+
 proc scrollIntoView*(ui: Ui, scroll: var float32) =
   ## Call right after pushClip of a scrolled area, before laying it out: when
   ## Tab (or a list's arrow keys) last frame went to something drawn there out
@@ -660,7 +664,7 @@ proc prevRune(s: string, i: int): int =
   result = max(0, i - 1)
   while result > 0 and (s[result].ord and 0xC0) == 0x80: dec result
 
-proc nextRune(s: string, i: int): int =
+proc nextRune*(s: string, i: int): int =
   result = min(s.len, i + 1)
   while result < s.len and (s[result].ord and 0xC0) == 0x80: inc result
 
@@ -676,6 +680,16 @@ proc countClick*(ui: Ui, id: string): int =
   ui.clickTime = now
   ui.clickPos = ui.mouse
   ui.clickCount
+
+proc textOffset*(ui: Ui, s: string, x: float32, font = FontMain): int =
+  ## The byte of s nearest to x pixels from its start.
+  var at = 0
+  while at < s.len:
+    let next = nextRune(s, at)
+    let (l, r) = (ui.textSize(s[0 ..< at], font).x, ui.textSize(s[0 ..< next], font).x)
+    if x < (l + r) / 2: return at
+    at = next
+  s.len
 
 proc charClass*(c: char): int =
   ## What separates words: 0 whitespace, 1 letters, digits, underscores and
@@ -1175,9 +1189,26 @@ proc evalMath*(s: string): float =
   if result.classify in {fcNan, fcInf, fcNegInf}:
     raise newException(ValueError, "not a number")
 
+proc fmtExact(v: float): string =
+  ## The fewest digits that read back as v, without an exponent.
+  result = $v
+  let e = result.find('e')
+  if e < 0:
+    if result.endsWith(".0"): result.setLen result.len - 2
+    return
+  let neg = result.startsWith("-")
+  let digits = result[(if neg: 1 else: 0) ..< e].replace(".", "")
+  let exp = parseInt(result[e + 1 .. ^1])
+  result = if exp < 0: "0." & repeat('0', -exp - 1) & digits
+           else: digits & repeat('0', max(0, exp + 1 - digits.len))
+  result.trimZeros()
+  if neg: result = "-" & result
+
 proc fmtNumber*(v: float, decimals: int): string =
-  ## decimals < 0: as many as the value needs (a float field shows what's stored).
+  ## decimals -1: up to 9 places (a float field shows what's stored).
+  ## decimals -2: every digit the value has, however many.
   if decimals == 0: return $int(round(v))
+  if decimals == -2: return fmtExact(v)
   if decimals > 0: return formatFloat(v, ffDecimal, decimals)
   result = formatFloat(v, ffDecimal, 9)
   result.trimZeros()
@@ -1185,16 +1216,24 @@ proc fmtNumber*(v: float, decimals: int): string =
 
 proc numberField*(ui: Ui, id: string, r: Rect, value: var float,
                   step, lo, hi: float, decimals = 0, axis = -1, live = false,
-                  mixed = false): bool =
+                  mixed = false, free: ptr string = nil): bool =
   ## Type a number (or basic math, worked out on Enter or unfocus), scroll
   ## over it or press Up/Down while typing (Shift: a quarter step). axis
   ## 0..2 colors the left edge with that axis's color. live also takes the
   ## value on every keystroke that leaves a valid number. mixed (several
   ## objects that differ) shows the field blank and only takes a typed value.
-  ## decimals < 0 shows as many as the value has. Returns true when value changed.
+  ## decimals < 0 shows as many as the value has (see fmtNumber). free: the
+  ## field also takes text that isn't a number (a particle variable's name):
+  ## free holds the value as text, and is updated with it. Returns true when
+  ## value (or free) changed.
   let fid = id & "#field"
+  let before = value
+  var loose = false
+  if free != nil:
+    try: discard parseFloat(free[].strip)
+    except ValueError: loose = true
   proc fmt(v: float): string =
-    if mixed: "" else: fmtNumber(v, decimals)
+    if mixed: "" elif loose: free[] else: fmtNumber(v, decimals)
   if ui.focusId == fid and ui.focusFresh: ui.editText = fmt(value)
   var buf = if ui.focusId == fid: ui.editText else: fmt(value)
   let ev = ui.textField(fid, r, buf, if mixed: "mixed" else: "")
@@ -1212,11 +1251,11 @@ proc numberField*(ui: Ui, id: string, r: Rect, value: var float,
     elif decimals == 0: max(1.0, round(step / 4))
     else: step / 4
   var delta = 0.0
-  if ui.hover(r) and ui.scroll() != 0 and not mixed:
+  if ui.hover(r) and ui.scroll() != 0 and not mixed and not loose:
     delta = if ui.scroll() < 0: step else: -step
     ui.scrollConsumed = true
   let focused = ui.focusId == fid
-  if focused and not mixed:
+  if focused and not mixed and not loose:
     if ui.window.buttonPressed[KeyUp]: delta = step
     if ui.window.buttonPressed[KeyDown]: delta = -step
     if delta != 0:
@@ -1237,13 +1276,19 @@ proc numberField*(ui: Ui, id: string, r: Rect, value: var float,
   if eeCommitted in ev and not (mixed and buf.strip.len == 0):
     try:
       let v = clamp(evalMath(buf), lo, hi)
-      if v != value or mixed:
+      if v != value or mixed or loose:
         value = v
         result = true
-    except ValueError: discard
+        if free != nil: free[] = fmtNumber(v, decimals)
+    except ValueError:
+      if free != nil and buf.strip.len > 0 and buf.strip != free[]:
+        free[] = buf.strip
+        result = true
   if delta != 0:
     # Snap to the step grid so typed odd values rejoin it.
-    let v = clamp(round((value + delta) / step) * step, lo, hi)
+    var v = clamp(round((value + delta) / step) * step, lo, hi)
+    # A step of 0.1 doesn't land on exact tenths: don't show the float's noise.
+    if decimals == -2: v = parseFloat(formatFloat(v, ffDecimal, 9))
     if v != value:
       value = v
       result = true
@@ -1251,6 +1296,7 @@ proc numberField*(ui: Ui, id: string, r: Rect, value: var float,
       ui.editText = fmt(value)
       ui.selAnchor = 0
       ui.caret = ui.editText.len
+  if free != nil and value != before: free[] = fmtNumber(value, decimals)
 
 proc fmtTime*(t: float, millis = false, dur = -1.0): string =
   ## HH:MM:SS, or HH:MM:SS.mmm with millis. MM:SS instead when the media's

@@ -1,0 +1,2 @@
+// Resources for the Windows executable (compiled by tools/windows.sh).
+1 ICON "catwalk.ico"

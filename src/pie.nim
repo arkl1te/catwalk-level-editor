@@ -43,7 +43,7 @@ let
   # Blender's default wcol_pie_menu, with Catwalk's accent for inner_sel.
   pieInner = pm(24, 24, 24)
   pieItem = pm(84, 84, 84)
-  pieInnerSel = pm(111, 96, 216)
+  pieInnerSel = pm(96, 137, 216)
   pieOutline = pm(36, 36, 36)
   pieText = pm(217, 217, 217)
   pieTextSel = pm(255, 255, 255)

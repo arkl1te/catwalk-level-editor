@@ -1,8 +1,8 @@
 ## Skybox images for the 3D view: level 0's skies (every ONSK a project can
 ## pick), extracted once into ~/.cache/catwalk/sky/<sky>/<face>.tga.
 ##
-## An ONSK links six TXMPs: top, left, right, front, back and an unused
-## bottom. Oni_Sky.c (the star placement in FUN_005105a0) gives their
+## An ONSK links six TXMPs: top, left, right, front, back and a bottom, which
+## level 0's skies leave empty and only Arklite draws. Oni_Sky.c (the star placement in FUN_005105a0) gives their
 ## placement on a cube around the camera, in Oni's Y-up world:
 ##   top    y = +1   u = (x + 1) / 2   v = (1 - z) / 2
 ##   right  x = +1   u = (z + 1) / 2   v = (1 - y) / 2
@@ -14,18 +14,16 @@
 import std/[os, strutils, tables]
 import jobs, project
 
-const
-  SkyFaces* = ["top", "left", "right", "front", "back"]   ## ONSK SkyboxTextures order.
-  SkyVersion = "1"
-
-proc skyDir*(): string =
-  let xdg = getEnv("XDG_CACHE_HOME")
-  (if xdg.len > 0: xdg else: getHomeDir() / ".cache") / "catwalk" / "sky"
+const SkyVersion = "1"
 
 proc hasSkyCache*(): bool =
-  fileExists(skyDir() / "version") and readFile(skyDir() / "version").strip == SkyVersion
+  # Not a new version for onsk.xml: an older Catwalk left open would extract again on seeing it.
+  fileExists(skyDir() / "version") and readFile(skyDir() / "version").strip == SkyVersion and
+    fileExists(skyDir() / "night" / "onsk.xml")
 
-proc skyFace*(sky, face: string): string = skyDir() / sky / face & ".tga"
+proc skyImage*(p: Project, sky, face: string): string =
+  ## A face of a sky the project can use: its own, or level 0's.
+  if p.isCustomSky(sky): p.customSkyDir(sky) / face & ".tga" else: skyFace(sky, face)
 
 proc skyCacheJob*(c: Config, logPath: string): Job =
   let
@@ -39,11 +37,11 @@ proc skyCacheJob*(c: Config, logPath: string): Job =
       if dirExists(work): removeDir(work)
       for d in [oni, xml, tga]: createDir(d)),
     command("Reading level 0", proc(): seq[string] =
-      @[c.mono, c.oniSplit, "-export", oni, c.gameData / "level0_Final.dat"]),
+      c.oniSplitCmd & @["-export", oni, c.gameData / "level0_Final.dat"]),
     command("Reading skies", proc(): seq[string] =
-      @[c.mono, c.oniSplit, "-extract:xml", xml, oni / "ONSK*.oni"]),
+      c.oniSplitCmd & @["-extract:xml", xml, oni / "ONSK*.oni"]),
     command("Extracting sky images", proc(): seq[string] =
-      result = @[c.mono, c.oniSplit, "-extract:tga", tga]
+      result = c.oniSplitCmd & @["-extract:tga", tga]
       for f in walkFiles(xml / "ONSK*.xml"):
         let sky = f.splitFile.name["ONSK".len .. ^1]
         let x = readFile(f)
@@ -69,6 +67,9 @@ proc skyCacheJob*(c: Config, logPath: string): Job =
         if fileExists(f):
           createDir(skyDir() / sky)
           moveFile(f, skyFace(sky, face))
+      for f in walkFiles(xml / "ONSK*.xml"):   # A graded copy of the sky starts from this.
+        let sky = f.splitFile.name["ONSK".len .. ^1]
+        if dirExists(skyDir() / sky): copyFile(f, skyDir() / sky / "onsk.xml")
       writeFile(skyDir() / "version", SkyVersion)
       removeDir(work))]
   newJob("Extracting skies", logPath, steps)

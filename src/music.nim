@@ -131,15 +131,16 @@ proc soundCacheJob*(c: Config, logPath: string): Job =
     more = work / "levels"
   var manifest = %*{"v": ManifestVersion, "ambients": {}, "impulses": {}, "groups": {}}
   var otherLevels: seq[string]
-  let steps = @[
+  var steps = @[
     action("Preparing", proc() =
       if dirExists(work): removeDir(work)
-      for d in [oni, xml, wav, more]: createDir(d)),
-    command("Reading level 0", proc(): seq[string] =
-      c.oniSplitCmd & @["-export", oni, c.gameData / "level0_Final.dat"]),
+      for d in [oni, xml, wav, more]: createDir(d))]
+  steps.add c.exportTypes("Reading level 0", c.gameData / "level0_Final.dat", oni, ["SNDD", "OSBD"],
+                          apart = ["OSBD"])
+  steps.add @[
     # OniSplit expands the wildcards: a thousand paths are too long for sh.
     command("Reading ambient sounds", proc(): seq[string] =
-      c.oniSplitCmd & @["-extract:xml", xml, oni / "OSBD*.oni"]),
+      c.oniSplitCmd & @["-extract:xml", xml, typeDir(oni, "OSBD") / "OSBD*.oni"]),
     # Level 0's sound groups name some sounds that only a level has (level
     # 14's gears.aif, from AE's Missing Sounds); Oni plays those there.
     action("Finding sounds in other levels", proc() =
@@ -156,13 +157,15 @@ proc soundCacheJob*(c: Config, logPath: string): Job =
           if "sndd" & snd & "\0" in names:
             otherLevels.add f
             break),
-    # OniSplit exports one .dat per run.
-    commandEach("Reading other levels", proc(): seq[seq[string]] =
-      for d in otherLevels: result.add c.oniSplitCmd & @["-export", more, d]),
+    # OniSplit exports one .dat per run: side by side, each in a folder of its own.
+    parallel("Reading other levels", proc(): seq[FileCommand] =
+      for i, d in otherLevels:
+        result.add (c.oniSplitCmd & @["-export:SNDD", more / $i, d], newSeq[string]())),
     action("Listing sounds", proc() =
-      for f in walkFiles(more / "SNDD*.oni"):
-        let dest = oni / f.extractFilename
-        if not fileExists(dest): moveFile(f, dest)
+      for i in 0 ..< otherLevels.len:
+        for f in walkFiles(more / $i / "SNDD*.oni"):
+          let dest = oni / f.extractFilename
+          if not fileExists(dest): moveFile(f, dest)
       removeDir(more)
       var have: HashSet[string]
       for f in walkFiles(oni / "SNDD*.oni"):

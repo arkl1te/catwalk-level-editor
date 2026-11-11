@@ -90,28 +90,27 @@ proc particleCacheJob*(c: Config, logPath: string): Job =
     xml = work / "xml"
     txml = work / "txml"
     dae = work / "dae"
-  let steps = @[
+  var steps = @[
     action("Preparing", proc() =
       if dirExists(work): removeDir(work)
-      for d in [oni, xml, txml, dae]: createDir(d)),
-    command("Reading level 0", proc(): seq[string] =
-      c.oniSplitCmd & @["-export", oni, c.gameData / "level0_Final.dat"]),
+      for d in [oni, xml, txml, dae]: createDir(d))]
+  steps.add c.exportTypes("Reading level 0", c.gameData / "level0_Final.dat", oni, ["TXMP", "BINA", "M3GM"],
+                          apart = ["BINA"])
+  steps.add @[
     command("Reading particle classes", proc(): seq[string] =
-      c.oniSplitCmd & @["-extract:xml", xml, oni / "BINA3RAP*.oni"]),
+      c.oniSplitCmd & @["-extract:xml", xml, typeDir(oni, "BINA") / "BINA3RAP*.oni"]),
     # Each model's .dae names its image after the model's TXMP.
-    command("Extracting particle models", proc(): seq[string] =
-      result = c.oniSplitCmd & @["-extract:dae", dae]
+    commandFiles("Extracting particle models", proc(): FileCommand =
+      result.head = c.oniSplitCmd & @["-extract:dae", dae]
       for t in texturesOf(xml, "BINA3RAP", geometry = true):
-        if fileExists(oni / "M3GM" & t & ".oni"): result.add oni / "M3GM" & t & ".oni"
-      if result.len == 4: result = @["true"]),
+        if fileExists(oni / "M3GM" & t & ".oni"): result.files.add oni / "M3GM" & t & ".oni"),
     # OniSplit finds an animated texture's frames next to its TXMP.
-    command("Extracting particle textures", proc(): seq[string] =
-      result = c.oniSplitCmd & @["-extract:xml", txml]
+    commandFiles("Extracting particle textures", proc(): FileCommand =
+      result.head = c.oniSplitCmd & @["-extract:xml", txml]
       var names = texturesOf(xml, "BINA3RAP")
       for f in walkFiles(dae / "images" / "*.tga"): names.incl f.splitFile.name
       for t in names:
-        if fileExists(oni / "TXMP" & t & ".oni"): result.add oni / "TXMP" & t & ".oni"
-      if result.len == 4: result = @["true"]),
+        if fileExists(oni / "TXMP" & t & ".oni"): result.files.add oni / "TXMP" & t & ".oni"),
     action("Writing particles", proc() =
       let classes = particleDir() / "classes"
       let textures = particleDir() / "textures"
@@ -138,11 +137,10 @@ proc levelTextureJob*(c: Config, oniDir: string, names: seq[string], logPath: st
   let dst = levelTextureDir(oniDir)
   newJob("Extracting the level's decal textures", logPath, @[
     action("Preparing", proc() = createDir(dst)),
-    command("Extracting decal textures", proc(): seq[string] =
-      result = c.oniSplitCmd & @["-extract:xml", dst]
+    commandFiles("Extracting decal textures", proc(): FileCommand =
+      result.head = c.oniSplitCmd & @["-extract:xml", dst]
       for n in names:
-        if fileExists(oniDir / "TXMP" & n & ".oni"): result.add oniDir / "TXMP" & n & ".oni"
-      if result.len == 4: result = @["true"]),
+        if fileExists(oniDir / "TXMP" & n & ".oni"): result.files.add oniDir / "TXMP" & n & ".oni"),
     action("Done", proc() = writeFile(dst / "done", names.join("\n")))])
 
 # --- classes ----------------------------------------------------------------------

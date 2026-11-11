@@ -45,7 +45,12 @@ What differs from Linux:
 - OniSplit.exe runs by itself (.NET Framework, which AE needs anyway), not with Mono;
   Play starts Oni.exe directly, and a `.bat` launch script through `cmd`.
 - Job steps run through `cmd /d /s /c` with their output appended to the build log
-  (`jobs.nim`), every argument quoted so `&`, `^` and the like in paths stay literal.
+  (`jobs.nim`), every argument quoted so `&`, `^` and the like in paths stay literal,
+  and split into several commands when the list of files would pass cmd's 8,191
+  characters. Commands that run side by side (the entity library's graph step) log to
+  files of their own, appended to the log when they end; those that give way to an
+  urgent one start below normal priority (`SetPriorityClass` on cmd, which OniSplit
+  inherits; `nice` on Linux).
 - Sound previews play through winmm's waveOut (`waveout.nim`) instead of pw-cat.
 - Menus, the Setup window and file dialogs use Majestic's Win32 backends
   (`xwin_win32.nim`, `dialogs_win32.nim`): popups drawn with the main GL context,

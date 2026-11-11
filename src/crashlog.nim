@@ -27,9 +27,10 @@ var
   contextLen: int
 
 proc logDir*(): string =
-  ## ~/.local/state/catwalk/logs, or the local cache folder on Windows.
+  ## ~/.local/state/catwalk/logs, on Windows %LOCALAPPDATA%\catwalk\logs (not
+  ## getCacheDir("catwalk"): on Windows that is already catwalk\cache).
   when defined(windows):
-    getCacheDir("catwalk") / "logs"
+    getCacheDir() / "catwalk" / "logs"
   else:
     let state = getEnv("XDG_STATE_HOME", getHomeDir() / ".local" / "state")
     state / "catwalk" / "logs"

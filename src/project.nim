@@ -28,6 +28,7 @@ export skygrade
 import fieldtypes, ambients
 export RecordingPrefix, splitRecording
 from mcp import DefaultMcpPort
+when defined(windows): import std/winlean
 
 type
   Config* = object
@@ -272,17 +273,51 @@ proc gameLevels*(c: Config): seq[int] =
 proc catwalkCache*(): string =
   ## Where extracted game data is cached: ~/.cache/catwalk, on Windows
   ## %LOCALAPPDATA%\catwalk\cache (next to the logs).
-  when defined(windows): getCacheDir("catwalk") / "cache"
+  # Not getCacheDir("catwalk"): on Windows that is already catwalk\cache.
+  when defined(windows): getCacheDir() / "catwalk" / "cache"
   else:
     let xdg = getEnv("XDG_CACHE_HOME")
     (if xdg.len > 0: xdg else: getHomeDir() / ".cache") / "catwalk"
 
 proc libraryDir*(): string =
   ## The entity library (library.nim builds it).
-  when defined(windows): getCacheDir("catwalk") / "library"  # %LOCALAPPDATA%
+  when defined(windows): getCacheDir() / "catwalk" / "library"  # %LOCALAPPDATA%
   else:
     let xdg = getEnv("XDG_DATA_HOME")
     (if xdg.len > 0: xdg else: getHomeDir() / ".local/share") / "catwalk" / "library"
+
+proc moveOldDataDir*() =
+  ## Catwalk 0.2.0 and older kept its Windows data a folder deeper, in
+  ## %LOCALAPPDATA%\catwalk\cache, with the caches in cache\cache. Moves it up
+  ## once. What can't be moved (an older Catwalk still running has it open)
+  ## stays where it is, and the caches are made again.
+  when defined(windows):
+    proc rename(src, dst: string) =
+      # Whole or not at all: moveDir would copy and delete when a file in
+      # src is open, leaving half of it in each place.
+      if dirExists(dst) or fileExists(dst): return
+      discard moveFileExW(newWideCString(src), newWideCString(dst), 0)
+    let root = getCacheDir() / "catwalk"
+    let old = root / "cache"
+    for name in ["library", "logs", "library.log", "library.lock"]:
+      if dirExists(old / name) or fileExists(old / name): rename(old / name, root / name)
+    let inner = old / "cache"
+    if not dirExists(inner): return
+    for kind, path in walkDir(inner):
+      let dst = old / path.extractFilename
+      if dirExists(dst) or fileExists(dst):   # Made again since: this one is stale.
+        try:
+          if kind in {pcDir, pcLinkToDir}: removeDir(path) else: removeFile(path)
+        except OSError: discard
+      else:
+        rename(path, dst)
+    var empty = true
+    for _ in walkDir(inner):
+      empty = false
+      break
+    if empty:
+      try: removeDir(inner)
+      except OSError: discard
 
 proc libraryDoorsDir*(): string = libraryDir() / "doors"
 
@@ -314,10 +349,9 @@ proc particleCacheDir*(): string =
 proc previewCacheDir*(): string =
   catwalkCache() / "preview"
 
-when defined(windows):
-  import std/winlean
-  proc processAlive(pid: int): bool =
-    ## Whether a process pid runs (Windows has no /proc to look in).
+proc processAlive*(pid: int): bool =
+  ## Whether a process pid runs.
+  when defined(windows):   # No /proc to look in.
     const QueryLimitedInformation = 0x1000'i32
     const StillActive = 259'i32
     let h = openProcess(QueryLimitedInformation, 0, pid.DWORD)
@@ -325,6 +359,8 @@ when defined(windows):
     var code: int32
     result = getExitCodeProcess(h, code) != 0 and code == StillActive
     discard closeHandle(h)
+  else:
+    dirExists("/proc/" & $pid)
 
 proc previewWorkDir*(): string = previewCacheDir() / "open-" & $getCurrentProcessId()
 
@@ -604,6 +640,38 @@ proc splitArgs(c: Config, args: varargs[string]): seq[string] =
   result = c.oniSplitCmd
   for a in args: result.add a
 
+proc mergeInto*(src, dst: string) =
+  ## Moves src's files into dst (keeping those dst has), then removes src.
+  if not dirExists(src): return
+  for f in walkDirRec(src, relative = true):
+    let d = dst / f
+    if not fileExists(d):
+      createDir(d.parentDir)
+      moveFile(src / f, d)
+  removeDir(src)
+
+proc typeDir*(dir, tag: string): string =
+  ## Where exportTypes leaves the instances of a type it keeps apart.
+  dir / "export-" & tag
+
+proc exportTypes*(c: Config, label, dat, dir: string, types: openArray[string],
+                  apart: openArray[string] = []): seq[Step] =
+  ## The instances of these types in dat, exported side by side: much faster
+  ## than the whole .dat. The first type (the largest) goes straight to dir;
+  ## the others to folders of their own (typeDir), as an export can bring a
+  ## few instances of another type and two OniSplits writing one file fail.
+  ## Those are moved into dir after, unless kept apart: OniSplit finds the
+  ## instances a file links to next to it, but each move takes a while.
+  let types = @types
+  let apart = @apart
+  @[parallel(label, proc(): seq[FileCommand] =
+      for i, t in types:
+        let to = if i == 0: dir else: typeDir(dir, t)
+        result.add (c.splitArgs("-export:" & t, to, dat), newSeq[string]())),
+    action(label & ": collecting", proc() =
+      for t in types[1 .. ^1]:
+        if t notin apart: mergeInto(typeDir(dir, t), dir))]
+
 proc copyTree(src, dst: string) =
   if dirExists(dst): removeDir(dst)
   copyDir(src, dst)
@@ -626,9 +694,9 @@ proc geometrySteps*(c: Config, p: Project): seq[Step] =
   ## Dumps the level's AKEV to XML and converts it to geometry.json.
   let xmlDir = p.buildDir / "akev"
   @[
-    command("Reading geometry", proc(): seq[string] =
+    commandFiles("Reading geometry", proc(): FileCommand =
       if dirExists(xmlDir): removeDir(xmlDir)
-      c.splitArgs("-extract:xml", xmlDir) & globOni(p.oniDir, "AKEV")),
+      (c.splitArgs("-extract:xml", xmlDir), globOni(p.oniDir, "AKEV"))),
     action("Converting geometry", proc() =
       var xmls: seq[string]
       for f in walkFiles(xmlDir / "AKEV*.xml"): xmls.add f
@@ -663,10 +731,10 @@ proc importSteps(c: Config, levelNumber: int, dir, folder, title: string,
       p.envName = onlv[0].splitFile.name["ONLV".len .. ^1]
       p.sky = p.findSky
       p.save()),
-    command("Extracting objects", proc(): seq[string] =
-      c.splitArgs("-extract:xml", p.objectsDir) & globOni(p.oniDir, "BINACJBO")),
-    command("Extracting textures and rooms", proc(): seq[string] =
-      c.splitArgs("-extract:dae", p.envDir) & globOni(p.oniDir, "AKEV"))]
+    commandFiles("Extracting objects", proc(): FileCommand =
+      (c.splitArgs("-extract:xml", p.objectsDir), globOni(p.oniDir, "BINACJBO"))),
+    commandFiles("Extracting textures and rooms", proc(): FileCommand =
+      (c.splitArgs("-extract:dae", p.envDir), globOni(p.oniDir, "AKEV")))]
   steps.add geometrySteps(c, p)
   steps.add @[
     action("Copying scripts", proc() =
@@ -700,12 +768,9 @@ proc previewJob*(c: Config, levelNumber: int, onDone: proc(p: Project)): Job =
     for kind, d in walkDir(cache):
       let name = d.lastPathPart
       if kind == pcDir and name.startsWith("open-") and d != work:
-        when defined(linux):
-          if not dirExists("/proc" / name["open-".len .. ^1]): removeDir(d)
-        elif defined(windows):
-          try:
-            if not processAlive(parseInt(name["open-".len .. ^1])): removeDir(d)
-          except ValueError, OSError: discard
+        try:
+          if not processAlive(parseInt(name["open-".len .. ^1])): removeDir(d)
+        except ValueError, OSError: discard
   let open = action("Opening a copy", proc() =
     if dirExists(work): removeDir(work)
     copyDir(pristine, work)
@@ -753,8 +818,8 @@ proc textureSteps(c: Config, p: Project, n: int, src: string): seq[Step] =
   @[
     command("Reading level " & $n, proc(): seq[string] =
       c.splitArgs("-export", src / "oni", c.gameData / "level" & $n & "_Final.dat")),
-    command("Extracting textures of level " & $n, proc(): seq[string] =
-      c.splitArgs("-extract:dae", src / "env") & globOni(src / "oni", "AKEV")),
+    commandFiles("Extracting textures of level " & $n, proc(): FileCommand =
+      (c.splitArgs("-extract:dae", src / "env"), globOni(src / "oni", "AKEV"))),
     action("Collecting textures of level " & $n, proc() =
       for sub in [("images", p.imagesDir), ("markers", p.markersDir)]:
         createDir(sub[1])
@@ -827,8 +892,8 @@ proc levelTextureSteps(c: Config, n: int): seq[Step] =
       if dirExists(dir): removeDir(dir)
       createDir(src)),
     command("Reading level " & $n, proc(): seq[string] = c.splitArgs("-export", src / "oni", dat)),
-    command("Extracting textures of level " & $n, proc(): seq[string] =
-      c.splitArgs("-extract:dae", src / "env") & globOni(src / "oni", "AKEV")),
+    commandFiles("Extracting textures of level " & $n, proc(): FileCommand =
+      (c.splitArgs("-extract:dae", src / "env"), globOni(src / "oni", "AKEV"))),
     action("Collecting textures of level " & $n, proc() =
       for f in walkFiles(src / "env" / "images" / "*.tga"):
         if not f.extractFilename.startsWith("bnv_grid"): moveFile(f, dir / f.extractFilename)
@@ -859,8 +924,8 @@ proc pictureSteps(c: Config, label, src, work: string, use: proc(file: string)):
       createDir(txmp)),
     command("Reading " & label, proc(): seq[string] =
       c.splitArgs("-create:txmp", txmp, "-large", src)),
-    command("Converting " & label, proc(): seq[string] =
-      c.oniSplitCmd & @["-extract:tga", tga] & globOni(txmp, "TXMP")),
+    commandFiles("Converting " & label, proc(): FileCommand =
+      (c.oniSplitCmd & @["-extract:tga", tga], globOni(txmp, "TXMP"))),
     action(label, proc() =
       for f in walkFiles(tga / "*.tga"):
         use(f)
@@ -1185,9 +1250,9 @@ proc scratchSteps(c: Config, p: Project, work, geo: string): seq[Step] =
                                   (if doorXml.len > 0: @[doorXml] else: @[]) &
                                   (if spinXml.len > 0: @[spinXml] else: @[]))),
     # Door textures the library lacks: level 0's (any texture can be picked).
-    command("Reading level 0", proc(): seq[string] =
-      if doors.wanted.len == 0: return @["true"]
-      c.splitArgs("-export", level0, c.gameData / "level0_Final.dat")),
+    command("Reading level 0's textures", proc(): seq[string] =
+      if doors.wanted.len == 0: return @[]
+      c.splitArgs("-export:TXMP", level0, c.gameData / "level0_Final.dat")),
     action("Collecting door textures", proc() =
       if doors.wanted.len == 0: return
       var missing: seq[string]
@@ -1203,7 +1268,7 @@ proc scratchSteps(c: Config, p: Project, work, geo: string): seq[Step] =
     # link it, so the quads' ObjectId and the ONLV's object quad lists are put
     # in afterwards, as for rebuilt game levels.
     command("Reading level back", proc(): seq[string] =
-      if not linkedObjects and not model.hasAnims: return @["true"]
+      if not linkedObjects and not model.hasAnims: return @[]
       c.splitArgs("-extract:xml", geo / "xml", geo / "out" / akevName, geo / "out" / onlvName)),
     action("Linking object geometry", proc() =
       if not linkedObjects:
@@ -1235,16 +1300,16 @@ proc scratchSteps(c: Config, p: Project, work, geo: string): seq[Step] =
                   " object quad lists, " & $doors.ids.len & " doors"
       f.close()),
     command("Writing level links", proc(): seq[string] =
-      if not linkedObjects: return @["true"]
+      if not linkedObjects: return @[]
       c.splitArgs("-create", geo / "onlv", geo / "xml" / "ONLV" & p.envName & ".xml")),
     action("Linking level", proc() =
       if not linkedObjects: return
       copyCreated(geo / "onlv", geo / "out")),
-    command("Writing marker textures", proc(): seq[string] =
+    commandFiles("Writing marker textures", proc(): FileCommand =
       var tgas: seq[string]
       for f in walkFiles(p.markersDir / "_marker_*.tga"): tgas.add f
       if tgas.len == 0: raise newException(IOError, "no marker textures in " & p.markersDir)
-      c.splitArgs("-create:txmp", geo / "markers") & tgas),
+      (c.splitArgs("-create:txmp", geo / "markers"), tgas)),
     action("Collecting level", proc() =
       if not fileExists(geo / "out" / akevName) or not fileExists(geo / "out" / onlvName):
         raise newException(IOError, "OniSplit wrote no level (see the log)")
@@ -1945,8 +2010,8 @@ proc buildJob*(c: Config, p: Project, then: seq[Step] = @[]): Job =
     action("Applying class edits", proc() =
       sources = classSources(p, p.buildDir / "classes")
       p.dropUnusedSounds(work)),
-    command("Compiling objects", proc(): seq[string] =
-      c.splitArgs("-create", objs) & sources, explainObjectError),
+    commandFiles("Compiling objects", proc(): FileCommand =
+      (c.splitArgs("-create", objs), sources), explainObjectError),
     action("Collecting objects", proc() =
       for f in walkFiles(objs / "*.oni"):
         let dst = work / f.extractFilename
@@ -1973,11 +2038,11 @@ proc buildJob*(c: Config, p: Project, then: seq[Step] = @[]): Job =
         c.splitArgs("-extract:xml", geo / "xml", geo / "out" / akevName)),
       # OniSplit links ghosts and door frames to TXMP_marker_* but doesn't write
       # those textures; the engine dereferences every quad's texture on load.
-      command("Writing marker textures", proc(): seq[string] =
+      commandFiles("Writing marker textures", proc(): FileCommand =
         var tgas: seq[string]
         for f in walkFiles(p.markersDir / "_marker_*.tga"): tgas.add f
         if tgas.len == 0: raise newException(IOError, "no marker textures in " & p.markersDir)
-        c.splitArgs("-create:txmp", geo / "markers") & tgas),
+        (c.splitArgs("-create:txmp", geo / "markers"), tgas)),
       action("Linking object geometry", proc() =
         let akevOni = geo / "out" / akevName
         linked = restoreObjectIds(model, geo / "xml" / "AKEV" & p.envName & ".xml", akevOni)

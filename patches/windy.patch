@@ -215,10 +215,39 @@ index 1147b56..f88aa59 100644
  
    XEventKind* {.size: cint.sizeof.} = enum
 diff --git a/src/windy/platforms/win32/platform.nim b/src/windy/platforms/win32/platform.nim
-index e790375..2124a33 100644
+index e790375..6b56353 100644
 --- a/src/windy/platforms/win32/platform.nim
 +++ b/src/windy/platforms/win32/platform.nim
-@@ -1044,7 +1044,9 @@ proc wndProc(
+@@ -1019,15 +1019,26 @@ proc wndProc(
+           MouseButton5
+       else:
+         MouseMiddle
++    # Capture the mouse while any main button is held, so its release still
++    # arrives when the cursor has left the window (a right-drag look would
++    # otherwise stay on until the next click inside).
+     if uMsg in {WM_LBUTTONDOWN.UINT, WM_RBUTTONDOWN, WM_MBUTTONDOWN}:
+       window.handleButtonPress(button)
+-      if button == MouseLeft:
++      if GetCapture() != window.hWnd:
+         discard SetCapture(window.hWnd)
+     else:
+       window.handleButtonRelease(button)
+-      if button == MouseLeft:
++      if button in {MouseLeft, MouseRight, MouseMiddle} and
++         window.state.buttonDown * {MouseLeft, MouseRight, MouseMiddle} == {}:
+         discard ReleaseCapture()
+     return 0
++  of WM_CAPTURECHANGED:
++    # Another window took the mouse: the held buttons' releases won't come.
++    if cast[HWND](lParam) != window.hWnd:
++      for b in [MouseLeft, MouseRight, MouseMiddle]:
++        if b in window.state.buttonDown:
++          window.handleButtonRelease(b)
++    return 0
+   of WM_KEYDOWN, WM_SYSKEYDOWN, WM_KEYUP, WM_SYSKEYUP:
+     if wParam == VK_PROCESSKEY:
+       # IME
+@@ -1044,7 +1055,9 @@ proc wndProc(
            window.handleButtonPress(button)
          else:
            window.handleButtonRelease(button)
@@ -230,10 +259,18 @@ index e790375..2124a33 100644
      if uMsg == WM_UNICHAR and wParam == UNICODE_NOCHAR:
        return TRUE
 diff --git a/src/windy/platforms/win32/windefs.nim b/src/windy/platforms/win32/windefs.nim
-index 8540d91..f9fb43a 100644
+index 8540d91..06d24de 100644
 --- a/src/windy/platforms/win32/windefs.nim
 +++ b/src/windy/platforms/win32/windefs.nim
-@@ -489,6 +489,7 @@ const
+@@ -413,6 +413,7 @@ const
+   WM_IME_KEYDOWN* = 0x0290
+   WM_IME_KEYUP* = 0x0291
+   WM_MOUSELEAVE* = 0x02A3
++  WM_CAPTURECHANGED* = 0x0215
+   WM_DPICHANGED* = 0x02E0
+   WM_DWMCOMPOSITIONCHANGED* = 0x031e
+   WM_DWMNCRENDERINGCHANGED* = 0x031f
+@@ -489,6 +490,7 @@ const
    KF_UP* = 0x8000
    VK_CONTROL* = 0x11
    VK_SNAPSHOT* = 0x2C
@@ -241,3 +278,12 @@ index 8540d91..f9fb43a 100644
    VK_LSHIFT* = 0xA0
    VK_RSHIFT* = 0xA1
    VK_PROCESSKEY* = 0xE5
+@@ -854,6 +856,8 @@ proc SetCapture*(hWnd: HWND): HWND {.dynlib: "User32".}
+ 
+ proc ReleaseCapture*(): BOOL {.dynlib: "User32".}
+ 
++proc GetCapture*(): HWND {.dynlib: "User32".}
++
+ proc GetKeyState*(nVirtKey: int32): SHORT {.dynlib: "User32".}
+ 
+ proc SetWindowTextW*(

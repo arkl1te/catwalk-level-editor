@@ -710,12 +710,14 @@ proc setRooms*(r: Renderer, scene: DaeScene) =
     for v in b.verts: data.add LevelVert(pos: v.pos, uv: v.uv, col: v.color)
   r.upload(lRooms, data, @[DrawRange(first: 0, count: data.len.int32)])
 
-proc model(r: Renderer, path, base, image: string): MeshLayer =
+proc model(r: Renderer, path, base, image: string): string =
   ## The saved model, uploaded on first use, its triangles shaded by a fixed
   ## light (the level's baked lighting doesn't reach objects). image, if
   ## given, textures all of it (console screens show their state's texture).
+  ## Returns its key in r.models.
   let key = if image.len > 0: path & "|" & image else: path
-  if key in r.models: return r.models[key]
+  result = key
+  if key in r.models: return
   var mesh = loadModel(path, base)
   if image.len > 0:
     mesh.images = @[image]
@@ -737,8 +739,7 @@ proc model(r: Renderer, path, base, image: string): MeshLayer =
     let (gl, alpha) = if tex >= 0: r.texture(mesh.images[tex]) else: (0.GLuint, false)
     draws.add DrawRange(first: data.len.int32, count: verts.len.int32, tex: gl, alphaTest: alpha)
     data.add verts
-  result = newMesh(data, draws)
-  r.models[key] = result
+  r.models[key] = newMesh(data, draws)
 
 proc clearModels*(r: Renderer) =
   ## Forgets the uploaded models (the library was rebuilt), and their
@@ -906,17 +907,53 @@ proc drawSky(r: Renderer, cam: Camera, w, h: int32) =
   glDepthMask(GL_TRUE)
 
 proc drawModels(r: Renderer, mvp: M4, is3D, textured: bool) =
+  ## Every model instance: solid in 3D, wireframe in 2D (lit = is3D, as
+  ## drawMesh would draw each). The state they share is set once: a level has
+  ## hundreds of them.
+  if r.modelInstances.len == 0: return
+  let lit = is3D
+  let textured = is3D and textured
+  glUseProgram(r.levelProg)
+  glUniform1i(r.uLevelTex, 0)
+  glUniform1f(r.uLevelLight, (if r.fullbright or not lit: 1'f32 else: 0'f32))
+  glUniform1i(r.uLevelShowTint, (if r.fullbright and r.showTint and lit: 1 else: 0))
+  glUniform1i(r.uLevelGrid, 0)
+  glUniform1f(r.uLevelGridSize, r.grid3D)
+  glUniform1f(r.uLevelGridAlpha, r.gridAlpha)
+  glUniform1f(r.uLevelBrightness, r.brightness)
+  glUniform1i(r.uLevelSkyBlend, -1)
+  glUniform1i(r.uLevelFacing, (if r.facing: 1 else: 0))
+  glUniform3f(r.uLevelViewDir, r.viewDir.x, r.viewDir.y, r.viewDir.z)
+  glUniform1i(r.uLevelBlend, 0)
+  glActiveTexture(GL_TEXTURE0)
+  glDisable(GL_CULL_FACE)
+  if not is3D: glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)
+  var lastUseTex, lastAlpha = -1
   for inst in r.modelInstances:
-    let m = r.model(inst.path, inst.base, inst.image)
-    let full = mul(mvp, inst.transform)
-    if is3D:
-      r.drawMesh(m, full, inst.tint, textured)
+    let key = r.model(inst.path, inst.base, inst.image)
+    let m = r.models[key].addr
+    if m.vao == 0: continue
+    var full = mul(mvp, inst.transform)
+    glUniformMatrix4fv(r.uLevelMvp, 1, GL_FALSE, full[0].addr)
+    if is3D: glUniform4f(r.uLevelTint, inst.tint.x, inst.tint.y, inst.tint.z, inst.tint.w)
     else:
-      glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)
       let c = inst.wire
-      r.drawMesh(m, full, vec4(c[0].float32 / 255, c[1].float32 / 255, c[2].float32 / 255,
-                               c[3].float32 / 255), false, lit = false)
-      glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
+      glUniform4f(r.uLevelTint, c[0].float32 / 255, c[1].float32 / 255, c[2].float32 / 255, c[3].float32 / 255)
+    glBindVertexArray(m.vao)
+    for d in m.draws:
+      let useTex = textured and d.tex != 0
+      let ut = (if useTex: 1 else: 0)
+      let at = (if useTex and d.alphaTest: 1 else: 0)
+      if ut != lastUseTex:
+        glUniform1i(r.uLevelUseTex, ut.GLint)
+        lastUseTex = ut
+      if at != lastAlpha:
+        glUniform1i(r.uLevelAlphaTest, at.GLint)
+        lastAlpha = at
+      if useTex: glBindTexture(GL_TEXTURE_2D, d.tex)
+      glDrawArrays(GL_TRIANGLES, d.first, d.count)
+  if not is3D: glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
+  glBindVertexArray(0)
 
 proc drawFlat(r: Renderer, verts: seq[FlatVert], mode: GLenum, mvp: M4) =
   if verts.len == 0: return

@@ -7,7 +7,8 @@ import silky, vmath, bumpy, pixie, opengl
 from pixie/fileformats/svg import parseSvg, newImage
 import theme, ui, icons, dialogs, menutree, xwin, colorpick
 import project, camera, render, appstate, viewtools, panels, objtemplates, music, pie, mcp, mcptools,
-       screenshot, crashlog, setupwin
+       screenshot, crashlog, setupwin, frameprof
+from library import renderPreviewsCli
 
 template staticBytes(path: string): untyped =
   ## A file's bytes, embedded at compile time.
@@ -36,6 +37,7 @@ proc noteState(a: App) =
   s.add "\nObjects: " & $a.objects.len & "\nLayout: " & $a.layout & "\nRender mode: " & $a.opts.mode &
         "\nRealtime preview: " & $a.realtime & "\nUnsaved changes: " & $a.dirty
   if a.busy: s.add "\nRunning: " & a.job.title
+  for l in a.loads: s.add "\nLoading: " & l.loadState
   setContext(s)
 
 proc frame(a: App) =
@@ -45,8 +47,8 @@ proc frame(a: App) =
   a.lastTime = now
   a.updateCamAnim()
   a.pollJob()
-  a.autoBuildPreviews()
-  a.autoExtractSky()
+  a.pollLoads()
+  a.autoLoad()
   a.pollMcp(AppVersion)
   if a.dialog != nil:
     var done = false
@@ -169,6 +171,39 @@ proc frame(a: App) =
   a.renderSetup()
   a.window.runeInputEnabled = true
 
+# --- drawing only when needed ----------------------------------------------------------
+# Like TrenchBroom, which repaints a view only when something in it changed:
+# a frame is drawn when input arrived, while something moves (a drag, a
+# camera glide, Realtime preview, a job), and otherwise 10 times a second
+# (timers, tooltips, the MCP server). In between the loop sleeps until input.
+
+const IdleFrame = 0.1   ## Seconds between frames when nothing moves.
+var wake = true         ## Input arrived since the last frame.
+var idle = false        ## The last onFrame drew nothing.
+var lastDraw = 0.0
+
+proc moving(a: App): bool =
+  ## Whether frames must come at the display's rate.
+  if a.busy or a.loads.len > 0 or a.realtime or a.particlePlaying.len > 0 or a.camAnim.on or
+     a.drag.kind != dkNone or a.menuSys.isOpen or a.setupOpen or
+     epochTime() - a.dupFlashAt < 1:
+    return true
+  for b in Button:
+    if a.window.buttonDown[b]: return true   # a key or button held: flying, dragging
+
+when defined(windows):
+  proc msgWaitForMultipleObjects(n: int32, handles: pointer, waitAll: int32, ms: int32,
+                                 wakeMask: int32): int32 {.stdcall, dynlib: "user32",
+                                 importc: "MsgWaitForMultipleObjects".}
+
+proc waitForInput(seconds: float) =
+  ## Sleeps until a window message arrives or seconds pass.
+  when defined(windows):
+    const QsAllInput = 0x04FF'i32
+    discard msgWaitForMultipleObjects(0, nil, 0, int32(seconds * 1000), QsAllInput)
+  else:
+    sleep(max(1, min(8, int(seconds * 1000))))
+
 proc buildAtlas(scale: float32): (Image, SilkyAtlas) =
   let fontPath = getTempDir() / "catwalk-font.ttf"
   if not fileExists(fontPath) or getFileSize(fontPath) != FontData.len:
@@ -216,13 +251,17 @@ proc main() =
   if "--mcp" in args:
     runBridge(loadConfig().mcpPort, AppVersion)
     return
+  if args.len > 0 and args[0] == "--render-previews":   # The library build's helpers.
+    renderPreviewsCli(args[1 .. ^1])
+    return
+  moveOldDataDir()   # Before the session log opens in the logs folder.
   initLog(AppVersion, args)
   let forceMcp = "--mcp-server" in args
   args.keepItIf(it != "--mcp-server")
   let a = App(cfg: loadConfig(), mcpForced: forceMcp, gridIndex: GridKeyBase + 3, snap: true, showGrid: true,
-              hoverView: -1, maximized: -1, layout: pl3, previewParts: {ppLights, ppSounds},
+              hoverView: -1, maximized: -1, layout: pl1, previewParts: {ppLights, ppSounds, ppParticles},
               previewSoundVolume: 1, previewMusicVolume: 1, dock: defaultDock(),
-              opts: ViewOptions(mode: rmDynamicLight, models: true, sky: true, invisible: true), showDirections: true, showGizmos: true, lastTime: epochTime(), zoom2D: 0.5, flySpeed: DefaultFlySpeed, texThumb: DefaultTexThumb, codeFontSize: DefaultCodeFontSize,
+              opts: ViewOptions(mode: rmDynamicLight, models: true, sky: true, invisible: true), showDirections: true, showGizmos: true, lastTime: epochTime(), zoom2D: 0.5, flySpeed: StartFlySpeed, texThumb: DefaultTexThumb, entityPreview: 0.75, newTexLevel: 1, codeFontSize: DefaultCodeFontSize,
               brushHeight: 64, rotateAngle: 15,
               moveBy: "0 0 0", shade: [200.0, 200, 200],
               splitX: 0.55, splitY: 0.5, shapeSides: 8, shapeSteps: 4, treeAnchor: -1,
@@ -252,9 +291,17 @@ proc main() =
   a.ui = newUi(a.sk, a.window)
   a.menuSys = newMenuSystem()
   a.window.onFocusChange = proc() =
+    wake = true
     a.focusLostAt = if a.window.focused: 0.0 else: epochTime()
   a.window.onRune = proc(r: Rune) =
+    wake = true
     if r.int32 >= 32: a.ui.typedPending.add $r
+  a.window.onMouseMove = proc() = wake = true
+  a.window.onScroll = proc() = wake = true
+  a.window.onResize = proc() = wake = true
+  a.window.onMove = proc() = wake = true
+  a.window.onButtonPress = proc(b: Button) = wake = true
+  a.window.onButtonRelease = proc(b: Button) = wake = true
   a.rend = newRenderer()
   a.views[0].cam = Camera(kind: vk3D, fovY: a.defaultFov, pos: vec3(0, 100, 300))
   a.views[1].cam = Camera(kind: vkTop, zoom: 0.5)
@@ -270,9 +317,22 @@ proc main() =
   if args.len > 0: a.openProjectDir(args[0].absolutePath)
   a.applyMcp()
 
-  a.window.onFrame = proc() = a.frame()
+  a.window.onFrame = proc() =
+    let now = epochTime()
+    if not wake and now - lastDraw < IdleFrame and not a.moving:
+      idle = true
+      return
+    idle = false
+    wake = false
+    # After a pause, a frame's worth of movement, not the whole pause's (a
+    # key pressed to fly would jump).
+    if now - lastDraw > 0.05: a.lastTime = now - 1 / 60
+    lastDraw = now
+    prof "frame": a.frame()
+    profFrame()
   while true:
     pollEvents()
+    if idle and not wake: waitForInput(IdleFrame - (epochTime() - lastDraw))
     discard a.menuSys.pollInput()
     # Menus close when the window loses focus. Re-checked every iteration, so
     # menus opened or kept open after the focus left still close; the grace

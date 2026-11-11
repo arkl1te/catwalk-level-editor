@@ -30,9 +30,9 @@ proc classCacheJob*(c: Config, logPath: string): Job =
       createDir(oni)),
     command("Reading level 0", proc(): seq[string] =
       c.oniSplitCmd & @["-export:ONCC", oni, c.gameData / "level0_Final.dat"]),
-    command("Reading classes", proc(): seq[string] =
-      result = c.oniSplitCmd & @["-extract:xml", dir]
-      for f in walkFiles(oni / "ONCC*.oni"): result.add f),
+    commandFiles("Reading classes", proc(): FileCommand =
+      result.head = c.oniSplitCmd & @["-extract:xml", dir]
+      for f in walkFiles(oni / "ONCC*.oni"): result.files.add f),
     action("Finishing", proc() =
       removeDir(oni)
       if classNames().len == 0: raise newException(IOError, "level 0 has no character classes")

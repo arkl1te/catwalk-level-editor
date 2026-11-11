@@ -32,16 +32,16 @@ proc skyCacheJob*(c: Config, logPath: string): Job =
     xml = work / "xml"
     tga = work / "tga"
   var faces: Table[string, (string, string)]   # TXMP name -> (sky, face)
-  let steps = @[
+  var steps = @[
     action("Preparing", proc() =
       if dirExists(work): removeDir(work)
-      for d in [oni, xml, tga]: createDir(d)),
-    command("Reading level 0", proc(): seq[string] =
-      c.oniSplitCmd & @["-export", oni, c.gameData / "level0_Final.dat"]),
+      for d in [oni, xml, tga]: createDir(d))]
+  steps.add c.exportTypes("Reading level 0", c.gameData / "level0_Final.dat", oni, ["TXMP", "ONSK"])
+  steps.add @[
     command("Reading skies", proc(): seq[string] =
       c.oniSplitCmd & @["-extract:xml", xml, oni / "ONSK*.oni"]),
-    command("Extracting sky images", proc(): seq[string] =
-      result = c.oniSplitCmd & @["-extract:tga", tga]
+    commandFiles("Extracting sky images", proc(): FileCommand =
+      result.head = c.oniSplitCmd & @["-extract:tga", tga]
       for f in walkFiles(xml / "ONSK*.xml"):
         let sky = f.splitFile.name["ONSK".len .. ^1]
         let x = readFile(f)
@@ -57,10 +57,9 @@ proc skyCacheJob*(c: Config, logPath: string): Job =
           let link = x[s + "<Link>".len ..< e].strip
           if link.len > 0 and fileExists(oni / link & ".oni"):
             faces[link] = (sky, SkyFaces[k])
-            result.add oni / link & ".oni"
+            result.files.add oni / link & ".oni"
           i = e
-          inc k
-      if result.len == 4: result = @["true"]),
+          inc k),
     action("Writing skies", proc() =
       for link, (sky, face) in faces:
         let f = tga / link & ".tga"

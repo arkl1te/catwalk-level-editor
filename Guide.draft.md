@@ -124,10 +124,21 @@ or click to place it. Built in: a generic object of each type, the game's charac
 (players, enemies, TCTF, civilians, with their usual team and weapon), weapons,
 power-ups, turrets and particles (lights, fire, steam, sparks, weather, decals).
 Furniture, consoles, doors and triggers come from the entity library, which the
-browser's button builds from the game files (about 30 s, into
-`~/.local/share/catwalk/library/`). The game has no furniture classes: each piece is
-level geometry linked to its object, so the library keeps that geometry and its
-textures, and placing one adds them to the level.
+browser's button builds from the game files (about 15 s, into
+`~/.local/share/catwalk/library/`, on Windows `%LOCALAPPDATA%\catwalk\library\`). It starts with the Warehouse's (level 1); each
+game level you add in Texture Collections adds its furniture, consoles, doors and
+triggers too, in the same few seconds that extract its textures. The game has no
+furniture classes: each piece is level geometry linked to its object, so the library
+keeps that geometry and its textures, and placing one adds them to the level.
+
+The first time a level is open, Catwalk loads what it takes from the game in the
+background while you work: the entity library, then level 0's skies, particles and
+sounds, one at a time (about a minute in all, once per computer). The status bar shows
+what is loading, with a bar and its progress (done/total); the Entity Browser and the
+Classes page show theirs too. Realtime preview is greyed out until its sounds and
+particles (it plays both unless you turn them off) are loaded, and Build or Play pressed while something it
+needs loads starts by itself once that's done. Loading pauses while a job you started
+(a new project, Build) runs.
 
 The slider next to the search field sets the preview size: all the way left is a compact
 list of names; further right shows each entity's model (characters in their idle pose,
@@ -148,7 +159,8 @@ a power of 2, at most 1024 (Arklite lifts the game's 256×256 limit; alpha is ke
 **Texture Collections** sets what the browser lists, as in TrenchBroom. Add moves a
 collection from Available to Enabled (double-click does too) and Up / Down set its
 order: this level's textures, your imported ones, and any other game level's, which are
-extracted once and copied into the project when first used. **Clean up unused** (in the
+extracted once (adding that level's entities to the Entity Browser) and copied into the
+project when first used. **Clean up unused** (in the
 browser) drops level collections no face uses.
 
 Game textures are only extracted so the editor can show them. Build leaves them out: a

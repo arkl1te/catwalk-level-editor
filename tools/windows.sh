@@ -14,7 +14,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BIN=catwalk.exe
+BIN=${CATWALK_BIN:-catwalk.exe}   # CATWALK_BIN: build somewhere else (tools/build-when-closed.sh)
 APP_DIR="${LOCALAPPDATA:?}/Programs/Catwalk"
 SHORTCUT="${APPDATA:?}/Microsoft/Windows/Start Menu/Programs/Catwalk.lnk"
 

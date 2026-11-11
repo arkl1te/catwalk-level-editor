@@ -201,17 +201,22 @@ proc bounds*(m: ThumbMesh): (Vec3, Vec3) =
 proc saveModel*(m: ThumbMesh, path, base, imageDir, keep: string) =
   ## Writes the mesh to path. Images outside keep are copied into imageDir;
   ## the file names them relative to base (which holds both).
-  var s = newFileStream(path, fmWrite)
-  if s == nil: raise newException(IOError, "cannot write " & path)
-  defer: s.close()
+  var s = newStringStream()   # Written at once: a file stream per value is slow.
   s.write ModelMagic
   s.write m.images.len.int32
   for img in m.images:
     var src = img
-    if not img.startsWith(keep & "/"):
+    if not img.startsWith(keep & "/") and not img.startsWith(keep & DirSep):
       createDir(imageDir)
       src = imageDir / img.extractFilename
-      if not fileExists(src): copyFile(img, src)
+      if not fileExists(src):
+        # Previews render in several processes: another may be copying it.
+        # A link where it can be: the extracted images are removed after.
+        try:
+          try: createHardlink(img, src)
+          except OSError: copyFile(img, src)
+        except OSError:
+          if not fileExists(src): raise
     let rel = src.relativePath(base)
     s.write rel.len.int32
     s.write rel
@@ -221,6 +226,7 @@ proc saveModel*(m: ThumbMesh, path, base, imageDir, keep: string) =
     for k in 0 .. 2:
       for c in [t.p[k].x, t.p[k].y, t.p[k].z, t.uv[k].x, t.uv[k].y]: s.write c
       for c in t.col[k]: s.write c
+  writeFile(path, s.data)
 
 proc loadModel*(path, base: string): ThumbMesh =
   ## A mesh saveModel wrote; empty if the file is missing or not one.

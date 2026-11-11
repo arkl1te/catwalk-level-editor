@@ -21,6 +21,9 @@ const
   SplitW* = 8'f32                   ## Thickness of the dividers between panes.
   DefaultFlySpeed* = 500'f32       ## Fly speed factor 1 (Settings > Mouse > Fly mode).
   FlyWheelStep* = 1.25'f32         ## Fly speed change per wheel notch while flying.
+  StartFlySpeed* = DefaultFlySpeed / (FlyWheelStep * FlyWheelStep * FlyWheelStep * FlyWheelStep *
+                   FlyWheelStep * FlyWheelStep * FlyWheelStep)
+    ## The fly speed to begin with: factor 0.21 (seven wheel notches below 1).
   MinTexThumb* = 32'f32            ## Texture browser tile sizes Ctrl+wheel zooms between.
   MaxTexThumb* = 256'f32
   DefaultTexThumb* = 56'f32
@@ -335,6 +338,16 @@ type
   NewKind* = enum           ## What the welcome screen's Create makes.
     nkScratch, nkCopy, nkPreview
 
+  Load* = ref object
+    ## A cache made in the background, one at a time, while the user works
+    ## (they wait while a job the user started runs): the entity library,
+    ## level 0's skies, particles, sounds and classes.
+    key*: string                    ## "library", "sky", "particles", "sounds", "classes", "levels".
+    title*: string
+    make*: proc(): Job              ## When its turn comes; nil: nothing to do any more.
+    done*: seq[proc()]              ## Run when it's made.
+    job*: Job                       ## nil until it starts.
+
   App* = ref object
     window*: Window
     sk*: Silky
@@ -397,8 +410,11 @@ type
     mergeLive*: string              ## Widget still editing the last ckProject step ("" = none).
     musicUndone*: bool              ## Undo or redo changed the level's track: the preview follows.
     drag*: Drag
-    job*: Job
+    job*: Job                       ## The job the user started (Build, a new project...).
     jobDone*: proc()
+    loads*: seq[Load]               ## Caches being made while the user works: the first runs.
+    soundAutoBuild*: bool           ## Level 0's sounds were extracted (or tried) unasked.
+    buildAfterLoad*: int            ## Build (1) or Play (2) pressed while a load it needs ran.
     menuSys*: MenuSystem            ## Menu bar and context menu popups (their own windows).
     menuTree*: MenuNode             ## This frame's menu bar tree.
     menuOpenedAt*: float            ## When the open menus opened, else 0.
@@ -419,7 +435,7 @@ type
     pie*: PieMenu                   ## Render-mode pie menu (hold Z over the views).
     realtime*: bool                 ## Realtime preview: Sound objects play, light animations run.
     realtimeStart*: float           ## epochTime when it was turned on (the animations' clock).
-    previewParts*: set[PreviewPart] ## What it plays (lights and sounds by default; never empty).
+    previewParts*: set[PreviewPart] ## What it plays (lights, sounds and particles by default; never empty).
     previewSoundVolume*: float      ## Its Sound objects' and the sound fields' previews' volume (Oni's 0..1; not the level's).
     previewMusicVolume*: float      ## Its level music's volume (Oni's 0..1; not the level's).
     realtimeMusic*: string          ## The level music it started ("" = none).
@@ -526,7 +542,7 @@ type
     soundImportPick*: proc(v: string)   ## The sound field whose Import sound... dialog is open.
     browserOpen*: HashSet[string]   ## Entity browser: expanded groups.
     entityFilter*: string
-    entityPreview*: float           ## Entity browser preview size: 0 = list, up to 1.
+    entityPreview*: float           ## Entity browser preview size: 0 = list, up to 1, in steps of 1/8.
     previewStamp: string            ## Library build the loaded previews are from.
     previewTried: HashSet[string]   ## Preview atlas keys loaded or missing.
     previewAutoBuild*: bool         ## The entity library was built for missing previews.
@@ -624,6 +640,21 @@ proc say*(a: App, msg: string, error = false) =
     inc a.logDropped
 
 proc busy*(a: App): bool = a.job != nil and a.job.state == jsRunning
+
+proc loading*(a: App, key: string): bool =
+  ## Whether the cache key names (see Load) is being made or waits its turn.
+  for l in a.loads:
+    if l.key == key: return true
+
+proc loadState*(l: Load): string =
+  ## "Building the entity library (12/31)", or "... (waiting)" before it starts.
+  if l.job == nil: return l.title & " (waiting)"
+  let (done, all) = l.job.progressCount
+  &"{l.title} ({done}/{all})"
+
+proc loadingText*(a: App, key: string): string =
+  for l in a.loads:
+    if l.key == key: return l.loadState
 
 proc isModification(c: Cmd): bool = c.kind notin {ckSelect, ckVisibility, ckProject}
 
@@ -820,12 +851,56 @@ proc unitOf*(a: App, gid: int32): int32 =
 
 proc pieceLocked*(a: App, pc: int32): bool = a.groupLocked(a.pieceGroup(pc))
 
+proc look*(o: LevelObject): tuple[half: Vec3, lift: float32, col: array[4, uint8]]
+
+var objEpoch = 0   ## Bumped by every edit, undo, redo and project load.
+
+type ObjInfo = object
+  ## What an object's box comes from in its data, kept until it changes (see
+  ## objInfo): picking and drawing ask for every object every frame.
+  epoch, models: int               ## objEpoch and library.modelEpoch when made; models 0 = empty.
+  hasModel: bool
+  lo, hi: Vec3                     ## The model's bounds in object space.
+  half: Vec3                       ## The marker box's, without a model.
+  lift: float32
+
+var objInfos: Table[LevelObject, ObjInfo]
+
+proc objInfo(o: LevelObject): ObjInfo =
+  ## o's ObjInfo, made again after an edit (any undo step), undo, redo, a
+  ## project load or a library build.
+  let epoch = objEpoch
+  let models = modelEpoch + 1
+  objInfos.withValue(o, c):
+    if c.epoch == epoch and c.models == models: return c[]
+  if objInfos.len > 0:
+    # Entries of an older epoch go together.
+    for v in objInfos.values:
+      if v.epoch != epoch or v.models != models:
+        objInfos.clear()
+      break
+  result = ObjInfo(epoch: epoch, models: models)
+  let (ok, m) = o.objectModel
+  if ok: (result.hasModel, result.lo, result.hi) = (true, m.lo, m.hi)
+  let l = o.look
+  (result.half, result.lift) = (l.half, l.lift)
+  objInfos[o] = result
+
+proc hasModel*(o: LevelObject): bool =
+  ## Whether the library has a model for o (objectModel's first value, kept).
+  o.objInfo.hasModel
+
+proc objectsChanged*() =
+  ## Forgets the kept object data: objects were edited outside push, undo
+  ## and redo (those forget it themselves).
+  inc objEpoch
+
 proc pickable*(a: App, o: LevelObject): bool =
   a.visible(o) and o.tag notin a.layerLocked and not a.groupLocked(a.objGroup(o))
 
 proc viewPickable*(a: App, o: LevelObject): bool =
   ## Whether a click in a view can hit o: there has to be something to click.
-  a.pickable(o) and (a.entityGizmo(o) or (a.opts.models and o.objectModel[0]))
+  a.pickable(o) and (a.entityGizmo(o) or (a.opts.models and o.hasModel))
 
 proc geometryVisible*(a: App): bool = a.geo != nil and GeometryLayer notin a.layerHidden
 proc geometryEditable*(a: App): bool = a.geometryVisible and GeometryLayer notin a.layerLocked
@@ -860,15 +935,45 @@ proc facePickable*(a: App): proc(fi: int): bool =
     if f.piece >= 0 and f.piece < app.geo.pieces.len and app.geo.pieces[f.piece].hidden: return false
     fi in app.selFaces or f.piece in app.selPieces or f.objectId in codes
 
+var pieceBox: seq[(Vec3, Vec3)]
+var pieceBoxGeo: Geometry
+var pieceBoxVersion = -1
+
+proc piecesHit*(a: App, r: Ray): seq[bool] =
+  ## Per piece, whether r passes through its bounds: a ray's faces are only
+  ## looked for in those (a level has tens of thousands). The bounds are kept
+  ## until the geometry changes.
+  if a.geo == nil: return
+  let g = a.geo
+  if pieceBoxGeo != g or pieceBoxVersion != g.version or pieceBox.len != g.pieces.len:
+    pieceBox = newSeq[(Vec3, Vec3)](g.pieces.len)
+    for b in pieceBox.mitems: b = (vec3(Inf.float32), vec3(-Inf.float32))
+    for f in g.faces:
+      if f.piece notin 0 ..< pieceBox.len.int32: continue
+      for v in f.verts:
+        pieceBox[f.piece][0] = min(pieceBox[f.piece][0], g.points[v])
+        pieceBox[f.piece][1] = max(pieceBox[f.piece][1], g.points[v])
+    pieceBoxGeo = g
+    pieceBoxVersion = g.version
+  result = newSeq[bool](pieceBox.len)
+  const pad = vec3(0.01, 0.01, 0.01)   # flat pieces have no thickness
+  for i, (lo, hi) in pieceBox:
+    result[i] = lo.x <= hi.x and r.rayBox(lo - pad, hi + pad) >= 0
+
 proc facePickable*(a: App, vi: int, r: Ray): proc(fi: int): bool =
   ## The same for ray r in view vi, which also passes through back faces where
   ## the view culls them (render.drawView), so a camera inside a wall picks
-  ## what it sees past the wall.
+  ## what it sees past the wall. Only faces of pieces the ray goes through.
   let pickable = a.facePickable
-  if a.views[vi].cam.kind != vk3D or a.opts.mode.wireframe: return pickable
+  let hit = a.piecesHit(r)
   let app = a
+  if a.views[vi].cam.kind != vk3D or a.opts.mode.wireframe:
+    return proc(fi: int): bool =
+      let p = app.geo.faces[fi].piece
+      p in 0 ..< hit.len.int32 and hit[p] and pickable(fi)
   result = proc(fi: int): bool =
-    if not pickable(fi): return false
+    let p = app.geo.faces[fi].piece
+    if p notin 0 ..< hit.len.int32 or not hit[p] or not pickable(fi): return false
     let f = app.geo.faces[fi]
     (f.flags and gfTwoSided) != 0 or f.isMarkerFace or f.isInvisibleFace or
       app.geo.normal(f).dot(r.dir) < 0
@@ -878,11 +983,24 @@ proc ownerOf*(a: App, objectId: int32): LevelObject =
   for o in a.objects:
     if o.objectCode == objectId: return o
 
-proc hasGeometry*(a: App, o: LevelObject): bool =
+var objFaceIndex: Table[int32, seq[int]]
+var objFaceGeo: Geometry
+var objFaceVersion = -1
+
+proc ownedFaces*(a: App, o: LevelObject): seq[int] =
+  ## The level geometry's faces o owns (its ObjectId), from an index kept
+  ## until the geometry changes: a level has tens of thousands of faces.
   let code = o.objectCode
-  if code == -1 or a.geo == nil: return false
-  for f in a.geo.faces:
-    if f.objectId == code: return true
+  if code == -1 or a.geo == nil: return
+  if objFaceGeo != a.geo or objFaceVersion != a.geo.version:
+    objFaceIndex.clear()
+    for i, f in a.geo.faces:
+      if f.objectId != -1: objFaceIndex.mgetOrPut(f.objectId, @[]).add i
+    objFaceGeo = a.geo
+    objFaceVersion = a.geo.version
+  objFaceIndex.getOrDefault(code)
+
+proc hasGeometry*(a: App, o: LevelObject): bool = a.ownedFaces(o).len > 0
 
 proc setPose*(a: App, o: LevelObject, pos, rot: Vec3, moveGeometry = true) =
   ## Moves an object and the level geometry it owns.
@@ -934,23 +1052,22 @@ proc look*(o: LevelObject): tuple[half: Vec3, lift: float32, col: array[4, uint8
 
 proc corners*(o: LevelObject): array[8, Vec3] =
   ## The object's box: its model's bounds, or else its marker box.
-  let (ok, m) = o.objectModel
-  if ok:
+  let c = o.objInfo
+  if c.hasModel:
     let t = objectMatrix(o.pos, o.rot)
     var i = 0
-    for x in [m.lo.x, m.hi.x]:
-      for y in [m.lo.y, m.hi.y]:
-        for z in [m.lo.z, m.hi.z]:
+    for x in [c.lo.x, c.hi.x]:
+      for y in [c.lo.y, c.hi.y]:
+        for z in [c.lo.z, c.hi.z]:
           result[i] = t * vec3(x, y, z)
           inc i
     return
-  let l = o.look
   if o.tag == "PART":
     # Particles turn about all three axes (an emitter's direction is its local +Y).
     let t = objectMatrix(o.pos, o.rot)
-    for i, k in boxCorners(vec3(0, l.lift, 0), l.half, 0): result[i] = t * k
+    for i, k in boxCorners(vec3(0, c.lift, 0), c.half, 0): result[i] = t * k
     return
-  boxCorners(o.pos + vec3(0, l.lift, 0), l.half, o.rot.y)
+  boxCorners(o.pos + vec3(0, c.lift, 0), c.half, o.rot.y)
 
 proc lightBall*(o: LevelObject): float32 =
   ## Lights pick by their gizmo's ball (0: not a light). A point light's is
@@ -978,6 +1095,12 @@ proc pickRay*(o: LevelObject, r: Ray): float32 =
   if ball > 0: return r.raySphere(o.pos, ball)
   let (lo, hi) = o.pickBox
   r.rayBox(lo, hi)
+
+proc pickRay*(o: LevelObject, r: Ray, box: (Vec3, Vec3)): float32 =
+  ## pickRay with o.pickBox worked out already.
+  let ball = o.lightBall
+  if ball > 0: return r.raySphere(o.pos, ball)
+  r.rayBox(box[0], box[1])
 
 proc pointing*(o: LevelObject): (bool, Vec3) =
   ## The way an object faces, for those that have one: a character's and a
@@ -1094,6 +1217,7 @@ proc push*(a: App, c: Cmd) =
   a.undoStack.add c
   a.redoStack.setLen 0
   inc a.pushCount
+  inc objEpoch
   a.trimGeometryUndo()
 
 proc snapshotObjects*(objs: seq[LevelObject]): seq[string] =
@@ -1220,6 +1344,7 @@ proc undo*(a: App) =
   if a.undoStack.len == 0: return
   let c = a.undoStack.pop
   a.applyCmd(c, undo = true)
+  inc objEpoch
   a.storeLinkSigs()
   a.redoStack.add c
   a.selRecorded = a.currentSel
@@ -1230,6 +1355,7 @@ proc redo*(a: App) =
   if a.redoStack.len == 0: return
   let c = a.redoStack.pop
   a.applyCmd(c, undo = false)
+  inc objEpoch
   a.storeLinkSigs()
   a.undoStack.add c
   a.selRecorded = a.currentSel
@@ -1462,7 +1588,8 @@ proc loadLayout*(a: App) =
   a.classListFolded = j{"classListFolded"}.getBool(false)
   if j{"classFolded"} != nil and j["classFolded"].kind == JArray:
     for n in j["classFolded"]: a.classFolded.incl n.getStr
-  a.entityPreview = clamp(j{"entityPreview"}.getFloat(a.entityPreview), 0, 1)
+  # Saved under a new name since step 6 became the default (the old one was mostly 0).
+  a.entityPreview = clamp(j{"entityPreviewSize"}.getFloat(a.entityPreview), 0, 1)
   a.texThumb = clamp(j{"texThumb"}.getFloat(a.texThumb), MinTexThumb, MaxTexThumb).float32
   if j{"codeFontSize"}.getInt in CodeFontSizes: a.codeFontSize = j{"codeFontSize"}.getInt
   a.flySpeed = clamp(j{"flySpeed"}.getFloat(a.flySpeed), MinFlySpeed, MaxFlySpeed).float32
@@ -1497,7 +1624,7 @@ proc saveLayout*(a: App) =
     writeFile(layoutPath(), pretty(%*{"layout": $a.layout, "splitX": a.splitX, "splitY": a.splitY,
       "dock": a.dock.toJson, "dockVersion": 2, "textureGroup": a.texGroup, "entityBrowserH": a.entityBrowserH,
       "classListFolded": a.classListFolded, "classFolded": a.classFolded.toSeq.sorted,
-      "entityPreview": a.entityPreview, "texThumb": a.texThumb, "codeFontSize": a.codeFontSize, "entityGroupsOpen": a.browserOpen.toSeq.sorted,
+      "entityPreviewSize": a.entityPreview, "texThumb": a.texThumb, "codeFontSize": a.codeFontSize, "entityGroupsOpen": a.browserOpen.toSeq.sorted,
       "flySpeed": a.flySpeed, "renderMode": $a.opts.mode,
       "realtimePreview": a.previewParts.toSeq.mapIt($it),
       "gizmos": a.showGizmos, "gizmosHidden": a.gizmoHidden.toSeq.sorted,
@@ -1743,6 +1870,7 @@ proc saveGroups(a: App, dir: string)
 
 proc loadProject*(a: App, p: Project) =
   if a.proj != nil and a.proj != p: a.saveCamera()
+  inc objEpoch
   a.rend.clearAll()
   a.proj = p
   openSoundsDir = p.soundsDir
@@ -2073,6 +2201,28 @@ proc focusBlocked(p: FocusPoint, eye: Vec3, skip: seq[bool]): (bool, bool) =
       result[0] = true
       return
 
+proc ensureFocusGrid(a: App) =
+  if focusGeo != a.geo or focusVersion != a.geo.version:
+    focusGrid = buildGrid(a.geo, blocksView)
+    focusGeo = a.geo
+    focusVersion = a.geo.version
+    focusStamp = newSeq[int32](focusGrid.triangles)
+    focusRay = 0
+
+proc hiddenFrom*(a: App, p, eye: Vec3, owner = 0'i32): bool =
+  ## Whether a face the 3D view draws lies between eye and p. Faces of the
+  ## object coded owner (when non-zero) and hidden faces don't count.
+  if a.geo == nil or a.geo.faces.len == 0: return false
+  a.ensureFocusGrid
+  let d = p - eye
+  if d.length < 2: return false
+  let n = d.normalize
+  inc focusRay
+  for (t, fi) in crossings(addr focusGrid, eye, p - n * 1.5, focusStamp, focusRay):
+    let f = focusGeo.faces[fi]
+    if (owner != 0 and f.objectId == owner) or not a.faceVisible(fi): continue
+    if focusGeo.normal(f).dot(n) < 0 or (f.flags and gfTwoSided) != 0: return true
+
 proc focusView(a: App, lo, hi: Vec3): (Vec3, float32, float32) =
   ## Where the 3D camera sees the box lo..hi framed with nothing in front of
   ## it: (position, yaw, pitch). Costs per spot: anything hidden first, then a
@@ -2089,12 +2239,7 @@ proc focusView(a: App, lo, hi: Vec3): (Vec3, float32, float32) =
   proc spot(yaw, pitch, dist: float32): Vec3 =
     c - Camera(yaw: yaw, pitch: pitch).forward * dist
   if a.geo == nil or a.geo.faces.len == 0: return (spot(here.yaw, here.pitch, far), here.yaw, here.pitch)
-  if focusGeo != a.geo or focusVersion != a.geo.version:
-    focusGrid = buildGrid(a.geo, blocksView)
-    focusGeo = a.geo
-    focusVersion = a.geo.version
-    focusStamp = newSeq[int32](focusGrid.triangles)
-    focusRay = 0
+  a.ensureFocusGrid
   let (pts, skip) = a.focusPoints
   if pts.len == 0: return (spot(here.yaw, here.pitch, far), here.yaw, here.pitch)
   var best = Inf.float32
@@ -2235,11 +2380,27 @@ proc planeHit*(r: Ray, point, normal: Vec3): (bool, Vec3) =
 
 # --- shared editing operations ------------------------------------------------------------------
 
-proc selectedFaceSet*(a: App): HashSet[int] =
-  ## Faces of selected pieces plus individually selected faces.
+var pieceFaceIndex: seq[seq[int]]
+var pieceFaceGeo: Geometry
+var pieceFaceVersion = -1
+
+proc facesOfPiece*(a: App, piece: int32): seq[int] =
+  ## A piece's faces, from an index kept until the geometry changes.
   if a.geo == nil: return
-  for i, f in a.geo.faces:
-    if f.piece in a.selPieces or i in a.selFaces: result.incl i
+  if pieceFaceGeo != a.geo or pieceFaceVersion != a.geo.version:
+    pieceFaceIndex = a.geo.pieceFaces
+    pieceFaceGeo = a.geo
+    pieceFaceVersion = a.geo.version
+  if piece in 0 ..< pieceFaceIndex.len.int32: pieceFaceIndex[piece] else: @[]
+
+proc selectedFaceSet*(a: App): HashSet[int] =
+  ## Faces of selected pieces plus individually selected faces. Called every
+  ## frame: only the selection's own faces are looked at.
+  if a.geo == nil: return
+  for p in a.selPieces:
+    for i in a.facesOfPiece(p): result.incl i
+  for i in a.selFaces:
+    if i in 0 ..< a.geo.faces.len: result.incl i
 
 proc holdTextures*(a: App, faces: HashSet[int]): TexHold =
   ## With UV lock off, notes each face's shift, scale and rotation on its world
@@ -2606,10 +2767,6 @@ proc addPreset*(a: App, p: Preset, pos: Vec3): LevelObject =
   a.clearSelection()
   o.selected = true
   o
-
-proc libraryStamp(): string =
-  try: (if hasLibrary(): $getLastModificationTime(libraryFile()).toUnix else: "")
-  except CatchableError: ""
 
 proc loadPresets*(a: App) =
   # The library may have been rebuilt: models are read again on next use.

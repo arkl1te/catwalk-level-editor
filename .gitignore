@@ -4,3 +4,4 @@ ideas.txt
 /catwalk.exe
 *.pdb
 *.ilk
+/build/

@@ -73,6 +73,9 @@ proc status(a: App): JsonNode =
   for i in a.shownViews: result["views"].add a.viewJson(i)
   if a.busy:
     result["job"] = %*{"title": a.job.title, "step": a.job.stepLabel, "progress": a.job.progress}
+  if a.loads.len > 0:
+    result["loading"] = newJArray()
+    for l in a.loads: result["loading"].add %l.loadState
   if a.proj == nil: return
   let p = a.proj
   result["project"] = %*{"dir": p.dir, "title": p.title, "env": p.envName, "level": p.levelNumber,

@@ -15,6 +15,8 @@ import std/[strutils, strformat, math, tables, sets, algorithm, sequtils, times,
 import silky, vmath, bumpy, pixie
 import theme, ui, menutree
 import levelobjects, camera, render, geometry, geomops, appstate, presets, library, objtemplates, sky, project
+from music import hasSoundCache
+from particlesim import hasParticleCache
 
 const
   DragThreshold = 2'f32     ## Pixels a press moves before it becomes a drag.
@@ -138,14 +140,21 @@ proc candidates*(a: App, vi: int, mouse: Vec2): seq[Cand] =
   for o in a.objects:
     if not a.viewPickable(o): continue
     let (lo, hi) = o.pickBox
-    let t = o.pickRay(r)
+    let t = o.pickRay(r, (lo, hi))
     if t >= 0:
       byObj[o] = result.len
       result.add Cand(obj: o, piece: -1, face: -1, t: t, area: a.projectedArea(vi, lo, hi))
   if a.geometryVisible:
     var byPiece: Table[int32, int]
     let hittable = a.facePickable(vi, r)
-    for i, f in a.geo.faces:
+    # Only the faces of pieces whose bounds the ray goes through.
+    let hit = a.piecesHit(r)
+    var faces: seq[int]
+    for pc, h in hit:
+      if h: faces.add a.facesOfPiece(pc.int32)
+    faces.sort()   # as the faces come: the nearest wins ties as before
+    for i in faces:
+      let f = a.geo.faces[i]
       if f.verts.len < 3 or not hittable(i): continue
       let p0 = a.geo.points[f.verts[0]]
       var t = Inf.float32
@@ -181,25 +190,27 @@ proc candidates*(a: App, vi: int, mouse: Vec2): seq[Cand] =
       for k in 0 ..< result.len:
         lo[k] = vec3(Inf.float32)
         hi[k] = vec3(-Inf.float32)
-      for f in a.geo.faces:
-        if f.piece in byPiece:
-          let k = byPiece[f.piece]
-          for v in f.verts:
+      for pc, k in byPiece:
+        for fi in a.facesOfPiece(pc):
+          for v in a.geo.faces[fi].verts:
             lo[k] = min(lo[k], a.geo.points[v])
             hi[k] = max(hi[k], a.geo.points[v])
       for pc, k in byPiece: result[k].area = a.projectedArea(vi, lo[k], hi[k])
   for c in result.mitems: c.point = r.origin + r.dir * c.t
   result.sort(proc(x, y: Cand): int = cmp(x.t, y.t))
 
-proc pick*(a: App, vi: int, mouse: Vec2): Cand =
-  ## TrenchBroom's choice: the nearest thing in 3D; in 2D the thing with the
-  ## smallest area on the view plane, so occluded objects stay clickable.
-  let cs = a.candidates(vi, mouse)
+proc pickOf(a: App, vi: int, cs: seq[Cand]): Cand =
+  ## pick's choice among candidates cs.
   if cs.len == 0: return noCand()
   if a.is3D(vi): return cs[0]
   result = cs[0]
   for c in cs:
     if c.area < result.area - 0.01: result = c
+
+proc pick*(a: App, vi: int, mouse: Vec2): Cand =
+  ## TrenchBroom's choice: the nearest thing in 3D; in 2D the thing with the
+  ## smallest area on the view plane, so occluded objects stay clickable.
+  a.pickOf(vi, a.candidates(vi, mouse))
 
 proc faceUnder*(a: App, vi: int, mouse: Vec2): (int, Vec3) =
   ## Frontmost editable geometry face under the mouse (faces, not objects).
@@ -216,11 +227,26 @@ proc selectedUnder(a: App, vi: int, mouse: Vec2): Cand =
   ## What a drag moves: the picked thing if it's selected, else the nearest
   ## selected thing under the mouse, even behind or inside something else
   ## (TrenchBroom's move tool takes the first selected hit).
-  let p = a.pick(vi, mouse)
+  let cs = a.candidates(vi, mouse)
+  let p = a.pickOf(vi, cs)
   if p.found and a.isSelected(p): return p
-  for c in a.candidates(vi, mouse):
+  for c in cs:
     if a.isSelected(c): return c
   noCand()
+
+var hoverMemo: tuple[frame, view: int, mouse: Vec2, found: bool]
+
+proc hoveringSelection(a: App, vi: int): bool =
+  ## Whether the mouse is over something selected in view vi, for the
+  ## overlays (worked out once a frame: both ask). Not while the camera
+  ## moves: flying, orbiting or panning isn't hovering.
+  if a.drag.kind in {dkLook, dkOrbit, dkPan}: return false
+  let m = a.ui.mouse
+  if hoverMemo.frame == a.frameNo and hoverMemo.view == vi and hoverMemo.mouse == m:
+    return hoverMemo.found
+  let found = a.selectedUnder(vi, m).found
+  hoverMemo = (a.frameNo, vi, m, found)
+  found
 
 # --- selection helpers ------------------------------------------------------------------------
 
@@ -1047,6 +1073,54 @@ proc updatePreview(a: App) =
 
 const DupFlashTime = 0.5  ## Seconds the in-place duplicate flash takes to fade.
 
+type ObjLook = object
+  ## What the views draw of an object that comes from its data, not where it
+  ## is: kept between edits (see objLook), as TrenchBroom keeps its entity
+  ## renderers until something changes.
+  look: tuple[half: Vec3, lift: float32, col: array[4, uint8]]
+  hasModel: bool
+  model: ObjectModel
+  hasScreen: bool
+  screen, image: string
+  hasVolume: bool
+  volLo, volHi: Vec3
+
+var objLooks: Table[LevelObject, ObjLook]
+var objLookStamp: (int, int, int, int, pointer, bool)
+
+proc objLook(a: App, o: LevelObject): ObjLook =
+  ## o's ObjLook, worked out again after an edit (any undo step, undo, redo),
+  ## a new library, or for a selected object (a field being dragged may not
+  ## have made its step yet).
+  if not o.selected:
+    let cached = objLooks.getOrDefault(o)
+    if cached.look.col[3] != 0: return cached
+  result.look = o.look
+  if a.opts.models:
+    (result.hasModel, result.model) = o.objectModel
+    if o.tag == "CONS": (result.hasScreen, result.screen, result.image) = o.consoleScreen
+  (result.hasVolume, result.volLo, result.volHi) = o.volumeRange
+  if result.look.col[3] == 0: result.look.col[3] = 1   # 0 marks "not cached"
+  if not o.selected: objLooks[o] = result
+
+proc lookCorners(o: LevelObject, ol: ObjLook): array[8, Vec3] =
+  ## o.corners from its ObjLook.
+  if ol.hasModel:
+    let t = objectMatrix(o.pos, o.rot)
+    var i = 0
+    for x in [ol.model.lo.x, ol.model.hi.x]:
+      for y in [ol.model.lo.y, ol.model.hi.y]:
+        for z in [ol.model.lo.z, ol.model.hi.z]:
+          result[i] = t * vec3(x, y, z)
+          inc i
+    return
+  let l = ol.look
+  if o.tag == "PART":
+    let t = objectMatrix(o.pos, o.rot)
+    for i, k in boxCorners(vec3(0, l.lift, 0), l.half, 0): result[i] = t * k
+    return
+  boxCorners(o.pos + vec3(0, l.lift, 0), l.half, o.rot.y)
+
 proc buildOverlays*(a: App) =
   let r = a.rend
   r.lines.setLen 0
@@ -1061,13 +1135,19 @@ proc buildOverlays*(a: App) =
     let t = flash * flash
     for k in 0 .. 2: result[k] = uint8(c[k].float + (255 - c[k].float) * t)
     result[3] = uint8(c[3].float + (255 - c[3].float) * t)
-  if modelsChanged(): r.clearModels()
+  let fresh = modelsChanged()
+  if fresh: r.clearModels()
+  let stamp = (a.pushCount, a.undoStack.len, a.redoStack.len, a.objects.len, cast[pointer](a.proj), a.opts.models)
+  if fresh or stamp != objLookStamp:
+    objLooks.clear()
+    objLookStamp = stamp
   for o in a.objects:
     if not a.visible(o): continue
-    let l = o.look
-    let k = o.corners
+    let ol = a.objLook(o)
+    let l = ol.look
+    let k = o.lookCorners(ol)
     # Objects with a model show it inside a plain box, like TrenchBroom.
-    let (hasModel, model) = if a.opts.models: o.objectModel else: (false, ObjectModel())
+    let (hasModel, model) = (ol.hasModel, ol.model)
     if hasModel:
       let t = objectMatrix(o.pos, o.rot)
       for part in model.parts:
@@ -1077,7 +1157,7 @@ proc buildOverlays*(a: App) =
           wire: (if o.selected: sel(rgba(255, 110, 110, 200)) else: [l.col[0], l.col[1], l.col[2], 120'u8]))
     if a.opts.models and o.tag == "CONS":
       # The screen, showing the texture of the console's starting state.
-      let (hasScreen, screen, image) = o.consoleScreen
+      let (hasScreen, screen, image) = (ol.hasScreen, ol.screen, ol.image)
       if hasScreen:
         r.modelInstances.add ModelInstance(path: screen, base: libraryDir(), image: image,
           transform: cast[M4](objectMatrix(o.pos, o.rot)),
@@ -1129,24 +1209,28 @@ proc buildOverlays*(a: App) =
       for (path, alpha) in [("OSD/Sphere/MinRadius", 200'u8), ("OSD/Sphere/MaxRadius", 110'u8)]:
         let radius = try: parseFloat(o.node.xpath(path).str.strip) * 3 except ValueError: 0.0
         if radius > 0: r.overlayLines.wireSphere(o.pos, radius.float32, [l.col[0], l.col[1], l.col[2], alpha])
-    let (has, lo, hi) = o.volumeRange
+    let (has, lo, hi) = (ol.hasVolume, ol.volLo, ol.volHi)
     if has and (o.selected or o.tag == "TRGV"):
       let kk = o.volumeCorners(lo, hi)
       if o.selected: r.overlayLines.wireBox(kk, sel(rgba(255, 70, 70)))
       else: r.lines.wireBox(kk, [l.col[0], l.col[1], l.col[2], 110'u8])
     if o.selected and a.geo != nil and o.objectCode != -1:
-      for fi in a.geo.objectFaces(o.objectCode):
+      for fi in a.ownedFaces(o):
         r.tris.faceFill(a.geo, a.geo.faces[fi], rgba(255, 60, 60, 60))
   if a.geo != nil:
     # The clip tool draws the selection as it would be after the cut instead.
     let clipping = a.tool == toolClip and a.clipPlane[0]
-    for i, f in a.geo.faces:
-      if f.piece in a.selPieces:
-        if clipping: continue
-        r.tris.faceFill(a.geo, f, rgba(255, 60, 60, 60))
-        r.overlayLines.faceOutline(a.geo, f, sel(rgba(255, 70, 70)))
-      elif i in a.selFaces:
-        if clipping: continue
+    # Only the selected pieces' and faces' (a level has tens of thousands).
+    if not clipping and (a.selPieces.len > 0 or a.selFaces.len > 0):
+      for p in a.selPieces:
+        for i in a.facesOfPiece(p):
+          let f = a.geo.faces[i]
+          r.tris.faceFill(a.geo, f, rgba(255, 60, 60, 60))
+          r.overlayLines.faceOutline(a.geo, f, sel(rgba(255, 70, 70)))
+      for i in a.selFaces:
+        if i notin 0 ..< a.geo.faces.len: continue
+        let f = a.geo.faces[i]
+        if f.piece in a.selPieces: continue
         r.tris.faceFill(a.geo, f, rgba(255, 60, 60, 110))
         r.overlayLines.faceOutline(a.geo, f, sel(rgba(255, 110, 110)))
     for fi in a.extrudeHoverFaces:
@@ -1171,7 +1255,7 @@ proc buildOverlays*(a: App) =
   let (sok, slo, shi) = a.selectionBounds
   let guide = sok and (a.drag.kind in {dkMove, dkHandles, dkScale, dkGizmo} or
               (a.hoverView >= 0 and a.is3D(a.hoverView) and
-               a.selectedUnder(a.hoverView, a.ui.mouse).found))
+               a.hoveringSelection(a.hoverView)))
   if guide:
     let c = (slo + shi) / 2
     r.lines.wireBox(boxCorners(c, (shi - slo) / 2, 0), rgba(255, 60, 60, 160))
@@ -1394,11 +1478,34 @@ proc setViewKind*(a: App, vi: int, next: ViewKind)
 proc canAddClipPoint(a: App, p: Vec3): bool
 proc clipPointNear(a: App, vi: int, m: Vec2): int
 
+proc realtimeWaits*(a: App): string =
+  ## What Realtime preview can't start without yet, as "Reading level 0's
+  ## sounds (3/7)": its sounds and particles while they load ("" = nothing).
+  ## The queue first: every view header asks every frame, and the caches'
+  ## checks look at files.
+  if (ppSounds in a.previewParts or ppMusic in a.previewParts) and a.loading("sounds") and
+     not hasSoundCache():
+    return a.loadingText("sounds")
+  if ppParticles in a.previewParts and a.loading("particles") and not hasParticleCache():
+    return a.loadingText("particles")
+
+proc switchRealtime*(a: App) =
+  ## Turns Realtime preview on or off; not on while what it plays still loads.
+  if not a.realtime and a.realtimeWaits.len > 0:
+    a.say("Realtime preview starts once this is done: " & a.realtimeWaits)
+    return
+  a.toggleRealtime()
+
 proc headerButton(a: App, r: Rect, icon: string, on: bool, tip: string, alt = false,
-                  outline = false): bool =
+                  outline = false, disabled = false): bool =
   ## A toggle in a view's header. alt outlines it in the accent color: the
   ## button's alternate mode is the one shown; outline draws a plain one.
+  ## disabled: greyed out, with the tip saying why.
   let ui = a.ui
+  if disabled:
+    ui.icon(icon & "32", r.xy + r.wh / 2, colTextDisabled)
+    ui.tip(r, tip)
+    return false
   let hov = ui.hover(r)
   if on: ui.roundedRect(r, colAccentDim, 2)
   elif hov: ui.roundedRect(r, colHover, 2)
@@ -1444,12 +1551,16 @@ proc drawViewHeader(a: App, vi: int, h: Rect, hot: bool) =
     x += 10
   # Right click: what it plays.
   let rt = next()
+  let waits = if a.realtime: "" else: a.realtimeWaits
   let clicked = a.headerButton(rt, "gamepad", a.realtime,
-                    "Realtime preview: animated vertex lighting plays, Sound objects can be heard " &
-                    "from the 3D camera and the level music plays. Right click to choose which")
+                    if waits.len > 0: "Realtime preview: still loading. " & waits &
+                                      ". Right click to choose what it plays"
+                    else: "Realtime preview: animated vertex lighting plays, Sound objects can be heard " &
+                          "from the 3D camera and the level music plays. Right click to choose which",
+                    disabled = waits.len > 0)
   a.partsOutline(rt, a.realtime, a.previewParts == {PreviewPart.low .. PreviewPart.high})
   if clicked:
-    if a.proj != nil: a.toggleRealtime()
+    if a.proj != nil: a.switchRealtime()
   elif ui.hover(rt) and ui.pressed(MouseRight):
     a.ctx = CtxMenu(pos: ui.mouse, view: -1, face: -1, realtime: true)
     a.menuSys.openContext(ui.mouse)
@@ -1491,6 +1602,54 @@ proc drawViewHeader(a: App, vi: int, h: Rect, hot: bool) =
       a.opts.mode = if mode == m: alt elif mode == alt: m else: m
   ui.popClip()
 
+const
+  NotesRange = 600'f32          ## How far an object's Notes show in the 3D view...
+  NotesRangeHidden = 120'f32    ## ...and how far when a surface is in front of them.
+  NotesMax = 48                 ## Most notes drawn at once (the nearest).
+
+proc drawNotes(a: App, vi: int) =
+  ## Objects' Notes floating over them in the 3D view, nearest on top.
+  let ui = a.ui
+  let v = a.views[vi]
+  let b = v.viewBody
+  let eye = v.cam.pos
+  var near: seq[(float32, LevelObject, Vec3)]
+  for o in a.objects:
+    if not a.visible(o): continue
+    let dist = (o.pos - eye).length
+    if dist > NotesRange: continue
+    let n = o.node.xpath("OSD/Notes")
+    if n == nil or n.str.strip.len == 0: continue
+    let (lo, hi) = o.pickBox
+    let at = vec3((lo.x + hi.x) / 2, hi.y + 2, (lo.z + hi.z) / 2)
+    near.add ((at - eye).length, o, at)
+  near.sort(proc(x, y: (float32, LevelObject, Vec3)): int = cmp(x[0], y[0]))
+  var shown: seq[(float32, LevelObject, Vec2, float32)]
+  for (dist, o, at) in near:
+    if shown.len >= NotesMax: break
+    let (ok, p) = a.toScreen(vi, at)
+    if not ok or not p.inside(b): continue
+    let limit = if a.hiddenFrom(at, eye, o.objectCode): NotesRangeHidden else: NotesRange
+    if dist > limit: continue
+    # Fade out over the last fifth of the range.
+    let fade = min(max((limit - dist) / (limit * 0.2'f32), 0'f32), 1'f32).float32
+    shown.add (dist, o, p, fade)
+  for k in countdown(shown.high, 0):
+    let (_, o, p, fade) = shown[k]
+    let text = o.node.xpath("OSD/Notes").str.strip.splitLines.join(" ")
+    let lines = ui.wrapText(text, 220, 4, FontSmall)
+    if lines.len == 0: continue
+    let lh = ui.textSize("Ag", FontSmall).y
+    var w = 0'f32
+    for l in lines: w = max(w, ui.textSize(l, FontSmall).x)
+    let sz = vec2(w + 12, lh * lines.len.float32 + 6)
+    let r = rect(floor(p.x - sz.x / 2), floor(p.y - sz.y - 6), sz.x, sz.y)
+    let al = (fade * 255).int
+    ui.roundedRect(r, pm(30, 28, 18, (fade * 215).int), 4)
+    ui.uiLine(vec2(p.x, r.y + r.h), p, pm(255, 220, 120, al div 2), 1)
+    for j, l in lines:
+      ui.text(l, vec2(r.x + 6, r.y + 3 + lh * j.float32), pm(255, 236, 170, al), FontSmall)
+
 proc drawViewOverlays*(a: App) =
   ## View headers, handles, labels and the lasso (drawn by the UI layer).
   let ui = a.ui
@@ -1524,7 +1683,7 @@ proc drawViewOverlays*(a: App) =
     # Size of the selection: always in 2D, in 3D while hovering it or dragging.
     if sok and a.tool notin {toolVertex, toolEdge, toolFace} and
        (not is3D or a.drag.kind in {dkMove, dkScale, dkGizmo} or
-        (hot and a.selectedUnder(i, ui.mouse).found)):
+        (hot and a.hoveringSelection(i))):
       a.sizeLabels(i, slo, shi)
     # Handles of the vertex/edge/face tools.
     if a.tool in {toolVertex, toolEdge, toolFace}:
@@ -1693,6 +1852,8 @@ proc drawViewOverlays*(a: App) =
         if ok and p.inside(b): ui.text(o.label, p + vec2(8, -18), colText, FontSmall)
         inc n
         if n > 300: break
+    else:
+      a.drawNotes(i)
     ui.popClip()
   if a.drag.kind in {dkBox, dkSelRect}:
     let v = a.views[a.drag.view]

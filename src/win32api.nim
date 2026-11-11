@@ -16,7 +16,6 @@ const
   WS_EX_NOACTIVATE* = 0x08000000'i32
   WM_DROPFILES* = 0x0233'u32
   WM_MOUSEACTIVATE* = 0x0021'u32
-  WM_CAPTURECHANGED* = 0x0215'u32
   MA_NOACTIVATE* = 3
   WMSZ_LEFT* = 1
   WMSZ_RIGHT* = 2
@@ -52,7 +51,6 @@ proc MonitorFromPoint*(pt: POINT, dwFlags: int32): HMONITOR {.stdcall, dynlib: "
 proc MoveWindow*(hWnd: HWND, x, y, w, h: int32, repaint: BOOL): BOOL {.stdcall, dynlib: "user32", importc.}
 proc AdjustWindowRectEx*(r: ptr RECT, style: LONG, menu: BOOL, exStyle: LONG): BOOL {.stdcall, dynlib: "user32", importc.}
 proc CreateSolidBrush*(color: int32): HBRUSH {.stdcall, dynlib: "gdi32", importc.}
-proc GetCapture*(): HWND {.stdcall, dynlib: "user32", importc.}
 proc ValidateRect*(hWnd: HWND, r: ptr RECT): BOOL {.stdcall, dynlib: "user32", importc.}
 
 proc DwmSetWindowAttribute*(hWnd: HWND, attr: int32, value: pointer, size: int32): HRESULT {.stdcall, dynlib: "dwmapi", importc.}

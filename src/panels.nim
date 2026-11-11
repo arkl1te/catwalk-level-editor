@@ -540,14 +540,25 @@ proc panelItems(a: App): seq[MenuItem] =
 proc recentItem(a: App, dir, label: string): MenuItem =
   item(label, "", not a.busy, action = proc() = a.whenSaved(proc() = a.openProjectDir(dir)))
 
+var recentChecked: tuple[at: float, list, dirs: seq[string], limit: int]
+
 proc recentItems(a: App): seq[MenuItem] =
   ## File > Open Recent: the last opened projects that still exist, then Clear
   ## Recent (TrenchBroom's recent documents menu). Folder names that repeat
   ## show the whole path.
-  var dirs: seq[string]
-  for d in a.cfg.recentProjects:
-    if dirs.len >= a.cfg.recentLimit: break
-    if d.isProject: dirs.add d
+  # The menus are built every frame: which still exist is looked up on disk
+  # every two seconds, or when the list changes.
+  let now = epochTime()
+  if now - recentChecked.at > 2 or recentChecked.list != a.cfg.recentProjects or
+     recentChecked.limit != a.cfg.recentLimit:
+    recentChecked.dirs.setLen 0
+    for d in a.cfg.recentProjects:
+      if recentChecked.dirs.len >= a.cfg.recentLimit: break
+      if d.isProject: recentChecked.dirs.add d
+    recentChecked.at = now
+    recentChecked.list = a.cfg.recentProjects
+    recentChecked.limit = a.cfg.recentLimit
+  let dirs = recentChecked.dirs
   for d in dirs:
     let name = d.lastPathPart
     var dup = false
@@ -693,7 +704,9 @@ proc menus*(a: App): seq[(string, seq[MenuItem])] =
       sep()] & gridSizes),
     subMenu("Render", renderModes & @[
       sep(),
-      item("Realtime preview", "", hasProj, a.realtime, action = proc() = a.toggleRealtime()),
+      item(if not a.realtime and a.realtimeWaits.len > 0: "Realtime preview (loading)" else: "Realtime preview",
+           "", hasProj and (a.realtime or a.realtimeWaits.len == 0), a.realtime,
+           action = proc() = a.switchRealtime()),
       item("Gizmos", "", hasProj, a.showGizmos, action = proc() = a.showGizmos = not a.showGizmos),
       sep(),
       item("Invisible faces", "", true, a.opts.invisible, action = proc() =
@@ -980,10 +993,104 @@ proc startJob*(a: App, j: Job, onDone: proc() = nil) =
   a.jobDone = onDone
   a.say j.title & "..."
 
+proc startLoad*(a: App, key, title: string, make: proc(): Job, onDone: proc() = nil) =
+  ## Queues a cache to make in the background (see Load): make runs when its
+  ## turn comes. Queued already under key: onDone joins it.
+  for l in a.loads:
+    if l.key == key:
+      if onDone != nil: l.done.add onDone
+      return
+  let l = Load(key: key, title: title, make: make)
+  if onDone != nil: l.done.add onDone
+  a.loads.add l
+
+proc pollLoads*(a: App) =
+  ## Advances the first load. While a job the user started runs (a new
+  ## project's textures, Build) loads wait, so that it has the machine: none
+  ## starts, and one under way starts nothing more (its running commands end).
+  if a.loads.len == 0 or a.busy: return
+  let l = a.loads[0]
+  if l.job == nil:
+    try: l.job = l.make()
+    except CatchableError as e:
+      a.loads.delete(0)
+      a.say(l.title & ": " & e.msg, true)
+      return
+    if l.job == nil:   # Nothing to do any more.
+      a.loads.delete(0)
+      return
+    a.say l.title & "..."
+  l.job.poll()
+  case l.job.state
+  of jsRunning: discard
+  of jsDone:
+    a.loads.delete(0)
+    let lines = a.log.len + a.logDropped
+    for d in l.done: d()
+    if a.log.len + a.logDropped == lines:
+      a.say &"{l.title}: done in {max(1, int(epochTime() - l.job.started + 0.5))} s"
+  of jsFailed:
+    a.loads.delete(0)
+    a.buildAfterLoad = 0   # Build, if it waited for this, will say what's missing.
+    a.say(l.title & ": " & l.job.error, true)
+    for line in l.job.logTail(8).splitLines: a.say("  " & line, true)
+    a.showPanel(pkConsole)
+
+proc progressBar(a: App, r: Rect, frac: float32) =
+  a.ui.rect(r, colTrack)
+  a.ui.rect(rect(r.x, r.y, r.w * clamp(frac, 0.03, 1), r.h), colAccent)
+
+proc jobCount(j: Job): string =
+  let (done, all) = j.progressCount
+  &"({done}/{all})"
+
+proc loadProgress(l: Load): float32 = (if l.job == nil: 0'f32 else: l.job.progress)
+
+proc loadingBar(a: App, r: Rect, key: string) =
+  ## A load's progress in the middle of r: a bar, and "what (done/all)" under it.
+  let ui = a.ui
+  for l in a.loads:
+    if l.key != key: continue
+    let w = min(260'f32, r.w - 32)
+    let bar = rect(r.x + (r.w - w) / 2, r.y + r.h / 2 - 14, w, 8)
+    a.progressBar(bar, l.loadProgress)
+    ui.textIn(ui.ellipsize(l.loadState, r.w - 16, FontSmall), rect(r.x, bar.y + 12, r.w, 20), colTextDim,
+              FontSmall, h = CenterAlign)
+    return
+
+proc libraryLoading*(a: App): Load =
+  ## The library build or the levels being added to it, if either is queued.
+  for l in a.loads:
+    if l.key == "library" or l.key.startsWith("library "): return l
+
+proc buildWaits(a: App): Load =
+  ## A load Build reads from, if one is under way: the library's door files
+  ## (when the level has doors), level 0's skies and recordings.
+  let p = a.proj
+  if p == nil: return
+  let lib = a.libraryLoading
+  if lib != nil and a.objects.anyIt(it.tag == "DOOR"): return lib
+  for l in a.loads:
+    if l.key == "sky" and p.sky.len > 0: return l
+    if l.key == "sounds" and not hasSoundCache(): return l
+
 proc build*(a: App, play: bool) =
   if a.proj == nil or a.busy: return
   if a.proj.preview:
     a.say("A preview can't be built or played: save it as a project first (File > Save As...)", true)
+    return
+  let waits = a.buildWaits
+  if waits != nil:
+    # Starts by itself once that's made (if the level is still open).
+    let app = a
+    let p = a.proj
+    if a.buildAfterLoad == 0:
+      waits.done.add proc() =
+        let again = app.buildAfterLoad
+        app.buildAfterLoad = 0
+        if app.proj == p and not app.busy: app.build(play = again == 2)
+    a.buildAfterLoad = if play: 2 else: 1
+    a.say((if play: "Play" else: "Build") & " starts once this is done: " & waits.loadState)
     return
   a.saveProject()
   var then: seq[Step]
@@ -1172,41 +1279,88 @@ proc convertSky(a: App, file: string, kind: SkySource, use: bool) =
       app.say("Converted the picture to " & sky & ": pick it under Sky in Properties")))
 
 proc extractCollections*(a: App, levels: seq[int]) =
+  ## Extracts the levels' textures; with the entity library built, their
+  ## classes join it in the same job (one export of each level for both).
   if a.busy:
     a.say("Busy: enable the collection once the current job ends", true)
     return
   let app = a
-  a.startJob(levelTexturesJob(a.cfg, levels, a.proj.buildDir / "textures.log"), proc() = app.refreshCollections())
+  if a.libraryLoading == nil and libraryBuilt() and not libraryBusyElsewhere():
+    a.startJob(addLevelsJob(a.cfg, levels, libraryDir().parentDir / "library.log", proc() = discard), proc() =
+      app.refreshCollections()
+      app.loadPresets())
+  else:
+    a.startJob(levelTexturesJob(a.cfg, levels, a.proj.buildDir / "textures.log"), proc() = app.refreshCollections())
+    if a.libraryLoading != nil:
+      # The library is being made: the levels' classes join it after, from
+      # these textures (unless it started late enough to take them itself).
+      a.startLoad("library " & levels.join(" "), "Adding levels to the entity library", proc(): Job =
+        if not libraryBuilt() or libraryBusyElsewhere(): return nil
+        let missing = levels.filterIt(it notin libraryLevels())
+        if missing.len == 0: return nil
+        addLevelsJob(app.cfg, missing, libraryDir().parentDir / "library.log", proc() = discard),
+        proc() = app.loadPresets())
 
 proc buildLibrary*(a: App) =
-  if a.busy: return
-  try:
-    let log = libraryDir().parentDir / "library.log"
-    a.startJob(libraryJob(a.cfg, log, proc() = discard), proc() =
-      a.loadPresets()
-      a.say "Built the entity library: " & libraryDir())
-  except CatchableError as e:
-    a.say(e.msg, true)
+  ## Makes the entity library in the background (see Load).
+  if a.loading("library"): return
+  let app = a
+  a.startLoad("library", "Building the entity library", proc(): Job =
+      libraryJob(app.cfg, libraryDir().parentDir / "library.log", proc() = discard),
+    proc() =
+      app.loadPresets()
+      app.say "Built the entity library: " & libraryDir())
 
 proc autoBuildPreviews*(a: App) =
   ## The entity browser's tiles and the views' entity models come from the
   ## library build: when they're shown and missing or from an older version,
   ## rebuild once, unasked, whichever panel is open.
-  let wanted = a.entityPreview > 0 or (a.opts.models and a.proj != nil)
-  if wanted and not hasPreviews() and not a.busy and not a.previewAutoBuild and
-     not libraryBusyElsewhere():
+  let wanted = a.entityPreview > 0 or a.opts.models
+  if a.proj != nil and wanted and not hasPreviews() and not a.loading("library") and
+     not a.previewAutoBuild and not libraryBusyElsewhere():
     a.previewAutoBuild = true
-    a.say "Rendering entity previews and models (about 30 s)"
+    a.say "Building the entity library: level 0 and level 1 (more levels join it with their Texture Collections)"
     a.buildLibrary()
 
 proc autoExtractSky*(a: App) =
   ## The 3D view's skybox needs level 0's sky images: extract them once,
   ## unasked, when a project with a sky is open.
   if a.opts.sky and a.proj != nil and a.proj.sky.len > 0 and not hasSkyCache() and
-     not a.busy and not a.skyAutoBuild:
+     not a.skyAutoBuild:
     a.skyAutoBuild = true
-    try: a.startJob(skyCacheJob(a.cfg, skyDir().parentDir / "sky.log"), proc() = discard)
-    except CatchableError as e: a.say(e.msg, true)
+    let c = a.cfg
+    a.startLoad("sky", "Reading level 0's skies", proc(): Job =
+      skyCacheJob(c, skyDir().parentDir / "sky.log"))
+
+proc loadSounds(a: App, then: proc() = nil) =
+  ## Level 0's sounds, extracted in the background; then runs after.
+  let c = a.cfg
+  a.startLoad("sounds", "Reading level 0's sounds", proc(): Job =
+    soundCacheJob(c, soundDir().parentDir / "sounds.log"), then)
+
+proc loadParticles(a: App, then: proc() = nil) =
+  a.particleAutoBuild = true
+  let c = a.cfg
+  a.startLoad("particles", "Reading level 0's particles", proc(): Job =
+    particleCacheJob(c, particleDir() / "particles.log"), then)
+
+var autoLoadAt: float
+
+proc autoLoad*(a: App) =
+  ## Once a level is open (its textures and geometry come first), what the
+  ## views and panels show of the game is made in the background while the
+  ## user works: entity models, skies, then what Realtime preview plays.
+  ## Twice a second: the checks look at files.
+  if a.proj == nil: return
+  let now = epochTime()
+  if now - autoLoadAt < 0.5: return
+  autoLoadAt = now
+  a.autoBuildPreviews()
+  a.autoExtractSky()
+  if not hasParticleCache() and not a.particleAutoBuild: a.loadParticles()
+  if not hasSoundCache() and not a.soundAutoBuild:
+    a.soundAutoBuild = true
+    a.loadSounds()
 
 proc issuesFromJob(a: App): seq[string] {.discardable.} =
   ## Moves the job's "info:", "warning:" and "error:" lines into the Issues
@@ -1240,10 +1394,16 @@ proc pollJob*(a: App) =
   of jsRunning: discard
   of jsDone:
     a.issuesFromJob()
+    let j = a.job
     let done = a.jobDone
     a.job = nil
     a.jobDone = nil
+    let lines = a.log.len + a.logDropped
     if done != nil: done()
+    # Jobs that say nothing when done (the caches made unasked) still end in
+    # the Console, else their "..." line looks like they never finished.
+    if a.log.len + a.logDropped == lines:
+      a.say &"{j.title}: done in {max(1, int(epochTime() - j.started + 0.5))} s"
   of jsFailed:
     let shown = a.issuesFromJob()
     a.say(a.job.error, true)
@@ -1339,6 +1499,47 @@ proc parseVec(s: string): (bool, Vec3) =
   try: (true, vec3(evalMath(parts[0]), evalMath(parts[1]), evalMath(parts[2])))
   except CatchableError: (false, vec3(0, 0, 0))
 
+const
+  LayoutButtonW = 30'f32
+  LayoutButtonsW = 4 * (LayoutButtonW + 4) + 6   ## The four buttons and the gap before View options.
+
+proc layoutCells(layout: PaneLayout, r: Rect): seq[Rect] =
+  ## The panes of layout drawn small inside r, in view order (as layoutViews
+  ## places them), with a 2 px gap between them.
+  let lw = floor(r.w * 0.55)
+  let th = floor(r.h * 0.5)
+  case layout
+  of pl1: @[r]
+  of pl2: @[rect(r.x, r.y, lw - 1, r.h), rect(r.x + lw + 1, r.y, r.w - lw - 1, r.h)]
+  of pl3: @[rect(r.x, r.y, lw - 1, r.h), rect(r.x + lw + 1, r.y, r.w - lw - 1, th - 1),
+            rect(r.x + lw + 1, r.y + th + 1, r.w - lw - 1, r.h - th - 1)]
+  of pl4: @[rect(r.x, r.y, lw - 1, th - 1), rect(r.x + lw + 1, r.y, r.w - lw - 1, th - 1),
+            rect(r.x, r.y + th + 1, lw - 1, r.h - th - 1),
+            rect(r.x + lw + 1, r.y + th + 1, r.w - lw - 1, r.h - th - 1)]
+
+proc layoutButtons(a: App, x0, y: float32) =
+  ## One, two, three and four panes: each a small drawing of its panes as
+  ## hollow rectangles, the one holding the 3D view filled.
+  let ui = a.ui
+  var x = x0
+  for l in PaneLayout:
+    let r = rect(x, y, LayoutButtonW, 24)
+    x += LayoutButtonW + 4
+    let on = a.layout == l and a.maximized < 0
+    let hov = ui.hover(r)
+    if on: ui.roundedRect(r, colAccentDim, 2)
+    elif hov: ui.roundedRect(r, colHover, 2)
+    let col = if on or hov: colWhite else: colTextDim
+    let icon = rect(r.x + 6, r.y + 5, r.w - 12, r.h - 10)
+    for i, c in layoutCells(l, icon):
+      if a.views[i].cam.kind == vk3D: ui.rect(c, col)
+      else: ui.border(c, col)
+    ui.tip(r, $l)
+    if hov and ui.pressed():
+      ui.consumeClick()
+      a.layout = l
+      a.maximized = -1
+
 proc drawToolOptions*(a: App, r: Rect) =
   ## The strip above the views: settings for the current tool (TrenchBroom's
   ## info bar) and the view options on the right.
@@ -1358,7 +1559,7 @@ proc drawToolOptions*(a: App, r: Rect) =
     x += 6
     ui.rect(rect(x, y + 5, 1, 14), colSeparator)
     x += 13
-  ui.pushClip(rect(r.x, r.y, r.w - 140, r.h))
+  ui.pushClip(rect(r.x, r.y, r.w - 140 - LayoutButtonsW, r.h))
   case a.tool
   of toolSelect:
     label "Shape"
@@ -1441,6 +1642,7 @@ proc drawToolOptions*(a: App, r: Rect) =
   ui.popClip()
   # View options, right-aligned (after the tool's controls in the Tab order).
   let vr = rect(r.x + r.w - 134, y, 126, 24)
+  a.layoutButtons(vr.x - LayoutButtonsW, y)
   # The render modes first, then the toggles.
   let toggles = [("Marker faces", a.opts.markers),
                  ("AI rooms", a.opts.rooms), ("Entity models", a.opts.models),
@@ -1462,7 +1664,7 @@ proc drawToolOptions*(a: App, r: Rect) =
   of 4: a.showDirections = not a.showDirections
   of 5: a.showGrid = not a.showGrid
   of 6: a.opts.sky = not a.opts.sky
-  of 7: a.toggleRealtime()
+  of 7: a.switchRealtime()
   of 8: a.showGizmos = not a.showGizmos
   of 9:
     a.opts.invisible = not a.opts.invisible
@@ -1571,11 +1773,9 @@ proc withSounds(a: App, what: string, play: proc()) =
   ## Runs play now, or once level 0's sounds are extracted (the first preview).
   if hasSoundCache():
     play()
-  elif a.busy:
-    a.say("Wait for the current job to finish, then preview the " & what & " again", true)
   else:
-    try: a.startJob(soundCacheJob(a.cfg, soundDir().parentDir / "sounds.log"), play)
-    except CatchableError as e: a.say(e.msg, true)
+    if not a.loading("sounds"): a.say("Level 0's sounds are read first: the " & what & " plays after")
+    a.loadSounds(play)
 
 proc previewMusic(a: App, realtime = false) =
   ## Plays the project's track (realtime: as Realtime preview's level music).
@@ -1645,7 +1845,7 @@ proc updateRealtime*(a: App) =
   if not sounds and music.len == 0: return
   if not hasSoundCache():
     # The first time, level 0's sounds are extracted (then this picks them up).
-    if a.sceneKey != "extracting" and not a.busy:
+    if a.sceneKey != "extracting":
       a.sceneKey = "extracting"
       a.withSounds("realtime sounds", proc() = discard)
     return
@@ -1690,10 +1890,7 @@ proc updateParticles*(a: App) =
     return
   if not hasParticleCache():
     # The first time, level 0's particle classes are extracted.
-    if not a.particleAutoBuild and not a.busy:
-      a.particleAutoBuild = true
-      try: a.startJob(particleCacheJob(a.cfg, particleDir() / "particles.log"), proc() = discard)
-      except CatchableError as e: a.say(e.msg, true)
+    if not a.particleAutoBuild: a.loadParticles()
     return
   let now = epochTime()
   if a.particleSim == nil:
@@ -3458,14 +3655,15 @@ proc drawObjectsPage(a: App, r: Rect) =
       y += 30
     var p = o.pos
     var rr = o.rot
-    let objBefore = @[o.snapshot]
-    let linked = a.hasGeometry(o)
-    let geoBefore = if linked: a.geo.clone else: nil
     let posChanged = matchesFilter(a.fieldFilter, "Position", "") and
                      vecRow("Position", p, a.grid.float, false)
     let rotChanged = matchesFilter(a.fieldFilter, "Rotation", "") and
                      vecRow("Rotation", rr, 15, true)
     if posChanged or rotChanged:
+      # Taken only now (o and the geometry haven't changed yet): a level's
+      # geometry is too big to copy every frame.
+      let objBefore = @[o.snapshot]
+      let geoBefore = if a.hasGeometry(o): a.geo.clone else: nil
       a.setPose(o, p, rr)
       a.push editCmd(if posChanged: "Move" else: "Rotate", @[o], objBefore, geoBefore, a.geo)
     # Key / value table.
@@ -3575,10 +3773,11 @@ proc drawEntityBrowser(a: App, br: Rect) =
   ## Presets in collapsible groups: drag one into a view, or click to place it.
   let ui = a.ui
   let tiles = a.entityPreview > 0
-  if tiles and not a.busy and hasPreviews() and not a.presetsCurrent: a.loadPresets()
-  let rendering = tiles and not hasPreviews() and (a.busy or libraryBusyElsewhere())
+  if tiles and a.libraryLoading == nil and not a.presetsCurrent and hasPreviews(): a.loadPresets()
+  let lib = a.libraryLoading
+  let rendering = tiles and not hasPreviews() and libraryBusyElsewhere()
   ui.sectionTitle(rect(br.x, br.y, br.w, 26),
-    if rendering: "Rendering model previews..."
+    if rendering: "Another Catwalk is building the entity library..."
     else: "Drag into a view, or click to place")
   const SliderW = 84'f32
   discard ui.textField("entity.filter", rect(br.x + 8, br.y + 32, br.w - SliderW - 28, 26), a.entityFilter, "Search...")
@@ -3586,7 +3785,14 @@ proc drawEntityBrowser(a: App, br: Rect) =
   let sr = rect(br.x + br.w - SliderW - 12, br.y + 32, SliderW, 26)
   discard ui.slider("entity.preview", sr, a.entityPreview, 0, 1, 0.125)
   ui.tip(sr, "Preview size")
-  let list = rect(br.x, br.y + 64, br.w, br.h - 64)
+  # The library on its way: its furniture, consoles, doors, triggers and previews.
+  var top = br.y + 64
+  if lib != nil:
+    a.progressBar(rect(br.x + 10, top + 2, br.w - 20, 6), lib.loadProgress)
+    ui.textIn(ui.ellipsize(lib.loadState, br.w - 20, FontSmall), rect(br.x + 10, top + 10, br.w - 20, 18),
+              colTextDim, FontSmall)
+    top += 32
+  let list = rect(br.x, top, br.w, br.y + br.h - top)
   let filter = a.entityFilter.strip.toLowerAscii
   var groups: seq[string]
   var members: Table[string, seq[int]]
@@ -3718,9 +3924,11 @@ proc drawEntityBrowser(a: App, br: Rect) =
     let label = if not hasLibrary(): "Build furniture, consoles, doors and triggers"
                 elif not hasPreviews(): "Rebuild the entity library for model previews"
                 else: "Rebuild the entity library"
-    if ui.textButton("entity.library", lb, label, primary = not hasLibrary()) and not a.busy:
+    if ui.textButton("entity.library", lb, label, primary = not hasLibrary()) and lib == nil:
       a.buildLibrary()
-    ui.tip(lb, "Takes them, with their geometry and textures, from the game's levels (about 30 s)")
+    ui.tip(lb, if lib != nil: "Under way: " & lib.loadState
+               else: "Takes them, with their geometry and textures, from levels 0 and 1 and the levels " &
+                     "of the Texture Collections you use, in the background (about 15 s)")
   else:
     discard ui.tabStop("entity.library", lb)  # Out of sight: Tab still gets there.
   discard ui.listNav("entity.list", list, navItems, a.entityCursor)
@@ -3742,14 +3950,13 @@ proc drawEntityBrowser(a: App, br: Rect) =
   if wanted.len > 0: a.loadPreviews(wanted)
 
 proc readClasses(a: App) =
-  if a.busy: return
   a.classAutoBuild = true
-  try:
-    a.startJob(classCacheJob(a.cfg, classCacheDir().parentDir / "classes.log"), proc() =
-      a.classList = classNames()
-      a.say &"Read {a.classList.len} character classes from level 0")
-  except CatchableError as e:
-    a.say(e.msg, true)
+  let app = a
+  a.startLoad("classes", "Reading level 0's character classes", proc(): Job =
+      classCacheJob(app.cfg, classCacheDir().parentDir / "classes.log"),
+    proc() =
+      app.classList = classNames()
+      app.say &"Read {app.classList.len} character classes from level 0")
 
 proc classLabel(name: string): string =
   ## A class's name as shown (classes.nim).
@@ -4182,7 +4389,7 @@ proc drawClassFields(a: App, o: LevelObject, props: Rect) =
       a.previewParts.incl ppParticles
       if a.particleSim != nil: a.particleSim.held.clear()
       if a.realtime: a.particleRestart = true
-      else: a.toggleRealtime()
+      else: a.switchRealtime()
     ui.tip(pb, "Runs the level's Particle objects from the start in the 3D views, with these values. " &
                "Edits show as you make them. Particles that wait for a script don't start here.")
     let nr = rect(x + 158, y, w - 158, 26)
@@ -4515,14 +4722,10 @@ proc drawClassFields(a: App, o: LevelObject, props: Rect) =
   ui.scrollbar("class.fields", list, a.classScroll, contentH + 20)
 
 proc readParticles(a: App) =
-  if a.busy: return
-  a.particleAutoBuild = true
-  try:
-    a.startJob(particleCacheJob(a.cfg, particleDir() / "particles.log"), proc() =
-      a.particleClasses = particleNames()
-      a.say &"Read {a.particleClasses.len} particle classes from level 0")
-  except CatchableError as e:
-    a.say(e.msg, true)
+  let app = a
+  a.loadParticles(proc() =
+    app.particleClasses = particleNames()
+    app.say &"Read {app.particleClasses.len} particle classes from level 0")
 
 proc drawClassesPage(a: App, whole: Rect) =
   ## Character and particle classes: the open one's fields above, every class below.
@@ -4560,10 +4763,9 @@ proc drawClassesPage(a: App, whole: Rect) =
   if particles:
     if not hasParticleCache():
       # Level 0's particles are extracted once, as for the realtime preview.
-      if not a.particleAutoBuild and a.proj != nil and not a.busy: a.readParticles()
-      if a.busy:
-        ui.textIn(if a.particleAutoBuild: "Reading the particle classes from level 0..."
-                  else: "Waiting for the current job to finish", r, colTextDim, h = CenterAlign)
+      if not a.particleAutoBuild and a.proj != nil: a.readParticles()
+      if a.loading("particles"):
+        a.loadingBar(r, "particles")
       else:
         let br = rect(r.x + (r.w - 260) / 2, r.y + r.h / 2 - 13, 260, 26)
         if ui.textButton("class.readParticles", br, "Read the particle classes from level 0", primary = true):
@@ -4572,10 +4774,9 @@ proc drawClassesPage(a: App, whole: Rect) =
     if a.particleClasses.len == 0: a.particleClasses = particleNames()
   elif not hasClassCache():
     # Level 0's classes are extracted once, unasked, the first time this shows.
-    if not a.classAutoBuild and a.proj != nil and not a.busy: a.readClasses()
-    if a.busy:
-      ui.textIn(if a.classAutoBuild: "Reading the character classes from level 0..."
-                else: "Waiting for the current job to finish", r, colTextDim, h = CenterAlign)
+    if not a.classAutoBuild and a.proj != nil: a.readClasses()
+    if a.loading("classes"):
+      a.loadingBar(r, "classes")
     else:
       let br = rect(r.x + (r.w - 260) / 2, r.y + r.h / 2 - 13, 260, 26)
       if ui.textButton("class.read", br, "Read the character classes from level 0", primary = true):
@@ -4976,6 +5177,20 @@ proc drawProperties(a: App, r0: Rect) =
     a.fieldSel = @[]
     a.drawLevelInfo(r)
 
+var usedTex: HashSet[string]
+var usedTexGeo: Geometry
+var usedTexVersion = -1
+
+proc usedTextures(a: App): HashSet[string] =
+  ## The textures the level's faces use, kept until the geometry changes.
+  if a.geo == nil: return
+  if usedTexGeo != a.geo or usedTexVersion != a.geo.version:
+    usedTex.clear()
+    for fc in a.geo.faces: usedTex.incl fc.texture
+    usedTexGeo = a.geo
+    usedTexVersion = a.geo.version
+  usedTex
+
 proc drawTextureBrowser(a: App, br: Rect) =
   ## The enabled collections' textures: click one to apply it to the selected faces.
   let ui = a.ui
@@ -5034,9 +5249,7 @@ proc drawTextureBrowser(a: App, br: Rect) =
   if a.proj == nil: return
   a.loadThumbnails()
   let f = a.texFilter.strip.toLowerAscii
-  var used: HashSet[string]
-  if a.geo != nil:
-    for fc in a.geo.faces: used.incl fc.texture
+  let used = a.usedTextures
   # The current texture: the selected faces' (red border), else the one picked.
   var current = a.currentTexture
   for fi in faces:
@@ -5172,7 +5385,9 @@ proc drawTextureCollections(a: App, r: Rect) =
       if id in p.textureCollections or rowOf(id) < 0: continue
       p.textureCollections.add id
       let c = a.texCollections[rowOf(id)]
-      if not c.ready: missing.add c.level
+      # Extracted before the library took levels this way: its classes still join.
+      if not c.ready or (c.level > 0 and libraryBuilt() and c.level notin libraryLevels()):
+        missing.add c.level
     p.save()
     a.collAvailable.clear()
     a.thumbsLoaded = false
@@ -5995,10 +6210,9 @@ proc drawStatus*(a: App) =
   if a.busy:
     let j = a.job
     let pw = 160'f32
-    let pr = rect(r.x + 8, r.y + 8, pw, 8)
-    ui.rect(pr, colTrack)
-    ui.rect(rect(pr.x, pr.y, pw * clamp(j.progress, 0.03, 1), pr.h), colAccent)
-    ui.textIn(j.title & ": " & j.stepLabel, rect(r.x + pw + 18, r.y, r.w / 2, r.h), colText, FontSmall)
+    a.progressBar(rect(r.x + 8, r.y + 8, pw, 8), j.progress)
+    ui.textIn(ui.ellipsize(&"{j.title}: {j.stepLabel} {j.jobCount}", r.w * 0.45 - pw, FontSmall),
+              rect(r.x + pw + 18, r.y, r.w * 0.45 - pw, r.h), colText, FontSmall)
   else:
     if a.proj == nil:
       left = "No level open"
@@ -6024,6 +6238,22 @@ proc drawStatus*(a: App) =
     right = &"{p.x:.1f}, {p.y:.1f}     " & right
   let rw = ui.textSize(right, FontSmall).x
   ui.text(right, vec2(r.x + r.w - rw - 10, r.y + 5), colTextDim, FontSmall)
+  # What loads in the background, left of that: the first, and how many wait.
+  if a.loads.len > 0:
+    let l = a.loads[0]
+    var s = (if a.busy and l.job != nil: l.title & " (paused)" else: l.loadState)
+    if a.loads.len > 1: s.add &"  ·  {a.loads.len - 1} more to load"
+    let pw = 100'f32
+    let room = r.w * 0.5 - rw - pw - 40
+    if room > 60:
+      let shown = ui.ellipsize(s, room, FontSmall)
+      let tx = r.x + r.w - rw - 30 - ui.textSize(shown, FontSmall).x
+      a.progressBar(rect(tx - pw - 8, r.y + 8, pw, 8), l.loadProgress)
+      ui.text(shown, vec2(tx, r.y + 5), colTextDim, FontSmall)
+      var tip = ""
+      for k in a.loads: tip.add (if tip.len > 0: "\n" else: "") & k.loadState
+      ui.tip(rect(tx - pw - 8, r.y, r.x + r.w - rw - 30 - (tx - pw - 8), r.h),
+             "Loading in the background while you work:\n" & tip)
 
 # --- welcome screen and settings ---------------------------------------------------------------
 
@@ -6101,7 +6331,10 @@ proc drawWelcome*(a: App, area: Rect) =
   let taken = not preview and a.newName.strip.len > 0 and dirExists(a.cfg.projectsDir / a.newName.strip)
   if taken and not a.busy:
     ui.text("A project with this name already exists", vec2(rx, ly + 50), colError, FontSmall)
-  if a.busy: ui.text(a.job.title & ": " & a.job.stepLabel, vec2(rx, ly + 50), colText, FontSmall)
+  if a.busy:
+    a.progressBar(rect(rx, ly + 56, 100, 6), a.job.progress)
+    ui.text(ui.ellipsize(&"{a.job.title}: {a.job.stepLabel} {a.job.jobCount}", colW - 110, FontSmall),
+            vec2(rx + 110, ly + 50), colText, FontSmall)
   ly += 80
 
   # The kinds of new project, picked with the radio buttons; the button under
@@ -6147,6 +6380,7 @@ proc drawWelcome*(a: App, area: Rect) =
   let sw = iw - tw - 6
   ui.text("Textures from", vec2(ix, ly), colTextDim, FontSmall)
   ui.text("Sky", vec2(ix + tw + 6, ly), colTextDim, FontSmall)
+  if a.newTexLevel > 0 and levels.len > 0 and a.newTexLevel notin levels: a.newTexLevel = 0
   var texItems = @["All game levels"]
   for n in levels: texItems.add "Level " & $n
   let texLabel = if a.newTexLevel > 0: "Level " & $a.newTexLevel else: texItems[0]
@@ -6176,7 +6410,7 @@ proc drawWelcome*(a: App, area: Rect) =
   let bw = (iw - (cols - 1).float32 * 6) / cols.float32
   var levelCells: seq[Rect]
   proc pickLevel(n: int) =
-    if not onLevel: pick(nkCopy)
+    if not onLevel: pick(nkPreview)
     if isMade(a.newName): a.newName = levelName(n)
     a.newLevel = n
   for i, n in levels:
@@ -6392,7 +6626,7 @@ proc drawSettings*(a: App) =
      ui.textButton("settings.reset", rect(box.x + 16, by, 140, 30), "Reset to defaults"):
     # Resets the View and Mouse pages (TrenchBroom resets the pane shown).
     e[].resetViewPrefs()
-    a.settingsFly = DefaultFlySpeed
+    a.settingsFly = StartFlySpeed
     a.setFov(e.fov)
   let sr = rect(box.x + box.w - 200, by, 88, 30)
   let cr = rect(box.x + box.w - 104, by, 88, 30)

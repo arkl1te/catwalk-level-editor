@@ -1527,7 +1527,7 @@ proc partsOutline(a: App, r: Rect, on, all: bool) =
 
 proc drawViewHeader(a: App, vi: int, h: Rect, hot: bool) =
   ## The view's name (and the 3D render mode), then, like UnrealEd's viewport
-  ## bar: Realtime preview, Gizmos, Invisible faces, the view kind (Top, Front, Side, Perspective) and
+  ## bar: Realtime preview, Gizmos, Editor-only, the view kind (Top, Front, Side, Perspective) and
   ## the render modes. A mode button pressed again switches to its alternate
   ## (Lighting / Solid, Wireframe / Lit Wireframe).
   let ui = a.ui
@@ -1575,11 +1575,18 @@ proc drawViewHeader(a: App, vi: int, h: Rect, hot: bool) =
   elif ui.hover(gz) and ui.pressed(MouseRight):
     a.ctx = CtxMenu(pos: ui.mouse, view: -1, face: -1, gizmos: true)
     a.menuSys.openContext(ui.mouse)
-  if a.headerButton(next(), "eye", a.opts.invisible,
-                    "Invisible faces: the light cyan faces flagged Invisible (invisible walls, " &
-                    "stair ramps). Hidden ones can't be clicked either"):
-    a.opts.invisible = not a.opts.invisible
-    if a.geo != nil: a.geo.bump()
+  # Right click: which of them.
+  let eo = next()
+  let eoClicked = a.headerButton(eo, "eye", a.showEditorOnly,
+                    "Editor-only: what the game never draws. Invisible faces (the light cyan faces " &
+                    "flagged Invisible: invisible walls, stair ramps; hidden ones can't be clicked " &
+                    "either) and objects' Notes over them in the 3D view. Right click to choose which")
+  a.partsOutline(eo, a.showEditorOnly, a.editorOnlyParts == {EditorOnlyPart.low .. EditorOnlyPart.high})
+  if eoClicked:
+    a.switchEditorOnly()
+  elif ui.hover(eo) and ui.pressed(MouseRight):
+    a.ctx = CtxMenu(pos: ui.mouse, view: -1, face: -1, editorOnly: true)
+    a.menuSys.openContext(ui.mouse)
   separator()
   for (letter, k, name) in [("T", vkTop, "Top"), ("F", vkFront, "Front"), ("S", vkSide, "Side"),
                             ("P", vk3D, "Perspective (3D)")]:
@@ -1603,13 +1610,14 @@ proc drawViewHeader(a: App, vi: int, h: Rect, hot: bool) =
   ui.popClip()
 
 const
-  NotesRange = 600'f32          ## How far an object's Notes show in the 3D view...
-  NotesRangeHidden = 120'f32    ## ...and how far when a surface is in front of them.
+  NotesRangeHidden = 120'f32    ## How far an object's Notes show when a surface is in front
+                                ## of them (no farther than a.notesRange, the menu's bar).
   NotesMax = 48                 ## Most notes drawn at once (the nearest).
 
 proc drawNotes(a: App, vi: int) =
   ## Objects' Notes floating over them in the 3D view, nearest on top.
   let ui = a.ui
+  if not a.showNotes: return
   let v = a.views[vi]
   let b = v.viewBody
   let eye = v.cam.pos
@@ -1617,7 +1625,7 @@ proc drawNotes(a: App, vi: int) =
   for o in a.objects:
     if not a.visible(o): continue
     let dist = (o.pos - eye).length
-    if dist > NotesRange: continue
+    if dist > a.notesRange: continue
     let n = o.node.xpath("OSD/Notes")
     if n == nil or n.str.strip.len == 0: continue
     let (lo, hi) = o.pickBox
@@ -1629,7 +1637,8 @@ proc drawNotes(a: App, vi: int) =
     if shown.len >= NotesMax: break
     let (ok, p) = a.toScreen(vi, at)
     if not ok or not p.inside(b): continue
-    let limit = if a.hiddenFrom(at, eye, o.objectCode): NotesRangeHidden else: NotesRange
+    let limit = if a.hiddenFrom(at, eye, o.objectCode): min(NotesRangeHidden, a.notesRange)
+                else: a.notesRange
     if dist > limit: continue
     # Fade out over the last fifth of the range.
     let fade = min(max((limit - dist) / (limit * 0.2'f32), 0'f32), 1'f32).float32
@@ -4158,8 +4167,9 @@ proc focusFace*(a: App, fi: int, corner = -1) =
   a.layerHidden.excl GeometryLayer
   a.layerLocked.excl GeometryLayer
   if f.isMarkerFace: a.opts.markers = true
-  if f.isInvisibleFace and not a.opts.invisible:
-    a.opts.invisible = true
+  if f.isInvisibleFace and not a.showInvisible:
+    a.showEditorOnly = true
+    a.editorOnlyParts.incl eoInvisible
     a.geo.bump()
   if f.piece >= 0 and f.piece < a.geo.pieces.len and a.geo.pieces[f.piece].hidden:
     a.geo.pieces[f.piece].hidden = false

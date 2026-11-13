@@ -30,8 +30,10 @@ changed later in View > Settings > General.
   options strip. The 2D views share zoom and pan.
 - **View header:** each view has buttons for Realtime preview, **Gizmos** (object boxes,
   light shapes, direction arrows and volumes; right-click it to hide single object types;
-  selected objects always show theirs) and **Invisible faces** (the eye: faces flagged
-  Invisible, such as invisible walls and stair ramps; hidden ones can't be clicked). View
+  selected objects always show theirs) and **Editor-only** (the eye: what the game never
+  draws, faces flagged Invisible, such as invisible walls and stair ramps, and objects'
+  Notes in the 3D view; right-click it to choose which and how close to the camera Notes
+  start to show; hidden faces can't be clicked). View
   options also has **Entity directions**: arrows for the way characters, flags, turrets,
   particles and lights face.
 - **Panels:** Viewport, Properties, Map, Files, Classes, Entity Browser, Texture Browser,

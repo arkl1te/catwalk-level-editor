@@ -151,7 +151,6 @@ type
   ViewOptions* = object
     mode*: RenderMode              ## How the 3D views draw the level (2D views are wireframe).
     rooms*, markers*: bool
-    invisible*: bool               ## Faces flagged Invisible (light cyan).
     models*: bool                  ## Entity models at their objects.
     sky*: bool                     ## The level's skybox behind the 3D view.
 
@@ -159,7 +158,7 @@ const
   InvisibleTint = vec4(0.55, 0.95, 1.0, 0.30)
     ## Invisible faces: light cyan, drawn even with marker faces hidden so a
     ## brush that's invisible on every side can still be seen and clicked
-    ## (unless the view header's eye button hides them).
+    ## (unless the view header's Editor-only button hides them).
   PreviewTint = vec4(1, 0.85, 0.85, 0.7)
     ## Brushes being created: TrenchBroom's CreateBrushesToolBase draws them
     ## tinted with the selected face color and 70 % opaque.

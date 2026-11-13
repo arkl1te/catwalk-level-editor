@@ -36,30 +36,45 @@ order. No title line goes above a list: each one ends with its `=== End of ... =
 by a blank line between lists:
 
 ```
-Make frame stepping instant by keeping the frames around a paused position in textures.
-Bump the version to 0.20.0.
+Make F2 list every character, mods' included, as portraits.
+Make force fields and phase cloaks respawn after 60 seconds.
+Ship server.bat and server.sh in the zip; the installer puts them in AE.
+Bump the version to 0.5.0.
 === End of Changes ===
 
-Add YouTube seek bar previews from storyboards, with a toggle in the seek bar's context menu.
-Add Ctrl+D to duplicate playlist entries.
+Add dedicated servers: no window or sound, with an admin console.
+Add server console commands: say, players, kick, ban, start, quit.
+Add photo mode on F10 in single player, cutscenes included.
 === End of New ===
 
-Fix the end of audio files being cut off (gapless-audio=no, ao=pulse).
-Stop listed YouTube playlists from adding their videos again after a restart.
+Fix sounds looping forever after a rollback.
+Fix F10 swallowing the next key.
 === End of Fixes ===
 ```
 
 - Keep all three end lines, even for a list with no items.
+- **Short lines: about 60-80 characters, never much more.** Brief, concise, straight. When an
+  item needs more, cut detail first: lists of options, examples, parentheses and env vars belong
+  in the docs, not here. Split an item only into parts that stand on their own, such as a feature
+  and a new setting it brings. Never split off its button, indicator, rename or edge cases.
 - **Changes**: existing behavior that now works differently, plus refactors, docs and the version.
 - **New**: features, options, shortcuts and tools that didn't exist before.
 - **Fixes**: anything that was broken and now isn't, whichever verb describes it best.
 - Sort each list from major to minor: what users will notice most goes first; internals, docs and
   the version go last.
-- One line per item, brief and informative, ending in a period.
+- One line per item, ending in a period.
 - Every item must begin with a verb in the imperative: Fix, Add, Make, Show, Separate, Clarify...
 - Describe user-visible behavior (menus, shortcuts, buttons, OSD messages, saved files) in plain
   terms. Name a proc, file or setting only when there is no better way to say it.
 - Split unrelated changes into separate items, and leave out steps of a single change.
+- **No redundancy: every item is one unique action, listed once, in exactly one list.** Decide
+  whether each action is a change, something new or a fix, and put it only there. Never describe
+  the same action twice: not as a "Make ..." in Changes and again as its "Fix ..." in Fixes, and
+  not as several items for its parts or its result (a bug and the mechanism that fixes it are one
+  item; so are a feature and its edge cases, its UI hints, and a rename it caused). Before
+  writing the block, check every pair of items: if two describe the same action, one is part of
+  the other, or one couldn't ship or be reverted without the other, merge them or drop the
+  lesser. Then check every item against the diff: what does it alone describe? If nothing, drop it.
 - Don't list patch/diff noise (whitespace, reordering) unless that's all there is.
 - Don't include `.claude/` in the summary.
 - After the code block, flag anything that shouldn't go into the commit unnoticed, such as leftover

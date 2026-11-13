@@ -709,9 +709,7 @@ proc menus*(a: App): seq[(string, seq[MenuItem])] =
            action = proc() = a.switchRealtime()),
       item("Gizmos", "", hasProj, a.showGizmos, action = proc() = a.showGizmos = not a.showGizmos),
       sep(),
-      item("Invisible faces", "", true, a.opts.invisible, action = proc() =
-        a.opts.invisible = not a.opts.invisible
-        if a.geo != nil: a.geo.bump()),
+      item("Editor-only", "", true, a.showEditorOnly, action = proc() = a.switchEditorOnly()),
       item("Marker faces", "", true, a.opts.markers, action = proc() =
         a.opts.markers = not a.opts.markers
         if a.geo != nil: a.geo.bump()),
@@ -820,6 +818,27 @@ proc gizmosTree(a: App): MenuNode =
   result.sep()
   result.item("Enable all", enabled = a.gizmoHidden.len > 0, action = proc() = a.gizmoHidden.clear())
 
+proc editorOnlyTree(a: App): MenuNode =
+  ## Right click on a view's Editor-only button: which of its things show.
+  result = newMenuRoot()
+  proc partItem(menu: MenuNode, p: EditorOnlyPart) =
+    menu.check($p, checked = p in a.editorOnlyParts, action = proc() = a.toggleEditorOnlyPart(p))
+  for p in EditorOnlyPart: partItem(result, p)
+  result.sep()
+  result.item("Enable all", enabled = a.editorOnlyParts != {EditorOnlyPart.low .. EditorOnlyPart.high},
+              action = proc() =
+                a.editorOnlyParts = {EditorOnlyPart.low .. EditorOnlyPart.high}
+                if a.geo != nil: a.geo.bump())
+  result.sep()
+  # How close to the 3D camera an object has to be for its Notes to show.
+  # The slider's 0..1 maps onto MinNotesRange..MaxNotesRange, in its 5 % steps.
+  let span = MaxNotesRange - MinNotesRange
+  result.slider("Notes appear within", (a.notesRange - MinNotesRange) / span,
+                enabled = eoNotes in a.editorOnlyParts,
+                onChange = proc(v: float) =
+                  a.notesRange = round((MinNotesRange + v.float32 * span) / NotesRangeStep) * NotesRangeStep,
+                valueText = proc(v: float): string = $int(round(MinNotesRange + v.float32 * span)))
+
 proc editParticleEvents(a: App, o: LevelObject, label: string, change: proc(root: XmlNode): int) =
   ## One undo step of a change to the class's Events. change returns how many
   ## Action parameters lost the action they named.
@@ -882,6 +901,7 @@ proc contextTree(a: App): MenuNode =
   if c.file.len > 0: return a.fileContextTree(c.file)
   if c.realtime: return a.realtimeTree()
   if c.gizmos: return a.gizmosTree()
+  if c.editorOnly: return a.editorOnlyTree()
   if c.classAdd.len > 0: return a.classAddTree(c.classAdd)
   if c.classParentsOf.len > 0: return a.classParentsTree(c.classParentsOf)
   if c.texture.len > 0:
@@ -1648,7 +1668,7 @@ proc drawToolOptions*(a: App, r: Rect) =
                  ("AI rooms", a.opts.rooms), ("Entity models", a.opts.models),
                  ("Object names in 2D", a.showObjectNames), ("Entity directions", a.showDirections),
                  ("Grid", a.showGrid), ("Sky", a.opts.sky), ("Realtime preview", a.realtime),
-                 ("Gizmos", a.showGizmos), ("Invisible faces", a.opts.invisible)]
+                 ("Gizmos", a.showGizmos), ("Editor-only", a.showEditorOnly)]
   var items: seq[string]
   for m in RenderMode: items.add (if a.opts.mode == m: "● " else: "◌ ") & $m
   for (n, on) in toggles: items.add (if on: "● " else: "◌ ") & n
@@ -1666,9 +1686,7 @@ proc drawToolOptions*(a: App, r: Rect) =
   of 6: a.opts.sky = not a.opts.sky
   of 7: a.switchRealtime()
   of 8: a.showGizmos = not a.showGizmos
-  of 9:
-    a.opts.invisible = not a.opts.invisible
-    if a.geo != nil: a.geo.bump()
+  of 9: a.switchEditorOnly()
   else: discard
 
 # --- dividers ---------------------------------------------------------------------------------

@@ -90,6 +90,10 @@ type
     ## What Realtime preview plays (right click its button to choose).
     ppLights = "Animated lighting", ppSounds = "Sound objects", ppMusic = "Level music",
     ppParticles = "Particles"
+  EditorOnlyPart* = enum
+    ## What the Editor-only button shows (right click it to choose): things
+    ## the game never draws.
+    eoInvisible = "Invisible faces", eoNotes = "Notes"
 
   ClassXmlDraft* = object
     text*, base*, error*: string       ## What's typed, the class it started from, why Apply refused it.
@@ -104,6 +108,7 @@ type
     file*: string                      ## Opened in the Files tab: the path under it (else "").
     realtime*: bool                    ## Opened on a view's Realtime preview button.
     gizmos*: bool                      ## Opened on a view's Gizmos button.
+    editorOnly*: bool                  ## Opened on a view's Editor-only button.
     classAdd*: string                  ## Opened on a class's + button: "+" for an event, else the event an action goes in.
     classParentsOf*: string            ## Opened on a breadcrumb: the class whose other parents it lists.
     ambient*: string                   ## Opened on a sound list's ambient: duplicating or editing it.
@@ -617,6 +622,9 @@ type
     showDirections*: bool           ## Entities show where they point.
     showGizmos*: bool               ## Entities draw their gizmos (boxes, light shapes, arrows, volumes).
     gizmoHidden*: HashSet[string]   ## Object types left out of them (right click the Gizmos button).
+    showEditorOnly*: bool           ## The Editor-only button: Invisible faces and objects' Notes...
+    editorOnlyParts*: set[EditorOnlyPart]  ## ...which of them (never empty).
+    notesRange*: float32            ## How far from the 3D camera objects' Notes start to show.
 
 # --- basics -------------------------------------------------------------------------------
 
@@ -696,6 +704,34 @@ proc togglePreviewPart*(a: App, p: PreviewPart) =
   if a.previewParts == {}:
     a.previewParts = {ppLights}
     if a.realtime: a.toggleRealtime()
+
+const
+  MinNotesRange* = 100'f32       ## The Editor-only menu's Notes distance bar: its ends...
+  MaxNotesRange* = 2100'f32
+  NotesRangeStep* = 100'f32      ## ...and its steps (the menu slider's 5 %).
+  DefaultNotesRange* = 600'f32
+
+proc showInvisible*(a: App): bool =
+  ## Faces flagged Invisible are drawn (and can be clicked).
+  a.showEditorOnly and eoInvisible in a.editorOnlyParts
+
+proc showNotes*(a: App): bool =
+  ## Objects' Notes float over them in the 3D view.
+  a.showEditorOnly and eoNotes in a.editorOnlyParts
+
+proc switchEditorOnly*(a: App) =
+  ## The Editor-only button: on or off.
+  a.showEditorOnly = not a.showEditorOnly
+  if a.geo != nil: a.geo.bump()
+
+proc toggleEditorOnlyPart*(a: App, p: EditorOnlyPart) =
+  ## Shows or hides one of the Editor-only things. Hiding the last one turns
+  ## the button off and leaves that one on.
+  if p in a.editorOnlyParts: a.editorOnlyParts.excl p else: a.editorOnlyParts.incl p
+  if a.editorOnlyParts == {}:
+    a.editorOnlyParts = {p}
+    a.showEditorOnly = false
+  if a.geo != nil: a.geo.bump()
 
 proc toggleGizmoKind*(a: App, tag: string) =
   ## Shows or hides one object type's gizmos. Hiding the last type turns the
@@ -909,7 +945,7 @@ proc faceVisible*(a: App, fi: int): bool =
   let f = a.geo.faces[fi]
   if f.piece >= 0 and f.piece < a.geo.pieces.len and a.geo.pieces[f.piece].hidden: return false
   if f.isMarkerFace and not a.opts.markers: return false
-  if f.isInvisibleFace and not a.opts.invisible: return false
+  if f.isInvisibleFace and not a.showInvisible: return false
   true
 
 # --- objects and their geometry ------------------------------------------------------------
@@ -1605,6 +1641,14 @@ proc loadLayout*(a: App) =
   if j{"gizmosHidden"} != nil and j["gizmosHidden"].kind == JArray:
     a.gizmoHidden.clear()
     for n in j["gizmosHidden"]: a.gizmoHidden.incl n.getStr
+  a.showEditorOnly = j{"editorOnly"}.getBool(a.showEditorOnly)
+  if j{"editorOnlyParts"} != nil and j["editorOnlyParts"].kind == JArray:
+    var parts: set[EditorOnlyPart]
+    for n in j["editorOnlyParts"]:
+      for p in EditorOnlyPart:
+        if $p == n.getStr: parts.incl p
+    if parts != {}: a.editorOnlyParts = parts
+  a.notesRange = clamp(j{"notesRange"}.getFloat(a.notesRange), MinNotesRange, MaxNotesRange).float32
   a.previewSoundVolume = clamp(j{"realtimeSoundVolume"}.getFloat(a.previewSoundVolume), 0, 1)
   a.previewMusicVolume = clamp(j{"realtimeMusicVolume"}.getFloat(a.previewMusicVolume), 0, 1)
   let w = j{"window"}
@@ -1628,6 +1672,8 @@ proc saveLayout*(a: App) =
       "flySpeed": a.flySpeed, "renderMode": $a.opts.mode,
       "realtimePreview": a.previewParts.toSeq.mapIt($it),
       "gizmos": a.showGizmos, "gizmosHidden": a.gizmoHidden.toSeq.sorted,
+      "editorOnly": a.showEditorOnly, "editorOnlyParts": a.editorOnlyParts.toSeq.mapIt($it),
+      "notesRange": a.notesRange,
       "realtimeSoundVolume": a.previewSoundVolume, "realtimeMusicVolume": a.previewMusicVolume, "window": {"x": a.winPos.x, "y": a.winPos.y,
         "width": a.winSize.x, "height": a.winSize.y, "maximized": a.winMaximized}}))
   except CatchableError as e: a.say("Could not save the layout: " & e.msg, true)

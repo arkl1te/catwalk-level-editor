@@ -23,6 +23,7 @@ type
     swatch*: ColorRGBX        ## alpha > 0: a color square in the check column
     value*: float             ## mkSlider: 0..1, shown as a percentage
     onChange*: proc (v: float) ## mkSlider: dragged, clicked or scrolled to v
+    valueText*: proc (v: float): string ## mkSlider: what the value reads as (nil = a percentage)
 
   MenuMode = enum
     mmClosed, mmBar, mmContext
@@ -76,10 +77,11 @@ proc radio*(parent: MenuNode, label: string, shortcut = "", checked: bool,
     checked: checked, enabled: enabled, action: action)
 
 proc slider*(parent: MenuNode, label: string, value: float, enabled = true,
-             onChange: proc (v: float) = nil) =
-  ## A label and a 0..1 track; changing it keeps the menu open.
+             onChange: proc (v: float) = nil, valueText: proc (v: float): string = nil) =
+  ## A label and a 0..1 track; changing it keeps the menu open. valueText
+  ## says what the value reads as at the right end (else a percentage).
   parent.children.add MenuNode(label: label, kind: mkSlider, value: value,
-    enabled: enabled, onChange: onChange)
+    enabled: enabled, onChange: onChange, valueText: valueText)
 
 proc sep*(parent: MenuNode) =
   parent.children.add MenuNode(kind: mkSeparator)
@@ -332,7 +334,8 @@ proc drawPopup(m: MenuSystem, ui: Ui, lv: PopupLevel, depth: int) =
       ui.rect(rect(t.x, cy - 2, t.w, 4), colTrack)
       ui.rect(rect(t.x, cy - 2, t.w * frac, 4), if c.enabled: colAccent else: colTextDisabled)
       ui.icon("knob16", vec2(t.x + t.w * frac, cy), if hov or active: colWhite else: fg)
-      ui.textIn($int(round(c.value * 100)) & "%", rect(row.x, row.y, row.w - 6, row.h),
+      let shown = if c.valueText != nil: c.valueText(c.value) else: $int(round(c.value * 100)) & "%"
+      ui.textIn(shown, rect(row.x, row.y, row.w - 6, row.h),
         if c.enabled: colTextDim else: colTextDisabled, h = RightAlign)
 
 proc drawBar*(m: MenuSystem, ui: Ui, root: MenuNode, bar: Rect) =

@@ -1,27 +1,29 @@
 ---
 name: make-changelog
-description: Turn a commit's message into a changelog for the GitHub release page, written for people who make Oni levels with Catwalk and leaving out project technicalities. Use when asked to make, write or translate a changelog, release notes or a release page text, e.g. "make a changelog of the last commit".
+description: Turn the commits since the last release into a changelog for the GitHub release page, written for people who make Oni levels with Catwalk and leaving out project technicalities. Use when asked to make, write or translate a changelog, release notes or a release page text, e.g. "make a changelog" or "release notes since v0.1.0".
 ---
 
 # Make a changelog
 
-Translate a commit message into release notes that level makers would care to read. This is for
+Translate commit messages into release notes that level makers would care to read. This is for
 the GitHub release page, so it's written for people who use Catwalk, not for its developers.
 
 ## 1. Gather the state
 
-Always read the commit again; never reuse a message from the conversation. Unless told which one,
-take the last commit:
+Always read the commits again; never reuse a message from the conversation. Unless told which
+commits, cover every commit since the last tag, the last release (all of them when there's no tag):
 
 ```bash
-git log -1 --format='%h %ad%n%B' --date=short && cat VERSION
+tag=$(git describe --tags --abbrev=0 2>/dev/null); echo "since: ${tag:-the first commit}"
+git log ${tag:+$tag..HEAD} --reverse --format='%h %ad%n%B' --date=short && cat VERSION
 ```
 
-If it was asked for a range of commits (for example since the last release), read them all and
-merge their items.
+Read them all and merge their items into one changelog. When a later commit changes or fixes
+something an earlier one added, describe it once, as it ships. Leave out commits with nothing a
+user would notice. If `VERSION` is no newer than the tag, say so after the changelog.
 
 If an item is too vague to explain to a user, read that part of the commit with `git show` rather
-than guessing what it does. Don't describe anything the commit doesn't contain.
+than guessing what it does. Don't describe anything the commits don't contain.
 
 ## 2. Write the changelog
 

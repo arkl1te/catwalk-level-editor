@@ -9,8 +9,8 @@
 ## carry that id. Free-form fields say what they take and list the values
 ## other objects in the level use.
 
-import std/[os, strutils, tables, sets, algorithm, xmlparser, xmltree, re, uri, bitops, times, sequtils]
-import levelobjects, presets, fieldtypes, particleevents, ambients
+import std/[os, strutils, tables, sets, algorithm, xmlparser, xmltree, uri, bitops, times, sequtils]
+import levelobjects, presets, fieldtypes, particleevents, ambients, textmatch
 
 type
   Choice* = object
@@ -199,18 +199,11 @@ proc refresh*(c: Catalog, gameData, projDir: string) =
   c.scriptsStamp = stamp
   var found: HashSet[string]
   c.scripts.setLen 0
-  let fn = re"(?m)^\s*func\s+(?:(?:void|int|float|bool|string)\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\("
   for f in files:
     var text: string
     try: text = readFile(f)
     except IOError: continue
-    var caps: array[1, string]
-    var at = 0
-    while true:
-      let (first, stop) = text.findBounds(fn, caps, at)
-      if first < 0: break
-      at = stop + 1
-      let name = caps[0]
+    for name in scriptFuncs(text):
       if name notin found:
         found.incl name
         c.scripts.add name
@@ -332,7 +325,7 @@ proc freeHint(key, value: string): Choice =
 proc fieldKey(tag, path, attr: string): string =
   ## "CHAR OSD/Inventory/Ammo/Use", "PATR OSD/Points/MoveToFlag .FlagId", with
   ## repeat indices ([2]) and the Loop nesting of patrol points removed.
-  var p = path.replace(re"\[\d+\]", "")
+  var p = stripIndices(path)
   if tag == "PATR": p = p.replace("/Loop/", "/")
   result = tag & " " & p
   if attr.len > 0: result.add " ." & attr
@@ -524,7 +517,7 @@ proc choices*(c: Catalog, o: LevelObject, path, attr, value: string,
     elif key.startsWith("PATR OSD/Points/") and attr == "FlagId":
       result = idChoices(objs, "FLAG", "OSD/FlagId")
     elif (o.tag in ["CONS", "DOOR", "TRIG"]) and key.contains(" OSD/Events/"):
-      let ev = path.replace(re"\[\d+\]", "").split('/')[^1]
+      let ev = stripIndices(path).split('/')[^1]
       if attr == "Function": result = scripts
       elif attr == "TargetId" and ev in EventTargets:
         let t = EventTargets[ev]

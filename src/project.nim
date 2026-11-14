@@ -21,11 +21,11 @@
 ## mod lists; Play starts Oni with ARKLITE_AUTOSTART=<Folder> (and
 ## ARKLITE_SAVEPOINT=<n> to start from a save point).
 
-import std/[os, osproc, json, strutils, strtabs, algorithm, re, sets, times, tables, uri, strformat, xmltree, xmlparser, sequtils]
+import std/[os, osproc, json, strutils, strtabs, algorithm, sets, times, tables, uri, strformat, xmltree, xmlparser, sequtils]
 import vmath
 import jobs, geometry, geomops, objtemplates, levelobjects, pictures, skyconvert, skyfit, skygrade, tga
 export skygrade
-import fieldtypes, ambients
+import fieldtypes, ambients, textmatch
 export RecordingPrefix, splitRecording
 from mcp import DefaultMcpPort
 when defined(windows): import std/winlean
@@ -601,11 +601,9 @@ proc listProjects*(c: Config): seq[string] =
 proc savePoints*(p: Project): seq[int] =
   ## Save points the level's scripts handle ("if (save_point eq N)" and the like).
   var found: HashSet[int]
-  let pat = re"save_point\s+eq\s+(\d+)"
   for f in walkDirRec(p.dir / "IGMD"):
     if not f.endsWith(".bsl"): continue
-    for m in findAll(readFile(f), pat):
-      let digits = m.split({' ', '\t'})[^1]
+    for digits in savePointNumbers(readFile(f)):
       try:
         let n = parseInt(digits)
         if n > 0 and n < 10: found.incl n
@@ -1337,7 +1335,7 @@ proc scratchSteps(c: Config, p: Project, work, geo: string): seq[Step] =
         c.splitArgs("-extract:xml", geo / "onlv-xml", work / onlvName)),
       action("Removing sky", proc() =
         let x = geo / "onlv-xml" / "ONLV" & p.envName & ".xml"
-        writeFile(x, readFile(x).replace(re"<SkyBox>[^<]*</SkyBox>", "<SkyBox></SkyBox>"))),
+        writeFile(x, readFile(x).replaceElement("SkyBox", "<SkyBox></SkyBox>"))),
       command("Writing level", proc(): seq[string] =
         c.splitArgs("-create", geo / "onlv", geo / "onlv-xml" / "ONLV" & p.envName & ".xml")),
       action("Linking level", proc() = copyCreated(geo / "onlv", work))]
@@ -1360,12 +1358,11 @@ proc startOnLoad(p: Project, igmd: string) =
     line.add "\n\t# Added by Catwalk: the level's music.\n\tsound_music_start " & p.music &
              " " & formatFloat(clamp(p.musicVolume, 0.0, 1.0), ffDecimal, 2) & "\n"
   if line.len == 0: return
-  let mainPat = re"func\s+(void\s+)?main\s*\(\s*(void)?\s*\)\s*\{"
   if dirExists(igmd):
     for f in walkFiles(igmd / "*.bsl"):
       let s = readFile(f)
-      let (_, last) = findBounds(s, mainPat)
-      if last >= 0:
+      let (first, last) = findMainFunc(s)
+      if first >= 0:   # No main() is (-1, 0).
         writeFile(f, s[0 .. last] & line & s[last + 1 .. ^1])
         return
   createDir(igmd)
@@ -1375,7 +1372,7 @@ proc explainObjectError(output: string): string =
   ## OniSplit reports a bad object field as a .NET stack trace naming only the
   ## field and the XML line; this names the object, the field and what's wrong.
   var m: array[2, string]
-  let at = output.find(re"Cannot read field '([^']+)' \(line (\d+)\)", m)
+  let at = findFieldError(output, m)
   if at < 0: return
   let field = m[0]
   var line = parseInt(m[1])
@@ -1395,22 +1392,22 @@ proc explainObjectError(output: string): string =
   var obj = ""
   for i in countdown(line - 1, 0):
     var o: array[2, string]
-    if lines[i].match(re"""\s*<(\w{4}) Id="(\d+)">""", o):
+    if matchObjectHead(lines[i], o):
       obj = typeName(o[0]) & " " & o[1]
       for k in i + 1 ..< line:
         var n: array[1, string]
-        if lines[k].match(re"\s*<Name>([^<]+)</Name>", n):
+        if matchNameElement(lines[k], n):
           obj.add " \"" & n[0] & "\""
           break
       break
   var v: array[1, string]
   let problem =
-    if lines[line - 1].match(re"\s*<[^>]*/>\s*$"): "is empty"
-    elif lines[line - 1].match(re"\s*<[^>]*>([^<]*)<", v): "is \"" & v[0] & "\""
+    if isEmptyElement(lines[line - 1]): "is empty"
+    elif matchElementText(lines[line - 1], v): "is \"" & v[0] & "\""
     else: "is invalid"
   let want =
-    if output.find(re"Visit(U?Int\d+|Byte|SByte)\b") >= 0: "a whole number"
-    elif output.find(re"Visit(Float|Double)\b") >= 0: "a number"
+    if hasVisit(output, ["Byte", "SByte"], intSizes = true): "a whole number"
+    elif hasVisit(output, ["Float", "Double"]): "a number"
     else: "a valid value"
   let where = if obj.len > 0: obj & ": " else: ""
   &"{where}{field} {problem}; it must be {want} ({file.extractFilename}, line {line})"
@@ -1675,7 +1672,7 @@ proc usedRecordings(p: Project): HashSet[string] =
       if f.endsWith(".xml") or f.endsWith(".bsl"): files.add f
   if fileExists(p.lightsPath): files.add p.lightsPath
   for f in files:
-    for m in readFile(f).findAll(re("(?<![A-Za-z0-9_])" & RecordingPrefix & "[A-Za-z0-9_.-]+")):
+    for m in readFile(f).findWordsWithPrefix(RecordingPrefix, {'A'..'Z', 'a'..'z', '0'..'9', '_', '.', '-'}):
       result.incl m
 
 proc dropUnusedSounds(p: Project, work: string) =
@@ -1959,8 +1956,8 @@ proc skySteps(c: Config, p: Project, work, geo: string): seq[Step] =
       if not fileExists(file): raise newException(ValueError, "level 0's skies aren't extracted yet: try again in a moment")
       var links = ""
       for f in SkyFaces: links.add &"<Link>TXMP{sky}_{f}</Link>"
-      readFile(file).replace(re"(?s)<SkyboxTextures>.*</SkyboxTextures>",
-                             "<SkyboxTextures>" & links & "<Link></Link></SkyboxTextures>")
+      readFile(file).replaceSpan("SkyboxTextures",
+                                 "<SkyboxTextures>" & links & "<Link></Link></SkyboxTextures>")
     result.add @[
       action("Preparing the sky", proc() =
         if dirExists(src): removeDir(src)
@@ -1981,7 +1978,7 @@ proc skySteps(c: Config, p: Project, work, geo: string): seq[Step] =
       c.splitArgs("-extract:xml", geo / "sky-xml", work / onlvName)),
     action("Linking the sky", proc() =
       let link = if sky.len > 0: "ONSK" & sky else: ""
-      writeFile(xmlPath, readFile(xmlPath).replace(re"<SkyBox>[^<]*</SkyBox>", "<SkyBox>" & link & "</SkyBox>"))),
+      writeFile(xmlPath, readFile(xmlPath).replaceElement("SkyBox", "<SkyBox>" & link & "</SkyBox>"))),
     command("Writing the level", proc(): seq[string] =
       c.splitArgs("-create", geo / "sky-onlv", xmlPath)),
     action("Linking level", proc() = copyCreated(geo / "sky-onlv", work))]

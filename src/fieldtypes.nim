@@ -8,7 +8,8 @@
 ## ONCC metadata (Oni.Metadata.InstanceMetadata). Ids that name another object
 ## or profile stay text fields: their dropdown lists what they can point at.
 
-import std/[strutils, re, tables, sequtils, math]
+import std/[strutils, tables, sequtils, math]
+import textmatch
 import particleevents
 
 const RecordingPrefix* = "rec_"
@@ -314,7 +315,7 @@ proc particleType(path, attr: string): FieldType =
 
 proc fieldType*(tag, path, attr: string): FieldType =
   ## The input for o's field (path, attr); fkText when it takes text or names something.
-  let p = path.replace(re"\[\d+\]", "")
+  let p = stripIndices(path)
   if tag == "ONCC":
     return if attr.len > 0: FieldType(kind: fkText) else: classType(p)
   if tag == "Particle": return particleType(p, attr)

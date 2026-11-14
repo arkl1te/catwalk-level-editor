@@ -24,10 +24,11 @@ jobs:
       - uses: actions/checkout@v4
 
       # The runner already has Visual Studio with the C++ workload and the
-      # Windows SDK (rc.exe, for the icon); only Nim is missing.
+      # Windows SDK (rc.exe, for the icon); only Nim is missing. An exact
+      # version, so a release is built with the Nim the last one was.
       - uses: jiro4989/setup-nim-action@v2
         with:
-          nim-version: '2.2.x'
+          nim-version: '2.2.14'
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build
@@ -46,6 +47,25 @@ jobs:
         with:
           name: ${{ steps.pkg.outputs.name }}
           path: ${{ steps.pkg.outputs.name }}/
+
+      # Starts the packaged catwalk.exe as a player gets it, with PATH cut to
+      # Windows' own folders, so a library missing from the zip fails here
+      # rather than on their PC (0.2.0 needed a pcre64.dll it didn't ship).
+      # A library that won't load opens a message box that waits for a
+      # click: the timeouts stop the step instead.
+      - name: Check that catwalk.exe starts
+        timeout-minutes: 3
+        run: |
+          cd "${{ steps.pkg.outputs.name }}"
+          rc=0
+          out=$(PATH="/c/Windows/System32:/c/Windows" /usr/bin/timeout 60 ./catwalk.exe --version) || rc=$?
+          out=$(tr -d '\r' <<< "$out")
+          echo "catwalk.exe --version: '$out' (exit $rc)"
+          want="Catwalk $(tr -d '\r\n' < ../VERSION)"
+          if [[ $rc != 0 || $out != "$want" ]]; then
+            echo "::error::catwalk.exe didn't start (expected '$want', exit 0)"
+            exit 1
+          fi
 
       # Release notes = the annotated tag's message ("What's new"). checkout
       # only fetches the tagged commit, so the tag object itself is fetched

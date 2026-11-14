@@ -35,9 +35,13 @@ workload; Nim finds the compiler by itself:
 | `tools/windows.sh install` / `uninstall` | Install to `%LOCALAPPDATA%\Programs\Catwalk` with a Start menu shortcut |
 | `tools/windows.sh stage DIR` | Copy what ships (exe, README, `licenses\`) into DIR |
 
-`.github/workflows/windows.yml` runs `build` and `stage` on every push and keeps the
-result as the run's artifact; a `v*` tag also makes a GitHub release with the zip, its
-notes taken from the annotated tag's message. The exe's icon is `assets/windows/catwalk.ico`,
+`.github/workflows/windows.yml` runs `build` and `stage` on every push with a pinned Nim
+(2.2.14) and keeps the result as the run's artifact; a `v*` tag also makes a GitHub release
+with the zip, its notes taken from the annotated tag's message. Before releasing, it starts
+the staged `catwalk.exe --version` with `PATH` cut to Windows' own folders: it prints
+`Catwalk <version>` and quits, so a library missing from the zip fails the run instead of
+the player's start (a failed load opens a message box that waits for a click, hence its
+timeouts). The exe's icon is `assets/windows/catwalk.ico`,
 made from `assets/catwalk.svg` by `nim r tools/make_ico.nim`.
 
 What differs from Linux:
@@ -65,9 +69,17 @@ literal past 64 KB); `patches/windy.patch` lets Alt+F4 through to Windows; progr
 started with `poDaemon`, so no console window flashes up; `.gitattributes` keeps the
 scripts, `deps.lock` and the patches LF, which bash and `git apply` need.
 
+Nothing may load a library at run time that Windows doesn't have, since the zip ships the
+exe alone. `std/re` is out for that reason: it loads PCRE (`pcre64.dll` on Windows), which
+stopped 0.2.0 from starting there. Text patterns are matched by hand in `textmatch.nim`;
+`tools/textmatch_test.nim` checks each against the regex it replaced (it needs PCRE, so it
+runs on Linux), optionally on a list of real files:
+`nim c -r -d:release tools/textmatch_test.nim paths.txt`.
+
 The Windows build is checked from Linux with `nim check --os:windows` (pass `--skipProjCfg`
 and every `vendor/*` path by hand: `config.nims` breaks under `--os:windows`) and by
-reading the C that `--compileOnly` generates; it hasn't been run on a Windows PC yet.
+reading the C that `--compileOnly` generates (its `nimLoadLibrary` calls must name only
+Windows' DLLs); the workflow's start check is the one run on Windows.
 
 ## Limits
 

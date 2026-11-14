@@ -248,6 +248,12 @@ proc main() =
   # bridge's) is kept.
   when defined(windows): attachStdio()
   var args = commandLineParams()
+  if "--version" in args:
+    # Before anything else: the Windows build runs it to check catwalk.exe
+    # starts, i.e. every library it loads at startup is there.
+    try: echo "Catwalk ", AppVersion
+    except IOError: discard
+    return
   if "--mcp" in args:
     runBridge(loadConfig().mcpPort, AppVersion)
     return

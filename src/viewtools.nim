@@ -2220,30 +2220,53 @@ proc csg*(a: App, op: string) =
       a.say("CSG needs convex brushes; piece " & $pc & " isn't one", true)
       return
   let before = a.geo.clone
+  # The geometry the op's piece removal starts from (after a surface cut).
+  var base = before
   var ok = true
   # Pieces each op consumes; its results are appended after the survivors.
   var consumed = toHashSet(pieces)
+  var cutNote = ""
   case op
   of "merge": ok = a.geo.csgMerge(pieces, a.densityFn)
   of "intersect": ok = a.geo.csgIntersect(pieces, a.densityFn)
   of "hollow": ok = a.geo.csgHollow(pieces, a.grid, a.densityFn) > 0
   of "subtract":
-    # Like TrenchBroom: the selection is subtracted from every brush it touches.
+    # Like TrenchBroom: the selection is subtracted from every brush it
+    # touches. Every other surface (imported level geometry, open or concave
+    # pieces) loses what lies inside the selection.
     var others: seq[int32]
+    var surfaces: seq[int]
     let (okb, lo, hi) = a.selectionBounds
     if okb:
       for pc in 0 ..< a.geo.pieces.len:
-        if pc.int32 in a.selPieces or not a.geo.pieces[pc].brush or a.geo.pieces[pc].hidden: continue
+        if pc.int32 in a.selPieces or a.geo.pieces[pc].hidden: continue
+        if not a.geo.pieces[pc].brush or not a.geo.isConvexClosed(byPiece[pc]):
+          for fi in byPiece[pc]:
+            let f = a.geo.faces[fi]
+            # Objects' faces move with them; room links aren't surfaces.
+            if f.objectId == -1 and not f.isMarkerFace: surfaces.add fi
+          continue
         var touches = false
         for fi in byPiece[pc]:
           for v in a.geo.faces[fi].verts:
             let p = a.geo.points[v]
             if p.x >= lo.x - 0.1 and p.y >= lo.y - 0.1 and p.z >= lo.z - 0.1 and
                p.x <= hi.x + 0.1 and p.y <= hi.y + 0.1 and p.z <= hi.z + 0.1: touches = true
-        if touches and a.geo.isConvexClosed(byPiece[pc]): others.add pc.int32
+        if touches: others.add pc.int32
+    let (cut, closed) =
+      if surfaces.len > 0: a.geo.subtractSurfaces(surfaces, pieces, a.densityFn) else: (0, 0)
+    if cut > 0:
+      cutNote = &": {cut} faces cut" & (if closed > 0: &", {closed} added to close them" else: "")
     if others.len == 0:
-      a.say("Subtract: no brushes touch the selection", true)
+      if cut == 0:
+        a.geo = before
+        a.say("Subtract: nothing goes into the selection", true)
+        return
+      # Piece numbers stay as they were: the selection stays on the brushes.
+      a.push geoCmd("CSG subtract", before, a.geo)
+      a.say "CSG subtract" & cutNote
       return
+    if cut > 0: base = a.geo.clone
     consumed = toHashSet(others)
     ok = a.geo.csgSubtract(others, pieces, a.densityFn) >= 0
   else: discard
@@ -2253,8 +2276,8 @@ proc csg*(a: App, op: string) =
     return
   # Survivors keep their order; empty pieces (left by group edits) are
   # dropped too, so count them rather than subtract from the old total.
-  var used = newSeq[bool](before.pieces.len)
-  for f in before.faces:
+  var used = newSeq[bool](base.pieces.len)
+  for f in base.faces:
     if f.verts.len >= 3 and f.piece >= 0 and f.piece < used.len: used[f.piece] = true
   var kept = 0
   for pc, u in used:
@@ -2264,7 +2287,7 @@ proc csg*(a: App, op: string) =
   a.push geoCmd("CSG " & op, before, a.geo)
   a.selPieces.clear()
   for pc in kept ..< tail: a.selPieces.incl pc.int32
-  a.say "CSG " & op
+  a.say "CSG " & op & cutNote
 
 proc createShape(a: App, lo, hi: Vec3, dir: Vec3) =
   if a.geo == nil: return

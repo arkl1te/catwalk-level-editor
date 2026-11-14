@@ -405,6 +405,7 @@ Keys:
 |---|---|
 | Esc | Cancel the drag in progress, then the tool's points or handles, then the tool, then the selection |
 | Ctrl+J / K / Shift+K / L | CSG merge / subtract / hollow (walls one grid step thick) / intersect |
+| Ctrl+K on any surface | Subtract also cuts what isn't a brush (the level's own walls and floors, open or concave pieces): faces lose the part inside the selected brushes and keep their texture and lighting. Faces it only touches, such as the floor it stands on, stay whole. Where a cut goes through a wall's two sides, the cut ends get faces with the brush's texture, and no face goes where one already is. The brushes stay selected; objects' faces and room links aren't cut |
 | Ctrl+J on faces of one plane | Join the touching ones into one face, as far as the shape stays convex (Oni's limit). Pieces from which a face moved stop being brushes: no CSG or corner removal on them |
 | Arrows, PgUp/PgDn | Move the selection one grid step (Ctrl: duplicate and move). With only faces selected, they move and rotate textures (Shift coarse, Ctrl fine). |
 | Alt+arrows, Alt+PgUp/PgDn | Yaw, roll, pitch by 90° (by the rotate tool's angle about its center while it is active) |

@@ -3,7 +3,7 @@
 ## A "brush" is a piece whose faces bound a closed convex solid; any piece can be
 ## moved, clipped and vertex-edited, but CSG needs brushes.
 
-import std/[math, tables, sets, algorithm, sequtils]
+import std/[math, tables, sets, algorithm, sequtils, strutils]
 import vmath
 import geometry, camera
 
@@ -685,6 +685,335 @@ proc csgSubtract*(g: Geometry, minuends: seq[int32], subtrahends: seq[int32],
   g.removePieces(toHashSet(minuends))
   for (planes, attrs) in current:
     if g.addSolid(planes, attrs, densityOf, group) >= 0: inc result
+
+# --- subtracting from surfaces -------------------------------------------------------------
+
+const
+  SubtractDepth = 0.05'f32    ## How far a face has to reach into the brush to be cut.
+  ## Faces that can't stand for a solid's side: the openings they leave aren't closed.
+  NotSolidFlags = gfGhost or gfDoorFrame or gfInvisible or gfTwoSided or gfTransparent or
+                  gfStairs or gfStairsUp or gfStairsDown or gfNoCollision
+
+type CutTrace = object
+  ## Where a cut face met one of the brush's planes: a segment on that plane,
+  ## and the face's normal along the plane (pointing out of the solid it bounds).
+  a, b, n: Vec3
+  piece: int32
+
+proc clipPoints(poly: seq[Vec3], pl: Plane, keepFront: bool): seq[Vec3] =
+  ## clipPolygon on bare corners.
+  let n = poly.len
+  for k in 0 ..< n:
+    let (a, b) = (poly[k], poly[(k + 1) mod n])
+    var (da, db) = (pl.dist(a), pl.dist(b))
+    if keepFront: (da, db) = (-da, -db)
+    if da <= Eps: result.add a
+    if (da < -Eps and db > Eps) or (da > Eps and db < -Eps):
+      result.add a + (b - a) * (da / (da - db))
+
+proc areaOf(poly: seq[Vec3]): float32 =
+  if poly.len < 3: return 0
+  var s = vec3(0, 0, 0)
+  for k in 1 ..< poly.len - 1: s += (poly[k] - poly[0]).cross(poly[k + 1] - poly[0])
+  s.length / 2
+
+proc centerOf(poly: seq[Vec3]): Vec3 =
+  for p in poly: result += p
+  result /= poly.len.float32
+
+proc cornersOf(g: Geometry, f: Face): seq[Vec3] = f.verts.mapIt(g.points[it])
+
+proc insideDepth(planes: seq[Plane], p: Vec3): float32 =
+  ## How far p is inside the convex solid (negative outside).
+  result = Inf.float32
+  for pl in planes: result = min(result, -pl.dist(p))
+
+proc rayHit(c, d, n: Vec3, traces: seq[CutTrace]): (int, int32) =
+  ## The nearest trace a ray from c along d (both on the plane with normal n)
+  ## crosses: 1 when it meets the trace's back (c is on the solid side), -1
+  ## its front, 0 none; and that trace's piece.
+  var best = Inf.float32
+  for t in traces:
+    let e = t.b - t.a
+    let den = d.cross(e).dot(n)
+    if abs(den) < 1e-6: continue
+    let w = t.a - c
+    let s = w.cross(e).dot(n) / den
+    let u = w.cross(d).dot(n) / den
+    if s <= 1e-3 or u < -1e-3 or u > 1 + 1e-3 or s >= best: continue
+    best = s
+    result = ((if d.dot(t.n) > 0: 1 else: -1), t.piece)
+
+proc joinedOutline(a, b: seq[Vec3], n: Vec3): seq[Vec3]
+
+proc subtractSurfaces*(g: Geometry, faces: seq[int], subtrahends: seq[int32],
+                       densityOf: proc(tex: string): float32): (int, int) =
+  ## Cuts the subtrahend brushes out of faces of any kind (imported level
+  ## geometry, open or concave pieces): a face reaching into a brush loses the
+  ## part inside it and keeps the rest, in its piece, with its look (UVs and
+  ## colors carried over). Faces that only touch a brush or lie on its surface
+  ## (the floor it stands on) are left whole. Where cut faces enclose a solid
+  ## (the two sides of a wall), the brush's surface closes the opening with a
+  ## face that takes the brush face's look, as subtracting brushes does, in
+  ## the piece of the face it closes; never where a face already covers it.
+  ## The subtrahends are kept. Piece numbers stay valid. Returns (faces cut,
+  ## faces added).
+  let byPiece = g.pieceFaces
+  let skip = toHashSet(subtrahends)
+  let firstNew = g.points.len.int32
+  var work = faces
+  var drop: HashSet[int]
+  var touched: HashSet[int]
+  for s in subtrahends:
+    let (bp, _) = g.brushPlanes(byPiece[s])
+    let polys = solidFromPlanes(bp)
+    if polys.len < 4: continue
+    var lo = vec3(Inf.float32)
+    var hi = vec3(-Inf.float32)
+    for (_, poly) in polys:
+      for p in poly:
+        lo = min(lo, p)
+        hi = max(hi, p)
+    proc nearBox(pts: seq[Vec3]): bool =
+      var (l, h) = (vec3(Inf.float32), vec3(-Inf.float32))
+      for p in pts:
+        l = min(l, p)
+        h = max(h, p)
+      h.x >= lo.x - Eps and h.y >= lo.y - Eps and h.z >= lo.z - Eps and
+        l.x <= hi.x + Eps and l.y <= hi.y + Eps and l.z <= hi.z + Eps
+    var traces = newSeq[seq[CutTrace]](bp.len)
+    var next: seq[int]
+    for fi in work:
+      if fi in drop: continue
+      let pts = g.cornersOf(g.faces[fi])
+      if pts.len < 3 or not nearBox(pts):
+        next.add fi
+        continue
+      var inside = pts
+      for pl in bp:
+        inside = clipPoints(inside, pl, keepFront = false)
+        if inside.len < 3: break
+      # Only a face reaching into the brush: one lying on its surface or
+      # touching it from outside is neither cut nor split.
+      if inside.len < 3 or areaOf(inside) < 0.01 or
+         insideDepth(bp, centerOf(inside)) < SubtractDepth:
+        next.add fi
+        continue
+      var f = g.faces[fi]
+      f.uvs.setLen f.verts.len
+      while f.colors.len < f.verts.len: f.colors.add [200'u8, 200, 200, 255]
+      f.colors.setLen f.verts.len
+      if (f.flags and NotSolidFlags) == 0:
+        let fn = g.normal(f)
+        for i, pl in bp:
+          var on: seq[Vec3]
+          for p in inside:
+            if abs(pl.dist(p)) <= 0.02: on.add p
+          if on.len < 2: continue
+          var (a, b, far) = (on[0], on[1], -1'f32)
+          for x in 0 ..< on.len:
+            for y in x + 1 ..< on.len:
+              let d = (on[x] - on[y]).length
+              if d > far: (a, b, far) = (on[x], on[y], d)
+          let along = fn - pl.n * fn.dot(pl.n)
+          if far < Eps or along.length < 1e-3: continue
+          traces[i].add CutTrace(a: a, b: b, n: along.normalize, piece: f.piece)
+      var rest = f
+      var first = true
+      for pl in bp:
+        let part = g.clipPolygon(rest, pl, keepFront = true)
+        rest = g.clipPolygon(rest, pl, keepFront = false)
+        if part.verts.len >= 3 and areaOf(g.cornersOf(part)) > 1e-3:
+          if first:
+            g.faces[fi] = part
+            next.add fi
+            touched.incl fi
+            first = false
+          else:
+            g.faces.add part
+            next.add g.faces.high
+            touched.incl g.faces.high
+        if rest.verts.len < 3: break
+      if first: drop.incl fi
+      g.pieces[f.piece].brush = false
+      inc result[0]
+    # Close the openings: per brush face, the parts its traces enclose.
+    for pi in 0 ..< polys.len:
+      let (i, poly) = polys[pi]
+      if traces[i].len == 0: continue
+      let pl = bp[i]
+      let capN = -pl.n
+      # Faces already lying there, facing the same way, cover their part.
+      var covers: seq[(seq[Vec3], Vec3)]
+      for fi in 0 ..< g.faces.len:
+        let cf = g.faces[fi]
+        if fi in drop or cf.piece in skip or cf.objectId != -1 or
+           (cf.flags and NotSolidFlags) != 0 or cf.texture.startsWith("_marker"): continue
+        let pts = g.cornersOf(cf)
+        if pts.len < 3 or not nearBox(pts): continue
+        if pts.anyIt(abs(pl.dist(it)) > SubtractDepth): continue
+        let n = g.normal(g.faces[fi])
+        if n.dot(capN) > 0.9: covers.add (pts, n)
+      var cells = @[poly]
+      proc split(cut: Plane) =
+        var nextCells: seq[seq[Vec3]]
+        for c in cells:
+          for keepFront in [true, false]:
+            let part = clipPoints(c, cut, keepFront)
+            if part.len >= 3 and areaOf(part) > 1e-4: nextCells.add part
+        cells = nextCells
+      for t in traces[i]: split(plane(t.n, t.a))
+      for (pts, n) in covers:
+        for k in 0 ..< pts.len:
+          let e = pts[(k + 1) mod pts.len] - pts[k]
+          if e.length > Eps: split(plane(e.cross(pl.n).normalize, pts[k]))
+      var dirs: seq[Vec3]
+      for t in traces[i]:
+        for d in [t.n, -t.n]:
+          if not dirs.anyIt(it.dot(d) > 0.9999): dirs.add d
+      var like = -1
+      for fi in byPiece[s]:
+        let fp = g.facePlane(g.faces[fi])
+        if fp.n.dot(pl.n) > 0.9999 and abs(fp.d - pl.d) < Eps * 10:
+          like = fi
+          break
+      if like < 0: continue
+      # Cells not parted by a cut face are inside or outside alike: group
+      # them, so a region the rays can't judge on its own (bounded by the
+      # brush's edges as much as by cut faces) goes with the rest of its solid.
+      var group = toSeq(0 ..< cells.len)
+      proc root(x: int): int =
+        result = x
+        while group[result] != result: result = group[result]
+      proc parted(p, q: Vec3): bool =
+        ## Whether cut faces cover all of the segment p-q.
+        let d = q - p
+        let len = d.length
+        var spans: seq[(float32, float32)]
+        for t in traces[i]:
+          var (ta, tb) = ((t.a - p).dot(d) / len, (t.b - p).dot(d) / len)
+          if ((t.a - p) - d * (ta / len)).length > 0.02 or
+             ((t.b - p) - d * (tb / len)).length > 0.02: continue
+          if ta > tb: swap(ta, tb)
+          if tb > Eps and ta < len - Eps: spans.add (ta, tb)
+        spans.sort(proc(x, y: (float32, float32)): int = cmp(x[0], y[0]))
+        var reach = 0'f32
+        for (x, y) in spans:
+          if x > reach + Eps: return false
+          reach = max(reach, y)
+          if reach >= len - Eps: return true
+        false
+      for x in 0 ..< cells.len:
+        for y in x + 1 ..< cells.len:
+          if root(x) == root(y): continue
+          let (cx, cy) = (cells[x], cells[y])
+          block shared:
+            for k in 0 ..< cx.len:
+              let (p, q) = (cx[k], cx[(k + 1) mod cx.len])
+              let e = q - p
+              let len = e.length
+              if len < Eps: continue
+              let u = e / len
+              for m in 0 ..< cy.len:
+                let (r, w) = (cy[m], cy[(m + 1) mod cy.len])
+                # Neighbours run along a shared edge the opposite way.
+                if (w - r).length < Eps or (w - r).normalize.dot(u) > -0.9999: continue
+                if ((r - p) - u * (r - p).dot(u)).length > 0.02 or
+                   ((w - p) - u * (w - p).dot(u)).length > 0.02: continue
+                let lo = max(0'f32, min((r - p).dot(u), (w - p).dot(u)))
+                let hi = min(len, max((r - p).dot(u), (w - p).dot(u)))
+                if hi - lo < Eps: continue
+                if not parted(p + u * lo, p + u * hi):
+                  group[root(y)] = root(x)
+                  break shared
+      # Inside a solid: some line through a cell meets the backs of cut faces
+      # both ways; outside: some way meets a front. A group is inside when
+      # one of its cells is and none is outside.
+      var (insideHit, outsideHit) = (newSeq[bool](cells.len), newSeq[bool](cells.len))
+      var pieceOf = newSeq[int32](cells.len)
+      for x, cell in cells:
+        let c = centerOf(cell)
+        let r = root(x)
+        for d in dirs:
+          let (h1, p1) = rayHit(c, d, pl.n, traces[i])
+          let (h2, _) = rayHit(c, -d, pl.n, traces[i])
+          if h1 < 0 or h2 < 0: outsideHit[r] = true
+          if h1 > 0 and h2 > 0 and not insideHit[r]:
+            insideHit[r] = true
+            pieceOf[r] = p1
+      # The cells to close, joined where they make one convex face.
+      var parts: seq[(seq[Vec3], int32)]
+      for x, cell in cells:
+        let r = root(x)
+        if not insideHit[r] or outsideHit[r] or areaOf(cell) < 0.01: continue
+        let c = centerOf(cell)
+        var covered = false
+        for (pts, n) in covers:
+          var all = true
+          for k in 0 ..< pts.len:
+            if (pts[(k + 1) mod pts.len] - pts[k]).cross(c - pts[k]).dot(n) < -1e-3:
+              all = false
+              break
+          if all:
+            covered = true
+            break
+        if not covered: parts.add (cell, pieceOf[r])
+      var joined = true
+      while joined:
+        joined = false
+        block search:
+          for x in 0 ..< parts.len:
+            for y in x + 1 ..< parts.len:
+              if parts[x][1] != parts[y][1]: continue
+              let both = joinedOutline(parts[x][0], parts[y][0], pl.n)
+              if both.len == 0: continue
+              parts[x][0] = both
+              parts.delete y
+              joined = true
+              break search
+      for (cell, piece) in parts:
+        let src = g.faces[like]
+        var attr = attrOf(src)
+        attr.frame = g.texFrame(src, densityOf(src.texture))
+        var f = Face(texture: attr.texture, flags: attr.flags, scriptId: attr.scriptId,
+                     untint: attr.untint, objectId: -1, piece: piece)
+        for k in countdown(cell.high, 0):
+          f.verts.add g.points.len.int32
+          g.points.add cell[k]
+          f.colors.add attr.color
+        g.mapNewFace(f, attr, densityOf(attr.texture))
+        g.faces.add f
+        g.pieces[piece].brush = false
+        next.add g.faces.high
+        touched.incl g.faces.high
+        inc result[1]
+    work = next
+  # Corners the cuts made twice (once per neighbouring part) become one again.
+  # Only new corners move onto others: the old ones stay shared as they were.
+  var at: Table[(int, int, int), int32]
+  proc key(p: Vec3): (int, int, int) =
+    (int(round(p.x * 256)), int(round(p.y * 256)), int(round(p.z * 256)))
+  for fi in touched:
+    for v in g.faces[fi].verts:
+      if v < firstNew: discard at.mgetOrPut(key(g.points[v]), v)
+  for fi in touched:
+    var f = addr g.faces[fi]
+    for v in f.verts.mitems:
+      if v >= firstNew: v = at.mgetOrPut(key(g.points[v]), v)
+    var k = 0
+    while k < f.verts.len and f.verts.len > 3:
+      let j = (k + 1) mod f.verts.len
+      if f.verts[k] == f.verts[j]:
+        f.verts.delete j
+        f.uvs.delete j
+        f.colors.delete j
+        if j < f.anims.len: f.anims.delete j
+      else: inc k
+  var kept: seq[Face]
+  for fi, f in g.faces:
+    if fi notin drop: kept.add f
+  g.faces = kept
+  g.compact(keepPieces = true)
 
 proc csgIntersect*(g: Geometry, pieces: seq[int32], densityOf: proc(tex: string): float32): bool =
   let byPiece = g.pieceFaces

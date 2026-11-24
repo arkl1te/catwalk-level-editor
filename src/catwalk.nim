@@ -9,6 +9,7 @@ import theme, ui, icons, dialogs, menutree, xwin, colorpick
 import project, camera, render, appstate, viewtools, panels, objtemplates, music, pie, mcp, mcptools,
        screenshot, crashlog, setupwin, frameprof
 from library import renderPreviewsCli
+from fieldchoices import SoundGroup
 
 template staticBytes(path: string): untyped =
   ## A file's bytes, embedded at compile time.
@@ -21,7 +22,7 @@ const
   AppVersion = staticRead("../VERSION").strip
   # Bytes, not strings: MSVC refuses a C string literal past 64 KB (Majestic's fix).
   FontData = staticBytes("../assets/fonts/IBMPlexSans-Regular.ttf")
-  MonoFontData = staticBytes("../assets/fonts/IBMPlexMono-Regular.ttf")
+  MonoFontData = staticBytes("../assets/fonts/JetBrainsMono-Regular.ttf")   # SIL OFL 1.1: assets/fonts/JetBrainsMono-OFL.txt
   IconSvg = staticRead("../assets/catwalk.svg")
   # logo.svg with its text converted to paths (pixie can't draw <text>); see the Makefile.
   LogoSvg = staticRead("../assets/logo-paths.svg")
@@ -49,6 +50,7 @@ proc frame(a: App) =
   a.pollJob()
   a.pollLoads()
   a.autoLoad()
+  a.restoreTextures()
   a.pollMcp(AppVersion)
   if a.dialog != nil:
     var done = false
@@ -60,7 +62,9 @@ proc frame(a: App) =
         let dir = res[0]
         case purpose
         of "textures": a.importTextures(res)
+        of "texsource": a.addTextureSource(dir)
         of "sounds": a.importSounds(res)
+        of "models": a.importModels(res)
         of "fieldsound":
           a.importSounds(res, a.soundImportPick)
           a.soundImportPick = nil
@@ -186,7 +190,7 @@ proc moving(a: App): bool =
   ## Whether frames must come at the display's rate.
   if a.busy or a.loads.len > 0 or a.realtime or a.particlePlaying.len > 0 or a.camAnim.on or
      a.drag.kind != dkNone or a.menuSys.isOpen or a.setupOpen or
-     epochTime() - a.dupFlashAt < 1:
+     epochTime() - a.dupFlashAt < 1 or epochTime() - a.spotMarksAt < SpotMarkTime or epochTime() < a.animUntil:
     return true
   for b in Button:
     if a.window.buttonDown[b]: return true   # a key or button held: flying, dragging
@@ -265,14 +269,15 @@ proc main() =
   let forceMcp = "--mcp-server" in args
   args.keepItIf(it != "--mcp-server")
   let a = App(cfg: loadConfig(), mcpForced: forceMcp, gridIndex: GridKeyBase + 3, snap: true, showGrid: true,
-              hoverView: -1, maximized: -1, layout: pl1, previewParts: {ppLights, ppSounds, ppParticles},
+              hoverView: -1, maximized: -1, layout: pl1, previewParts: {ppLights, ppSounds, ppParticles, ppFog},
               previewSoundVolume: 1, previewMusicVolume: 1, dock: defaultDock(),
               opts: ViewOptions(mode: rmDynamicLight, models: true, sky: true), showDirections: true, showGizmos: true,
-              showEditorOnly: true, notesRange: DefaultNotesRange, editorOnlyParts: {EditorOnlyPart.low .. EditorOnlyPart.high}, lastTime: epochTime(), zoom2D: 0.5, flySpeed: StartFlySpeed, texThumb: DefaultTexThumb, entityPreview: 0.75, newTexLevel: 1, codeFontSize: DefaultCodeFontSize,
+              showEditorOnly: true, notesRange: DefaultNotesRange, editorOnlyParts: {EditorOnlyPart.low .. EditorOnlyPart.high}, lastTime: epochTime(), zoom2D: 0.5, flySpeed: StartFlySpeed, texThumb: DefaultTexThumb, entityPreview: 0.75, newTexLevel: 1, soundOpen: {SoundGroup.sgLoop}, codeFontSize: DefaultCodeFontSize, scriptSoundVolume: 1.0,
               brushHeight: 64, rotateAngle: 15,
               moveBy: "0 0 0", shade: [200.0, 200, 200],
               splitX: 0.55, splitY: 0.5, shapeSides: 8, shapeSteps: 4, treeAnchor: -1,
-              extrudeHover: -1, browserPress: (-1, vec2(0, 0)), scaleBySize: true, rotAxis: 1, newSky: Skies[0])
+              extrudeHover: -1, browserPress: (-1, vec2(0, 0)), scaleBySize: true, rotAxis: 1, newSky: Skies[0],
+              uvView: UvView(face: -1, height: DefaultUvViewH, grid: [1, 1]))
   for c in Categories: a.browserOpen.incl c.generic
   a.loadLayout()
   a.loadPresets()
@@ -364,6 +369,7 @@ proc main() =
   a.saveCamera()
   a.saveLayout()
   stopPreview()
+  stopClip()
   stopScene()
   stopMcp()
   closeLog()

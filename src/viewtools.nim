@@ -434,6 +434,16 @@ proc resetRotateCenter*(a: App) =
   if ok: a.rotCenter = c
   a.rotCenterText = &"{a.rotCenter.x:g} {a.rotCenter.y:g} {a.rotCenter.z:g}"
 
+proc gizmoAxes*(a: App): array[3, Vec3] =
+  ## The axes the translation gizmo and the rotate rings use: the world's, or
+  ## with local axes on, the first selected object's own (geometry has none).
+  result = [vec3(1, 0, 0), vec3(0, 1, 0), vec3(0, 0, 1)]
+  if not a.gizmoLocal: return
+  let sel = a.selection
+  if sel.len == 0: return
+  let m = objectMatrix(vec3(0, 0, 0), sel[0].rot)
+  for k in 0 .. 2: result[k] = (m * result[k]).normalize
+
 proc ringRadius(a: App, vi: int): float32 =
   ## World radius of the rotate ring so it is RotateRingPx on screen.
   let cam = a.views[vi].cam
@@ -444,11 +454,8 @@ proc ringRadius(a: App, vi: int): float32 =
 
 proc ringPoints(a: App, vi: int, axis: int): seq[Vec3] =
   let r = a.ringRadius(vi)
-  var u, v: Vec3
-  case axis
-  of 0: (u, v) = (vec3(0, 1, 0), vec3(0, 0, 1))
-  of 1: (u, v) = (vec3(1, 0, 0), vec3(0, 0, 1))
-  else: (u, v) = (vec3(1, 0, 0), vec3(0, 1, 0))
+  let axes = a.gizmoAxes
+  let (u, v) = (axes[(axis + 1) mod 3], axes[(axis + 2) mod 3])
   for k in 0 .. 64:
     let t = k.float32 / 64 * 2 * PI
     result.add a.rotCenter + (u * cos(t) + v * sin(t)) * r
@@ -527,7 +534,8 @@ proc scaleHandleAt(a: App, vi: int, m: Vec2): (bool, Vec3) =
 
 # --- translation gizmo ---------------------------------------------------------------------------
 # Selected entities get X/Y/Z arrows (with no modal tool). Dragging one moves
-# the selection along that world axis only.
+# the selection along that axis only: the world's, or the object's own with
+# local axes on (gizmoAxes).
 
 proc gizmoShown*(a: App): bool =
   a.tool == toolSelect and a.selection.len > 0 and
@@ -555,10 +563,9 @@ proc gizmoArrows(a: App, vi: int): seq[tuple[axis: int, base, tip: Vec2]] =
   let (ok, p) = a.toScreen(vi, c)
   if not ok: return
   let l = a.gizmoLength(vi, c)
+  let axes = a.gizmoAxes
   for axis in 0 .. 2:
-    var e = vec3(0, 0, 0)
-    e[axis] = 1
-    let (ok2, q) = a.toScreen(vi, c + e * l)
+    let (ok2, q) = a.toScreen(vi, c + axes[axis] * l)
     if ok2 and (q - p).length > GizmoArrowPx * 0.2: result.add (axis, p, q)
 
 proc gizmoSquares(a: App, vi: int): seq[tuple[normal: int, quad: array[4, Vec2]]] =
@@ -566,10 +573,9 @@ proc gizmoSquares(a: App, vi: int): seq[tuple[normal: int, quad: array[4, Vec2]]
   ## One seen (nearly) edge-on is left out.
   let c = a.gizmoCenter
   let l = a.gizmoLength(vi, c)
+  let axes = a.gizmoAxes
   for n in 0 .. 2:
-    var u, v = vec3(0, 0, 0)
-    u[(n + 1) mod 3] = 1
-    v[(n + 2) mod 3] = 1
+    let (u, v) = (axes[(n + 1) mod 3], axes[(n + 2) mod 3])
     let (s0, s1) = (l * GizmoSquareFrom, l * GizmoSquareTo)
     var quad: array[4, Vec2]
     var ok = true
@@ -613,6 +619,61 @@ proc alongAxis(r: Ray, origin, e: Vec3): (bool, float32) =
   let denom = 1 - b * b
   if denom < 1e-6: return (false, 0)
   (true, (b * r.dir.dot(w0) - e.dot(w0)) / denom)
+
+# --- furniture scale gizmo -----------------------------------------------------------------------
+# The Scale tool on furniture alone: a handle along each of the (first) object's
+# own axes, with a box for a head, and a square in the middle. Dragging a handle
+# scales along that axis (Shift: all three), the square all three. Each object
+# scales about its own position (setScale).
+
+const
+  ScaleSnap = 0.05'f32   ## Scale steps while snapping to the grid.
+
+proc objScaleShown*(a: App): bool =
+  ## Whether the Scale tool shows the furniture scale gizmo instead of the
+  ## bounds' handles: only objects that scale are selected.
+  if a.tool != toolScale or a.selPieces.len > 0 or a.selFaces.len > 0: return false
+  if a.drag.kind notin {dkNone, dkScaleObj, dkLook, dkOrbit, dkPan, dkIgnore}: return false
+  let sel = a.selection
+  sel.len > 0 and sel.allIt(it.canScale)
+
+proc objScaleCenter(a: App): Vec3 =
+  let sel = a.selection
+  for o in sel: result += o.pos
+  if sel.len > 0: result = result / sel.len.float32
+
+proc objScaleAxes(a: App): array[3, Vec3] =
+  ## The first selected object's own X, Y and Z in the world. Furniture can't
+  ## shear, so this gizmo stays on them whether the gizmo axes are world or local.
+  let sel = a.selection
+  let m = objectMatrix(vec3(0, 0, 0), if sel.len > 0: sel[0].rot else: vec3(0, 0, 0))
+  for k in 0 .. 2:
+    var e = vec3(0, 0, 0)
+    e[k] = 1
+    result[k] = (m * e).normalize
+
+proc objScaleHandles(a: App, vi: int): seq[tuple[axis: int, base, tip: Vec2]] =
+  ## The handles on screen; one pointing (nearly) at the viewer is left out.
+  let c = a.objScaleCenter
+  let (ok, p) = a.toScreen(vi, c)
+  if not ok: return
+  let l = a.gizmoLength(vi, c)
+  let axes = a.objScaleAxes
+  for k in 0 .. 2:
+    let (ok2, q) = a.toScreen(vi, c + axes[k] * l)
+    if ok2 and (q - p).length > GizmoArrowPx * 0.2: result.add (k, p, q)
+
+proc objScaleAt(a: App, vi: int, m: Vec2): string =
+  ## "scale0".."scale2" (a handle), "scaleAll" (the middle square) or "".
+  if not a.objScaleShown: return
+  let (ok, c) = a.toScreen(vi, a.objScaleCenter)
+  if ok and abs(m.x - c.x) <= 8 and abs(m.y - c.y) <= 8: return "scaleAll"
+  var best = 8'f32
+  for (axis, p, q) in a.objScaleHandles(vi):
+    let d = min(segDist(m, p + (q - p) * 0.2, q), (m - q).length)
+    if d < best:
+      best = d
+      result = "scale" & $axis
 
 # --- volume handles -------------------------------------------------------------------------------
 # A selected sound's Box or trigger volume gets a handle in the middle of each
@@ -695,8 +756,9 @@ proc rectObjects(a: App, r: Rect): seq[LevelObject] =
 
 # --- extrusion targets ---------------------------------------------------------------------------
 
-proc raySegDist(r: Ray, p, q: Vec3): float32 =
-  ## Shortest distance between the ray and the segment p..q (world units).
+proc raySegClosest(r: Ray, p, q: Vec3): (float32, Vec3, Vec3) =
+  ## Shortest distance between the ray and the segment p..q (world units), with
+  ## the ray's point and the segment's point that are that far apart.
   let d = q - p
   let w0 = p - r.origin
   let (aa, b, dd, e) = (d.dot(d), d.dot(r.dir), d.dot(w0), r.dir.dot(w0))
@@ -706,15 +768,29 @@ proc raySegDist(r: Ray, p, q: Vec3): float32 =
   if t < 0:
     t = 0
     s = if aa < 1e-9: 0'f32 else: clamp(-dd / aa, 0, 1)
-  (p + d * s - (r.origin + r.dir * t)).length
+  let (onRay, onSeg) = (r.origin + r.dir * t, p + d * s)
+  ((onSeg - onRay).length, onRay, onSeg)
 
-proc extrudeFaceAt*(a: App, vi: int, m: Vec2): int =
+type ExtrudePick* = object
+  ## What a Shift+drag on a selected piece grabs (TrenchBroom's ExtrudeHitData):
+  ## the face it moves, the point on the mouse ray it starts from, and how the
+  ## mouse ray picks the drag distance from there. line: the point on the line
+  ## through it along the face's normal nearest the ray (a face under the mouse
+  ## in 3D); else where the ray meets the plane through it with normal plane,
+  ## measured along the face's normal (a horizon edge: the face in front of the
+  ## edge in 3D, the view direction in 2D).
+  face*: int
+  point*: Vec3
+  line*: bool
+  plane*: Vec3
+
+proc extrudePickAt*(a: App, vi: int, m: Vec2): ExtrudePick =
   ## The selected piece's face Shift+drag would move: the one under the mouse,
   ## else the hidden face behind the horizon edge nearest the mouse ray, however
   ## far (TrenchBroom's ExtrudeTool). A horizon edge joins a face seen from the
   ## front and one that isn't; in 2D views, where the mouse is over the selection,
   ## only an edge within a few pixels counts, as the mouse there moves the piece.
-  result = -1
+  result.face = -1
   if a.geo == nil or a.selPieces.len == 0: return
   let cam = a.views[vi].cam
   let r = a.viewRay(vi, m)
@@ -731,11 +807,14 @@ proc extrudeFaceAt*(a: App, vi: int, m: Vec2): int =
       let t = r.rayTriangle(p0, a.geo.points[f.verts[k]], a.geo.points[f.verts[k + 1]])
       if t >= 0 and t < bestT:
         bestT = t
-        result = fi
-  if result >= 0:
-    if cam.kind == vk3D: return
+        result.face = fi
+  if result.face >= 0:
+    if cam.kind == vk3D:
+      result.point = r.origin + r.dir * bestT
+      result.line = true
+      return
     over = true
-    result = -1
+    result.face = -1
   # Each piece's edges with the faces on them (matched by position: faces may not share points).
   var edges: Table[(int32, string, string), seq[int]]
   var ends: Table[(int32, string, string), (Vec3, Vec3)]
@@ -753,8 +832,9 @@ proc extrudeFaceAt*(a: App, vi: int, m: Vec2): int =
   var best = Inf.float32
   for key, fs in edges:
     # The face to drag: the hidden one of a horizon pair, or, at an edge only one
-    # face has, that face when it isn't seen from the front.
-    var drag = -1
+    # face has, that face when it isn't seen from the front. ref: the pair's
+    # other face, seen from the front.
+    var (drag, refFace) = (-1, -1)
     if fs.len == 1:
       let dt = dots[fs[0]]
       if (cam.kind == vk3D and dt >= 0) or (cam.kind != vk3D and abs(dt) < 0.9): drag = fs[0]
@@ -762,9 +842,11 @@ proc extrudeFaceAt*(a: App, vi: int, m: Vec2): int =
       for i in 0 ..< fs.len:
         for j in i + 1 ..< fs.len:
           let (di, dj) = (dots[fs[i]], dots[fs[j]])
-          if (di < 0) != (dj < 0): drag = (if di > dj: fs[i] else: fs[j])
+          if (di < 0) != (dj < 0):
+            (drag, refFace) = (if di > dj: (fs[i], fs[j]) else: (fs[j], fs[i]))
     if drag < 0: continue
     let (p, q) = ends[key]
+    let (rd, onRay, _) = r.raySegClosest(p, q)
     var d: float32
     if over:
       let (o1, p1) = a.toScreen(vi, p)
@@ -773,10 +855,17 @@ proc extrudeFaceAt*(a: App, vi: int, m: Vec2): int =
       d = segDist(m, p1, p2)
       if d >= 8: continue
     else:
-      d = r.raySegDist(p, q)
+      d = rd
     if d < best:
       best = d
-      result = drag
+      # TrenchBroom anchors the drag at the ray's point nearest the edge (its
+      # handle position plus handle offset), so it feels like dragging the edge.
+      result = ExtrudePick(face: drag, point: onRay)
+      if cam.kind != vk3D: result.plane = r.dir
+      elif refFace >= 0: result.plane = a.geo.normal(a.geo.faces[refFace])
+      else: result.line = true  # An open edge: no face in front of it.
+
+proc extrudeFaceAt*(a: App, vi: int, m: Vec2): int = a.extrudePickAt(vi, m).face
 
 proc cutEdgeAt*(a: App, vi: int, m: Vec2): (int, Vec3, Vec3) =
   ## The selected face Ctrl+Shift+drag would cut and the edge the cut would
@@ -1217,6 +1306,16 @@ proc buildOverlays*(a: App) =
     if o.selected and a.geo != nil and o.objectCode != -1:
       for fi in a.ownedFaces(o):
         r.tris.faceFill(a.geo, a.geo.faces[fi], rgba(255, 60, 60, 60))
+  # Spots the views were sent to with no object there (a level particle a
+  # script names): a particle-colored box pulsing on top, fading out.
+  let markAge = epochTime() - a.spotMarksAt
+  if markAge < SpotMarkTime:
+    let fade = clamp((SpotMarkTime - markAge) / 1.0, 0, 1)
+    let pulse = 0.5 + 0.5 * cos(markAge * 2 * PI * 1.5)
+    let alpha = uint8(255 * fade)
+    for p in a.spotMarks:
+      r.overlayLines.wireBox(boxCorners(p, vec3(1.5'f32 + 1.5 * pulse.float32), 0), [255'u8, 110, 255, alpha])
+      r.overlayLines.wireBox(boxCorners(p, vec3(0.6'f32), 0), [255'u8, 255, 255, alpha])
   if a.geo != nil:
     # The clip tool draws the selection as it would be after the cut instead.
     let clipping = a.tool == toolClip and a.clipPlane[0]
@@ -1311,7 +1410,7 @@ proc buildOverlays*(a: App) =
       let fill = [HandleCol[0], HandleCol[1], HandleCol[2], 128'u8]
       for k in 1 ..< o.len - 1:
         for p in [o[0], o[k], o[k + 1]]: r.overlayTris.add FlatVert(pos: p, col: fill)
-  if a.tool == toolScale and sok:
+  if a.tool == toolScale and sok and not a.objScaleShown:
     r.overlayLines.wireBox(boxCorners((slo + shi) / 2, (shi - slo) / 2, 0), rgba(160, 140, 255))
   a.updatePreview()
 
@@ -1325,25 +1424,33 @@ proc buildGrid(a: App, vi: int, body: Rect) =
   while g * cam.zoom < 6: g *= 2
   let lo = cam.pixelToPlane(0, body.h, body.w, body.h)
   let hi = cam.pixelToPlane(body.w, 0, body.w, body.h)
-  # Alphas are for the default opacity 0.5 (Settings > View > Grid opacity).
+  # As opaque as the 3D view's face grid at the same Settings > View > Grid
+  # opacity (render.nim grid(): minor lines 0.85 x 0.5, major 1.55 x 0.5, times
+  # the opacity), so 0.425 and 0.775 times it here.
   let prefs = if a.settingsOpen: a.settingsEdit else: a.cfg
-  let op = prefs.gridOpacity / 0.5
-  proc alpha(v: float): int = int(clamp(v * op, 0, 255))
+  let opacity = clamp(prefs.gridOpacity, 0, 1)
+  proc alpha(share: float): uint8 = uint8(clamp(share * opacity * 255, 0, 255))
   let gc = prefs.gridColor
-  let minor = [gc[0].uint8, gc[1].uint8, gc[2].uint8, alpha(14).uint8]
-  let major = [gc[0].uint8, gc[1].uint8, gc[2].uint8, alpha(34).uint8]
+  let minor = [gc[0].uint8, gc[1].uint8, gc[2].uint8, alpha(0.425)]
+  let major = [gc[0].uint8, gc[1].uint8, gc[2].uint8, alpha(0.775)]
   proc axisCol(dir: Vec3): array[4, uint8] =
+    # The world axes stay stronger than the grid lines (130 at the default 0.5).
     let c = axisColor(axisIndex(dir))
-    [c[0], c[1], c[2], alpha(130).uint8]
+    [c[0], c[1], c[2], alpha(130 / 255 / 0.5)]
+  # Each line a quad Settings' thickness wide on screen (1 = one pixel).
+  let half = clamp(prefs.gridThickness, MinGridThickness, MaxGridThickness).float32 / cam.zoom / 2
+  proc strip(a, b, side: Vec3, col: array[4, uint8]) =
+    let (p0, p1, p2, p3) = (a - side * half, b - side * half, b + side * half, a + side * half)
+    for p in [p0, p1, p2, p0, p2, p3]: r.gridLines.add FlatVert(pos: p, col: col)
   var x = floor(lo.x / g) * g
   while x <= hi.x:
     let col = if abs(x) < 0.001: axisCol(ax.up) elif abs(x / (g * 8) - round(x / (g * 8))) < 0.001: major else: minor
-    r.gridLines.line(ax.right * x + ax.up * lo.y, ax.right * x + ax.up * hi.y, col)
+    strip(ax.right * x + ax.up * lo.y, ax.right * x + ax.up * hi.y, ax.right, col)
     x += g
   var y = floor(lo.y / g) * g
   while y <= hi.y:
     let col = if abs(y) < 0.001: axisCol(ax.right) elif abs(y / (g * 8) - round(y / (g * 8))) < 0.001: major else: minor
-    r.gridLines.line(ax.right * lo.x + ax.up * y, ax.right * hi.x + ax.up * y, col)
+    strip(ax.right * lo.x + ax.up * y, ax.right * hi.x + ax.up * y, ax.up, col)
     y += g
 
 proc drawViews*(a: App) =
@@ -1363,6 +1470,7 @@ proc drawViews*(a: App) =
                           prefs.gridColor[2].float32) / 255
   a.rend.gridColor3D = prefs.gridColor3D
   a.rend.gridAlpha = prefs.gridOpacity.float32
+  a.rend.gridThickness = prefs.gridThickness.float32
   a.rend.brightness = prefs.brightness.float32
   a.rend.setTextureFilter(prefs.linearFilter)
   let proj = a.proj
@@ -1690,7 +1798,7 @@ proc drawViewOverlays*(a: App) =
     ui.pushClip(b)
     let is3D = v.cam.kind == vk3D
     # Size of the selection: always in 2D, in 3D while hovering it or dragging.
-    if sok and a.tool notin {toolVertex, toolEdge, toolFace} and
+    if sok and a.tool notin {toolVertex, toolEdge, toolFace} and not a.objScaleShown and
        (not is3D or a.drag.kind in {dkMove, dkScale, dkGizmo} or
         (hot and a.hoveringSelection(i))):
       a.sizeLabels(i, slo, shi)
@@ -1713,7 +1821,7 @@ proc drawViewOverlays*(a: App) =
           for axis in 0 .. 2:
             let pts = a.ringPoints(i, axis)
             let hotRing = a.hoverHandle == "ring" & $axis or (a.drag.kind == dkRotate and
-                          axisIndex(a.drag.axis) == axis)
+                          a.drag.axisIdx == axis)
             let col = axisColor(axis).toUi
             for k in 0 ..< pts.len - 1:
               let (o1, p1) = a.toScreen(i, pts[k])
@@ -1729,15 +1837,38 @@ proc drawViewOverlays*(a: App) =
           ui.chip(fmtVec(a.rotCenter), c + vec2(0, -20))
         if a.drag.kind == dkRotate and a.drag.view == i:
           ui.chip(fmtNum(a.drag.angle) & "°", c + vec2(0, 22))
+    # Furniture scale gizmo.
+    if a.objScaleShown:
+      let dragging = a.drag.kind == dkScaleObj
+      let all = dragging and (a.drag.scaleAxes == vec3(1, 1, 1) or a.mods.s)
+      for (axis, p, q) in a.objScaleHandles(i):
+        let active = all or (dragging and a.drag.scaleAxes[axis] > 0) or
+                     (not dragging and hot and a.hoverHandle == "scale" & $axis)
+        if dragging and not active: continue
+        let col = if active: HandleCol.toUi else: axisColor(axis).toUi
+        let dir = (q - p).normalize
+        ui.uiLine(p, q - dir * 5, col, if active: 3.0 else: 2.0)
+        ui.rect(rect(q.x - 5, q.y - 5, 10, 10), col)
+        ui.text(["X", "Y", "Z"][axis], q + dir * 9 + vec2(-4, -8), col, FontSmall)
+      let (okc, c) = a.toScreen(i, a.objScaleCenter)
+      if okc:
+        let midHot = (dragging and a.drag.scaleAxes == vec3(1, 1, 1)) or
+                     (not dragging and hot and a.hoverHandle == "scaleAll")
+        let mc = if midHot: HandleCol.toUi else: pm(235, 235, 235)
+        ui.rect(rect(c.x - 6, c.y - 6, 12, 12), pm(235, 235, 235, if midHot: 200 else: 60))
+        let k = [c + vec2(-6, -6), c + vec2(6, -6), c + vec2(6, 6), c + vec2(-6, 6)]
+        for j in 0 .. 3: ui.uiLine(k[j], k[(j + 1) mod 4], mc, if midHot: 2.0 else: 1.5)
+        if dragging and a.drag.view == i and a.drag.objs.len > 0:
+          ui.chip("Scale " & fmtVec(a.drag.objs[0].scale), c + vec2(0, 24))
     # Scale tool handles.
-    if a.tool == toolScale and sok:
+    elif a.tool == toolScale and sok:
       for (s, p) in a.scaleHandles(i):
         let (ok, q) = a.toScreen(i, p)
         if ok: ui.uiCircle(q, 3.5, pm(110, 230, 110), filled = true)
     # Translation gizmo on selected entities.
     if a.gizmoShown:
       let dragging = a.drag.kind == dkGizmo
-      let dragAxis = axisIndex(a.drag.axis)
+      let dragAxis = a.drag.axisIdx
       for (n, quad) in a.gizmoSquares(i):
         let active = (dragging and a.drag.onPlane and dragAxis == n) or
                      (not dragging and hot and a.hoverHandle == "plane" & $n)
@@ -1978,6 +2109,22 @@ proc startGeometryDrag(a: App, kind: DragKind, vi: int, mouse: Vec2, world: Vec3
       for fi in a.selectedFaceSet:
         if a.geo.faces[fi].verts.allIt(it in points): faces.incl fi
       a.drag.texHold = a.holdTextures(faces)
+
+proc beginObjScale(a: App, vi: int, mouse: Vec2, handle: string) =
+  ## A press on the furniture scale gizmo (objScaleAt's handle).
+  let c = a.objScaleCenter
+  a.startGeometryDrag(dkScaleObj, vi, mouse, c, initHashSet[int32]())
+  a.drag.pivot = c
+  for o in a.drag.objs: a.drag.startScales.add o.scale
+  if handle == "scaleAll":
+    a.drag.scaleAxes = vec3(1, 1, 1)
+    return
+  let k = parseInt(handle[^1 .. ^1])
+  a.drag.scaleAxes = vec3(0, 0, 0)
+  a.drag.scaleAxes[k] = 1
+  a.drag.axis = a.objScaleAxes[k]
+  let (ok, s0) = a.viewRay(vi, mouse).alongAxis(c, a.drag.axis)
+  a.drag.along = if ok: s0 else: 0
 
 proc beginMove(a: App, vi: int, mouse: Vec2, world: Vec3) =
   var points: HashSet[int32]
@@ -2910,24 +3057,21 @@ proc snapExtrude(a: App, dist: float32): float32 =
       best = abs(s - dist)
       result = s
 
-proc beginExtrude(a: App, vi: int, m: Vec2, fi: int, kind: DragKind) =
+proc beginExtrude(a: App, vi: int, m: Vec2, pick: ExtrudePick, kind: DragKind) =
+  let fi = pick.face
   let f = a.geo.faces[fi]
-  a.startGeometryDrag(kind, vi, m, a.geo.center(f), initHashSet[int32]())
-  let r = a.viewRay(vi, m)
-  # Grab the point under the mouse on the face's plane when there is one.
+  a.startGeometryDrag(kind, vi, m, pick.point, initHashSet[int32]())
   let n = a.geo.normal(f)
-  if a.is3D(vi):
-    let (ok, p) = r.planeHit(a.geo.center(f), n)
-    if ok and (p - a.geo.center(f)).length < 100000: a.drag.startWorld = p
-  else:
-    # The point under the mouse at the face's depth, so only the mouse's
-    # movement counts.
-    a.drag.startWorld = a.pointOnView(vi, m, a.geo.center(f))
+  # How the mouse picks the distance (TrenchBroom's ExtrudeDragDelegate and
+  # StampDragDelegate pickers): from the point under the mouse, along the line
+  # through it on the face's normal, or across a plane through it measured
+  # along the normal. Sliding in 3D always takes the line (SlideDragDelegate3D).
+  a.drag.extrudeLine = pick.line or (kind == dkSlide and a.is3D(vi))
+  a.drag.planeNormal = if a.drag.extrudeLine: n else: pick.plane
   a.drag.face = fi
   a.drag.piece = f.piece
   a.drag.axis = n
   a.drag.selBefore = (a.selection, a.selPieces, a.selFaces)
-  a.drag.planeNormal = n
   a.drag.objs.setLen 0
   a.drag.objBefore.setLen 0
   # Every selected piece with a face on fi's plane moves with it, fi's first.
@@ -2962,8 +3106,18 @@ proc beginCut(a: App, vi: int, m: Vec2, fi: int, p, q: Vec3) =
   let n = a.geo.normal(f)
   let inward = a.cutAxis(fi, p, q)
   # Grab the point under the mouse on the face, so only its movement counts.
-  let (ok, at) = a.viewRay(vi, m).planeHit(p, n)
-  if ok and (at - p).length < 100000: a.drag.startWorld = at
+  let r = a.viewRay(vi, m)
+  let (ok, at) = r.planeHit(p, n)
+  let onFace = ok and (at - p).length < 100000
+  if onFace: a.drag.startWorld = at
+  # The edge slides across the face, so the mouse picks on the face's plane and
+  # the edge stays under it (TrenchBroom's horizon-edge drag across the face in
+  # front of it); on the line along the cut when the face is seen edge-on or the
+  # mouse ray misses its plane, and across the view plane in 2D views
+  # (TrenchBroom's 2D pickers).
+  if not a.is3D(vi): a.drag.planeNormal = r.dir
+  elif not onFace or abs(r.dir.dot(n)) < 0.05: a.drag.extrudeLine = true
+  else: a.drag.planeNormal = n
   a.drag.face = fi
   a.drag.axis = inward
   a.drag.cutEdge = (p, q)
@@ -3018,8 +3172,9 @@ proc startLeftDrag(a: App, vi: int, pressPos: Vec2) =
   let gz = a.gizmoAt(vi, pressPos)
   if gz.len > 0 and (md.none or md.only(c = true)):
     let onPlane = gz.startsWith("plane")
-    var e = vec3(0, 0, 0)
-    e[parseInt(gz[^1 .. ^1])] = 1
+    let idx = parseInt(gz[^1 .. ^1])
+    let frame = a.gizmoAxes
+    let e = frame[idx]
     let c0 = a.gizmoCenter
     let r = a.viewRay(vi, pressPos)
     var (ok, s0, grab) = (false, 0'f32, c0)
@@ -3033,6 +3188,8 @@ proc startLeftDrag(a: App, vi: int, pressPos: Vec2) =
       a.drag.axis = e
       a.drag.along = s0
       a.drag.onPlane = onPlane
+      a.drag.axisIdx = idx
+      a.drag.frame = frame
       a.drag.pivot = grab
       return
   # Move (Alt: vertical, Ctrl: duplicate first).
@@ -3062,16 +3219,24 @@ proc startLeftDrag(a: App, vi: int, pressPos: Vec2) =
       a.startGeometryDrag(dkRotate, vi, pressPos, a.rotCenter, pts)
       if geoBefore != nil: a.drag.geoBefore = geoBefore
       a.drag.pivot = a.rotCenter
-      var axis = vec3(0, 0, 0)
-      axis[parseInt(h[4 .. ^1])] = 1
-      # Turn the same way on screen whichever side the camera is on.
+      # 2D views have one ring, about the world axis they look along.
+      let idx = parseInt(h[4 .. ^1])
       let cam = a.views[vi].cam
+      var axis = vec3(0, 0, 0)
+      if cam.kind == vk3D: axis = a.gizmoAxes[idx]
+      else: axis[idx] = 1
+      a.drag.axisIdx = if cam.kind == vk3D or not a.gizmoLocal: idx else: -1
+      # Turn the same way on screen whichever side the camera is on.
       let toViewer = if cam.kind == vk3D: -cam.forward else: cam.kind.axes.toViewer
       if axis.dot(toViewer) < 0: axis = -axis
       a.drag.axis = axis
       return
   of toolScale:
-    let (ok, sides) = a.scaleHandleAt(vi, pressPos)
+    let objHandle = a.objScaleAt(vi, pressPos)
+    if objHandle.len > 0:
+      a.beginObjScale(vi, pressPos, objHandle)
+      return
+    let (ok, sides) = if a.objScaleShown: (false, vec3(0, 0, 0)) else: a.scaleHandleAt(vi, pressPos)
     if ok:
       let (okb, lo, hi) = a.selectionBounds
       if okb:
@@ -3109,10 +3274,10 @@ proc startLeftDrag(a: App, vi: int, pressPos: Vec2) =
       return
   # Extrude a selected brush's face (Shift), split (Ctrl), slide (Alt), stamp (Ctrl+Alt).
   if not modal and md.s and a.geo != nil:
-    let fi = a.extrudeFaceAt(vi, pressPos)
-    if fi >= 0:
+    let pick = a.extrudePickAt(vi, pressPos)
+    if pick.face >= 0:
       let kind = if md.c and md.al: dkStamp elif md.al: dkSlide elif md.c: dkSplit else: dkExtrude
-      a.beginExtrude(vi, pressPos, fi, kind)
+      a.beginExtrude(vi, pressPos, pick, kind)
       return
   case a.tool
   of toolClip:
@@ -3267,17 +3432,29 @@ proc updateDraw(a: App, m: Vec2) =
   a.drag.extent = (lo, hi)
   a.drag.axis = cur - s0
 
-proc extrudeDistance(a: App, m: Vec2): float32 =
-  let n = a.drag.axis
-  let cam = a.views[a.drag.view].cam
-  let r = a.viewRay(a.drag.view, m)
-  let viewDir = if cam.kind == vk3D: cam.forward else: -cam.kind.axes.toViewer
-  let pn = n.cross(viewDir).cross(n)
-  if pn.length < 1e-4: return 0
-  let (ok, p) = r.planeHit(a.drag.startWorld, pn.normalize)
-  if not ok: return 0
-  result = (p - a.drag.startWorld).dot(n)
-  if a.snap: result = a.snapExtrude(result)
+proc extrudeDistance(a: App, m: Vec2): (bool, float32) =
+  ## How far the drag has moved the face along its normal, snapped; false when
+  ## the mouse ray picks nothing (parallel to the line or plane, or the plane
+  ## behind the camera), so the face stays where it was (TrenchBroom).
+  let d = a.drag
+  let n = d.axis
+  let r = a.viewRay(d.view, m)
+  var dist: float32
+  if d.extrudeLine:
+    # makeLineHandlePicker: the line's point nearest the ray.
+    let (ok, s) = r.alongAxis(d.startWorld, n)
+    if not ok: return (false, 0'f32)
+    dist = s
+  else:
+    # makeCanonicalHandlePicker: the plane's point under the mouse, along the
+    # normal. In 2D the plane faces the view, which has no "behind".
+    let dn = r.dir.dot(d.planeNormal)
+    if abs(dn) < 1e-6: return (false, 0'f32)
+    let t = (d.startWorld - r.origin).dot(d.planeNormal) / dn
+    if t < -1e-6 and a.is3D(d.view): return (false, 0'f32)
+    dist = (r.origin + r.dir * t - d.startWorld).dot(n)
+  if a.snap: dist = a.snapExtrude(dist)
+  (true, dist)
 
 proc movePieceCorners(a: App, pc: int32, corners: seq[Vec3], d: Vec3) =
   ## Moves every point of piece pc at one of the corner positions by d.
@@ -3378,7 +3555,9 @@ proc updateExtrude(a: App, m: Vec2, last = false) =
     if a.snap: move = a.snapV(move)
     dist = move.length
   else:
-    dist = a.extrudeDistance(m)
+    let (ok, picked) = a.extrudeDistance(m)
+    if not ok and not last: return
+    dist = if ok: picked else: d.builtMove.dot(d.axis)
     move = d.axis * dist
   if abs(dist) > 1e-4: a.drag.moved = true
   if not a.rebuildDue(move, last): return
@@ -3415,7 +3594,9 @@ proc updateCut(a: App, m: Vec2, last = false) =
   ## extrude's face; it goes through every selected face it crosses. Dragged
   ## the other way, out past the edge, it extends the face across its plane.
   let d = a.drag
-  let dist = a.extrudeDistance(m)
+  let (ok, picked) = a.extrudeDistance(m)
+  if not ok and not last: return
+  let dist = if ok: picked else: d.builtMove.dot(d.axis)
   if not a.rebuildDue(d.axis * dist, last): return
   a.restoreGeometry(d.geoBefore)
   a.restoreSelection(d.selBefore)
@@ -3528,7 +3709,13 @@ proc updateDrag(a: App, m: Vec2) =
       delta = a.drag.axis * (s - a.drag.along)
     else:
       delta = a.dragDelta(m, md.s)
-    if a.snap: delta = a.snapV(delta)   # relative snapping, like TrenchBroom
+    if a.snap:
+      if a.drag.kind == dkGizmo:
+        # Grid steps along the gizmo's own axes, so local ones stay on their line.
+        let f = a.drag.frame
+        let s = a.snapV(vec3(delta.dot(f[0]), delta.dot(f[1]), delta.dot(f[2])))
+        delta = f[0] * s.x + f[1] * s.y + f[2] * s.z
+      else: delta = a.snapV(delta)   # relative snapping, like TrenchBroom
     a.applyMoveDelta(delta)
   of dkExtrude, dkSlide, dkSplit, dkStamp: a.updateExtrude(m)
   of dkCut: a.updateCut(m)
@@ -3641,6 +3828,29 @@ proc updateDrag(a: App, m: Vec2) =
       for pv, q in a.drag.startPoints: a.geo.points[pv] = remap(q)
       a.releaseTextures(a.drag.texHold, restore = true)
       a.geo.bump()
+  of dkScaleObj:
+    if (m - a.drag.startMouse).length > DragThreshold: a.drag.moved = true
+    if not a.drag.moved: return
+    let middle = a.drag.scaleAxes == vec3(1, 1, 1)
+    var f: float32
+    if middle:
+      # Right or up grows, left or down shrinks: twice as big per 120 pixels.
+      let d = (m.x - a.drag.startMouse.x) - (m.y - a.drag.startMouse.y)
+      f = pow(2'f32, d / 120)
+    else:
+      # The handle's box stays under the mouse.
+      let (ok, s) = a.viewRay(a.drag.view, m).alongAxis(a.drag.pivot, a.drag.axis)
+      if not ok or abs(a.drag.along) < 1e-4: return
+      f = s / a.drag.along
+    let all = middle or md.s
+    for i, o in a.drag.objs:
+      var sc = a.drag.startScales[i]
+      for k in 0 .. 2:
+        if not all and a.drag.scaleAxes[k] == 0: continue
+        var v = max(sc[k] * f, MinScale)
+        if a.snap and round(v / ScaleSnap) > 0: v = round(v / ScaleSnap) * ScaleSnap
+        sc[k] = v
+      a.setScale(o, sc)
   of dkDraw: a.updateDraw(m)
   of dkBox: discard
   of dkSelRect:
@@ -3688,14 +3898,12 @@ proc updateDrag(a: App, m: Vec2) =
     proc onPlane(x: Vec3): Vec3 = x - n * (x - s).dot(n)
     a.drag.corners = @[s, onPlane(p1), onPlane(p2), onPlane(p3)]
   of dkAssembleDup:
-    let n = a.drag.axis
-    let cam = a.views[a.drag.view].cam
-    let r = a.viewRay(a.drag.view, m)
-    let pn = n.cross(cam.forward).cross(n)
-    if pn.length < 1e-4: return
-    let (ok, p) = r.planeHit(a.drag.startWorld, pn.normalize)
+    # TrenchBroom's DuplicateFaceDragDelegate: the point on the line along the
+    # normal nearest the mouse ray.
+    let (ok, s) = a.viewRay(a.drag.view, m).alongAxis(a.drag.startWorld, a.drag.axis)
     if not ok: return
-    var dist = (p - a.drag.startWorld).dot(n)
+    let n = a.drag.axis
+    var dist = s
     if a.snap: dist = snapTo(dist, a.grid)
     a.drag.corners = if abs(dist) < 1e-4: @[] else: a.assemblePoints.mapIt(it + n * dist)
   of dkPlace:
@@ -3727,7 +3935,7 @@ proc endDrag(a: App, m: Vec2) =
   of dkMove, dkGizmo: a.finishDrag(if d.dup: "Duplicate" else: "Move")
   of dkHandles: a.finishDrag($a.tool)
   of dkRotate: a.finishDrag("Rotate")
-  of dkScale: a.finishDrag("Scale")
+  of dkScale, dkScaleObj: a.finishDrag("Scale")
   of dkBoxFace: a.finishDrag("Resize volume")
   of dkExtrude, dkSlide, dkSplit, dkStamp: a.finishExtrude(m)
   of dkCut: a.finishCut(m)
@@ -4004,6 +4212,7 @@ proc handleViews*(a: App, dt: float32) =
     case a.tool
     of toolVertex, toolEdge, toolFace: a.hoverHandle = a.handleAt(vi, m)
     of toolRotate: a.hoverHandle = a.rotateHandleAt(vi, m)
+    of toolScale: a.hoverHandle = a.objScaleAt(vi, m)
     of toolSelect:
       let bh = a.boxHandleAt(vi, m)
       a.hoverHandle = if bh >= 0: "box" & $bh else: a.gizmoAt(vi, m)
@@ -4281,6 +4490,15 @@ proc scaleSelection*(a: App, f: Vec3) =
   a.transformSelectedGroups(affineOf(sc))
   a.push editCmd("Scale", sel, before, geoBefore, a.geo)
 
+proc scaleObjects*(a: App, f: Vec3) =
+  ## Scale tool's Apply on furniture: each one's scale times f, along its own axes.
+  let sel = a.selection.filterIt(it.canScale)
+  if sel.len == 0: return
+  let geoBefore = if a.geo != nil: a.geo.clone else: nil
+  let before = snapshotObjects(sel)
+  for o in sel: a.setScale(o, vec3(o.scale.x * f.x, o.scale.y * f.y, o.scale.z * f.z))
+  a.push editCmd("Scale", sel, before, geoBefore, a.geo)
+
 proc gridKeys(a: App, c, al: bool): bool =
   ## Grid shortcuts: 0 show grid, Alt+0 snap, +/- size, 1-9 size 1..256.
   ## Returns true if one was pressed.
@@ -4405,7 +4623,8 @@ proc handleKeys*(a: App, menuAction: proc(label: string): bool) =
   elif not c and not al and pressed(KeyF): a.setTool(toolFace)
   elif not c and not al and not sh and pressed(KeyR): a.setTool(toolRotate)
   elif not c and not al and pressed(KeyT): a.setTool(toolScale)
-  elif not c and not al and pressed(KeyU): a.uvLock = not a.uvLock
+  elif not c and not al and pressed(KeyU): a.toggleUvLock()
+  elif not c and not al and not sh and pressed(KeyL): a.toggleGizmoLocal()
   elif not c and pressed(KeySpace): a.cycleView()
   elif a.gridKeys(c, al): discard
   else:

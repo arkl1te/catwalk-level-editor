@@ -999,10 +999,39 @@ proc spinSamplers(s: SpinGroup): string =
     "<input semantic=\"INTERPOLATION\" source=\"#i\"/></sampler>"
   result.add &"<channel source=\"#s\" target=\"{s.name}/turn.ANGLE\"/></animation></library_animations>\n"
 
+const
+  DriftGrid = 0.125'f32   ## Build writes coordinates this close to the 1/8 grid
+  DriftMax = 0.001'f32    ## (float rounding left by edits) on the grid.
+
+proc snapDrift(x: float32): float32 =
+  ## Editing leaves float rounding in points meant to be on the grid
+  ## (-191.99996 for -192). A quad that close to one of OniSplit's octree leaf
+  ## faces is left out of the leaves it runs through (its exact triangle-box
+  ## test), and Oni draws a quad only when a visibility ray crossed a leaf
+  ## listing it: on Condemned two walls vanished as the camera climbed a ramp
+  ## (2026-11-19, docs/multiplayer.md). Only rounding-size offsets move; real
+  ## off-grid points (thirds, cuts, furniture) are farther than DriftMax.
+  let r = round(x / DriftGrid) * DriftGrid
+  if abs(x - r) <= DriftMax: r else: x
+
+proc snapDrift(p: Vec3): Vec3 = vec3(snapDrift(p.x), snapDrift(p.y), snapDrift(p.z))
+
+proc keepUnsnapped(g: Geometry, verts: openArray[int32], raw: var HashSet[int32]) =
+  ## Corners of one face that snapping would merge (two points under 0.002
+  ## apart) are written as they are, so no face loses a corner.
+  for a in 0 ..< verts.len:
+    for b in a + 1 ..< verts.len:
+      let pa = g.points[verts[a]]
+      let pb = g.points[verts[b]]
+      if pa != pb and snapDrift(pa) == snapDrift(pb):
+        raw.incl verts[a]
+        raw.incl verts[b]
+
 proc writeDae(path: string, g: Geometry, faces: seq[int], imageDir, markerDir: string,
               spin = SpinGroup()) =
   ## One geometry node; one polylist per material. With a spin the points are
-  ## relative to its center and the node carries the turn.
+  ## relative to its center and the node carries the turn. Points within
+  ## DriftMax of the 1/8 grid are written on it (snapDrift).
   var byMat: OrderedTable[string, seq[int]]
   for fi in faces:
     let f = g.faces[fi]
@@ -1012,11 +1041,13 @@ proc writeDae(path: string, g: Geometry, faces: seq[int], imageDir, markerDir: s
     byMat.mgetOrPut(m, @[]).add fi
   var pointIndex: Table[int32, int]
   var pos, uvs, cols: seq[string]
+  var raw: HashSet[int32]
+  for fi in faces: keepUnsnapped(g, g.faces[fi].verts, raw)
   for fi in faces:
     for v in g.faces[fi].verts:
       if v notin pointIndex:
         pointIndex[v] = pointIndex.len
-        let p = g.points[v] - spin.center
+        let p = (if v in raw: g.points[v] else: snapDrift(g.points[v])) - spin.center
         pos.add &"{p.x:.4f} {p.y:.4f} {p.z:.4f}"
   var o = newStringOfCap(1 shl 16)
   o.add "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
@@ -1124,6 +1155,13 @@ proc writeLevelSource*(g: Geometry, dir, envName, sky, imageDir, markerDir: stri
   for i, f in g.faces:
     if f.verts.len < 3: continue
     var flags = f.flags and not (DerivedFlags or EditorFlags)
+    # Stair portals (StairsUp/StairsDown: the room links at a flight's ends) are
+    # walked through, as ghosts are. OniSplit gives ghosts (by their marker) and
+    # the portals it makes from the rooms NoCollision, but a portal face handed
+    # to it stays a solid wall: an invisible wall across both ends of every
+    # flight in a rebuilt game level, and a wall in the AI grids too.
+    if (flags and (gfStairsUp or gfStairsDown)) != 0 and markerMaterial(f).len == 0:
+      flags = flags or gfNoCollision or gfNoOcclusion
     # Bungie's importer made every face with a see-through texture Transparent
     # and Two-sided (Imp_Env2_Process.c): Oni then draws it in its alpha pass,
     # after everything solid and sorted, as the viewport does. Without it the
@@ -1182,8 +1220,10 @@ proc writeRoomsDae*(g: Geometry, path: string): int =
       (lo, hi)
     if hi.x - lo.x < 8 or hi.z - lo.z < 8: continue   # stair treads, trims
     var idx: seq[string]
+    var raw: HashSet[int32]
+    keepUnsnapped(g, f.verts, raw)
     for v in f.verts:
-      let p = g.points[v]
+      let p = if v in raw: g.points[v] else: snapDrift(g.points[v])   # as writeDae writes it
       idx.add $pos.len
       pos.add &"{p.x:.4f} {p.y:.4f} {p.z:.4f}"
     polys.add &"<polylist count=\"1\"><input semantic=\"VERTEX\" source=\"#vtx\" offset=\"0\"/>" &
@@ -1214,12 +1254,62 @@ proc writeRoomsDae*(g: Geometry, path: string): int =
 proc cornerKey(p: Vec3): (int, int, int) =
   (int(round(p.x * 10)), int(round(p.y * 10)), int(round(p.z * 10)))
 
+proc snapToModel*(built, model: Geometry) =
+  ## OniSplit gives back the points it was given a hair off (up to ~1e-4), so
+  ## a corner near the edge of a cornerKey cell lands in the next cell and its
+  ## quad matches no face: 147 of an imported model's 2472 faces lost their
+  ## furniture link that way. Every built point within 0.01 of a model point
+  ## becomes that point exactly, before anything is matched by corners.
+  const SnapTol = 0.01'f32
+  var cells: Table[(int, int, int), seq[int32]]
+  for i, p in model.points: cells.mgetOrPut(cornerKey(p), @[]).add i.int32
+  for p in built.points.mitems:
+    let (x, y, z) = cornerKey(p)
+    var best = SnapTol
+    var at = -1'i32
+    for dx in -1 .. 1:
+      for dy in -1 .. 1:
+        for dz in -1 .. 1:
+          for i in cells.getOrDefault((x + dx, y + dy, z + dz)):
+            let d = (model.points[i] - p).length
+            if d <= best:
+              best = d
+              at = i
+    if at >= 0: p = model.points[at]
+
 proc faceKey(g: Geometry, f: Face): string =
   var cs: seq[(int, int, int)]
   for v in f.verts: cs.add cornerKey(g.points[v])
   cs.sort
   result = f.texture
   for c in cs: result.add &"|{c[0]},{c[1]},{c[2]}"
+
+proc quadTable(akevXml, akevOni, data: string, count: int): int =
+  ## Where the quad table's first quad starts in an AKEV .oni (data): an int32
+  ## count, then 56 bytes per quad (4 point, 4 texcoord, 4 color, flags,
+  ## ObjectId). Found by its count plus the first quad's point and texcoord
+  ## indices, read from the XML dump.
+  let xml = readFile(akevXml)
+  let q0 = xml.find("<AGQGQuad>")
+  if q0 < 0: raise newException(ValueError, "no quads in " & akevXml)
+  var first: seq[int32]
+  var p = q0
+  while first.len < 8:
+    let a = xml.find("<Int32>", p)
+    let b = xml.find("</Int32>", a)
+    first.add parseInt(xml[a + 7 ..< b]).int32
+    p = b
+  var pattern = newString(4 + 32)
+  var cnt = count.int32
+  copyMem(pattern[0].addr, cnt.addr, 4)
+  for i, v in first:
+    var x = v
+    copyMem(pattern[4 + i * 4].addr, x.addr, 4)
+  let at = data.find(pattern)
+  if at < 0 or data.find(pattern, at + 1) >= 0:
+    raise newException(ValueError, "could not locate the quad table in " & akevOni)
+  result = at + 4
+  if result + count * 56 > data.len: raise newException(ValueError, "quad table truncated")
 
 proc restoreObjectIds*(model: Geometry, akevXml, akevOni: string,
                        keep = initTable[int32, int32]()):
@@ -1231,6 +1321,7 @@ proc restoreObjectIds*(model: Geometry, akevXml, akevOni: string,
   ## through keep (OniSplit's ObjectId -> Catwalk's).
   ## akevXml is OniSplit's XML dump of akevOni; akevOni is patched in place.
   let built = importAkevXml(akevXml)
+  built.snapToModel(model)
   var exact: Table[string, int32]
   var byCorner: Table[(int, int, int), seq[(string, int32)]]
   for f in model.faces:
@@ -1269,34 +1360,65 @@ proc restoreObjectIds*(model: Geometry, akevXml, akevOni: string,
   result.built = built
   if result.linked == 0: return
 
-  # The quad table in the .oni: int32 count, then 56 bytes per quad
-  # (4 point, 4 texcoord, 4 color, flags, ObjectId). Found by its count plus the
-  # first quad's point and texcoord indices, read from the XML dump.
-  let xml = readFile(akevXml)
-  let q0 = xml.find("<AGQGQuad>")
-  if q0 < 0: raise newException(ValueError, "no quads in " & akevXml)
-  var first: seq[int32]
-  var p = q0
-  while first.len < 8:
-    let a = xml.find("<Int32>", p)
-    let b = xml.find("</Int32>", a)
-    first.add parseInt(xml[a + 7 ..< b]).int32
-    p = b
-  var pattern = newString(4 + 32)
-  var cnt = ids.len.int32
-  copyMem(pattern[0].addr, cnt.addr, 4)
-  for i, v in first:
-    var x = v
-    copyMem(pattern[4 + i * 4].addr, x.addr, 4)
   var data = readFile(akevOni)
-  let at = data.find(pattern)
-  if at < 0 or data.find(pattern, at + 1) >= 0:
-    raise newException(ValueError, "could not locate the quad table in " & akevOni)
-  let base = at + 4
-  if base + ids.len * 56 > data.len: raise newException(ValueError, "quad table truncated")
+  let base = quadTable(akevXml, akevOni, data, ids.len)
   for i, id in ids:
     var x = id
     copyMem(data[base + i * 56 + 52].addr, x.addr, 4)
+  writeFile(akevOni, data)
+
+proc restoreCollision*(model, built: Geometry, akevXml, akevOni: string):
+    tuple[cleared, unmatched: int] =
+  ## OniSplit takes character collision away from quads on its own while it
+  ## builds the AI grids: everything in a slab in front of a quad flagged Stairs
+  ## (RoomGridBuilder.ProcessStairsCollision) and vertical strips up to 4 units
+  ## high near a flat room's floor (BuildGrid). Bungie's importer flagged every
+  ## non-vertical quad in a stair room Stairs, treads included, so a rebuilt game
+  ## level lost the collision of every stair ramp and of floors and curbs next
+  ## to them: characters fell through the stairs. Here a built quad keeps
+  ## NoCharacterCollision only when the face it came from has it (matched by
+  ## corners: a split face's pieces share its corners), except vertical strips
+  ## up to 4 units high: those stay as OniSplit made them, so characters keep
+  ## running over low lips (a collidable 2-unit curb stops Konoko dead, as in
+  ## Bungie's level 1), as in every level Catwalk built before.
+  ## akevXml is OniSplit's XML dump of akevOni; akevOni is patched in place.
+  ## unmatched: built quads with the flag that match no face (left as is).
+  var byCorner: Table[(int, int, int), seq[int]]
+  for fi, f in model.faces:
+    for v in f.verts: byCorner.mgetOrPut(cornerKey(model.points[v]), @[]).add fi
+  var clear: seq[int]
+  for i, f in built.faces:
+    if (f.flags and gfNoCharacterCollision) == 0 or f.verts.len < 3: continue
+    # BuildGrid's low strips: vertical, at most 4 high.
+    var lo = Inf.float32
+    var hi = -Inf.float32
+    for v in f.verts:
+      lo = min(lo, built.points[v].y)
+      hi = max(hi, built.points[v].y)
+    if abs(built.normal(f).y) < 1e-4 and hi - lo <= 4.001: continue
+    # Faces having every corner of this quad.
+    var common: seq[int]
+    for n, v in f.verts:
+      let here = byCorner.getOrDefault(cornerKey(built.points[v]))
+      if n == 0: common = here
+      else: common = common.filterIt(it in here)
+      if common.len == 0: break
+    if common.len == 0:
+      inc result.unmatched
+      continue
+    # Coplanar faces on the same corners: the one with this quad's texture.
+    let sameTex = common.filterIt(model.faces[it].texture.cmpIgnoreCase(f.texture) == 0)
+    if sameTex.len > 0: common = sameTex
+    if common.allIt((model.faces[it].flags and gfNoCharacterCollision) == 0): clear.add i
+  result.cleared = clear.len
+  if clear.len == 0: return
+  var data = readFile(akevOni)
+  let base = quadTable(akevXml, akevOni, data, built.faces.len)
+  for i in clear:
+    var flags: uint32
+    copyMem(flags.addr, data[base + i * 56 + 48].addr, 4)
+    flags = flags and not gfNoCharacterCollision
+    copyMem(data[base + i * 56 + 48].addr, flags.addr, 4)
   writeFile(akevOni, data)
 
 proc hasAnims*(g: Geometry): bool =

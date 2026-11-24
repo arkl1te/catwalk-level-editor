@@ -12,7 +12,7 @@
 ##     squares (arklite/src/texture_clamp.c), and Catwalk's levels only run on
 ##     Arklite.
 
-import std/[math, os, strutils]
+import std/[math, os, strutils, osproc, streams, strformat]
 import pixie
 import tga
 
@@ -21,9 +21,31 @@ const
   DirectFormats* = ["png", "jpg", "jpeg", "bmp", "gif", "qoi", "ppm", "tga"]
   OniSplitFormats* = ["dds", "tif", "tiff"]   ## Read through OniSplit.
 
+var ffmpegCopies = 0
+
+proc decodeWithFfmpeg(path: string, why: ref CatchableError): Image =
+  ## A picture Pixie can't read (16-bit PNG...), as ffmpeg reads it, at 8
+  ## bits per channel; raises why when there's no ffmpeg or it can't either.
+  if findExe("ffmpeg").len == 0: raise why
+  inc ffmpegCopies
+  let tmp = getTempDir() / &"catwalk-picture-{getCurrentProcessId()}-{ffmpegCopies}.png"
+  try:
+    let p = startProcess("ffmpeg", args = ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", path,
+                                           "-frames:v", "1", "-pix_fmt", "rgba", "-c:v", "png", "-f", "image2", tmp],
+                         options = {poUsePath, poStdErrToStdOut})
+    discard p.outputStream.readAll
+    let code = p.waitForExit
+    p.close()
+    if code != 0 or not fileExists(tmp): raise why
+    result = decodeImage(readFile(tmp))
+  finally:
+    if fileExists(tmp): removeFile(tmp)
+
 proc readPicture*(path: string): TgaImage =
   if path.splitFile.ext.toLowerAscii == ".tga": return readTga(readFile(path))
-  let img = decodeImage(readFile(path))
+  var img: Image
+  try: img = decodeImage(readFile(path))
+  except PixieError as e: img = decodeWithFfmpeg(path, e)
   result = TgaImage(width: img.width, height: img.height, rgba: newSeq[uint8](img.width * img.height * 4))
   for i, px in img.data:
     let c = px.rgba
@@ -32,15 +54,15 @@ proc readPicture*(path: string): TgaImage =
     result.rgba[i * 4 + 2] = c.b
     result.rgba[i * 4 + 3] = c.a
 
-proc nearestPower(n: int): int =
-  ## The power of 2 nearest to n, at most MaxTextureSide.
-  1 shl clamp(round(log2(max(n, 1).float)).int, 0, log2(MaxTextureSide.float).int)
+proc nearestPower(n: int, maxSide = MaxTextureSide): int =
+  ## The power of 2 nearest to n, at most maxSide (a power of 2).
+  1 shl clamp(round(log2(max(n, 1).float)).int, 0, log2(maxSide.float).int)
 
-proc fittedSize*(w, h: int): (int, int) =
-  ## Size a w x h picture gets: scaled to fit MaxTextureSide, each side then
-  ## taken to its nearest power of 2.
-  let s = min(1.0, MaxTextureSide / max(w, h))
-  (nearestPower(int(w.float * s)), nearestPower(int(h.float * s)))
+proc fittedSize*(w, h: int, maxSide = MaxTextureSide): (int, int) =
+  ## Size a w x h picture gets: scaled to fit maxSide, each side then taken to
+  ## its nearest power of 2.
+  let s = min(1.0, maxSide / max(w, h))
+  (nearestPower(int(w.float * s), maxSide), nearestPower(int(h.float * s), maxSide))
 
 proc resized*(src: TgaImage, w, h: int): TgaImage =
   ## Averages the source pixels each target pixel covers (linear when enlarging).
@@ -98,3 +120,53 @@ proc safeName*(file: string): string =
   for ch in file.splitFile.name:
     result.add(if ch in {'a'..'z', 'A'..'Z', '0'..'9'}: ch.toUpperAscii else: '_')
   if result.len > 40: result.setLen 40
+
+# --- marker textures ---------------------------------------------------------
+
+proc markerPictures*(): seq[(string, TgaImage)] =
+  ## The pictures of the marker textures (ghosts, door frames, stairs...),
+  ## drawn as OniSplit draws them (Akira/MaterialLibrary.cs, MarkerMaterials):
+  ## a level made with no game level's textures gets them from here.
+  proc surface(w, h: int): TgaImage = TgaImage(width: w, height: h, rgba: newSeq[uint8](w * h * 4))
+  proc fill(s: var TgaImage, x, y, w, h: int, c: array[4, uint8]) =
+    for yy in y ..< min(y + h, s.height):
+      for xx in x ..< min(x + w, s.width):
+        for k in 0 .. 3: s.rgba[(yy * s.width + xx) * 4 + k] = c[k]
+  proc lines(s: var TgaImage, c: array[4, uint8]) =
+    ## The frame and middle cross of the ghost, barrier and impassable markers.
+    s.fill(0, 0, 128, 1, c)
+    s.fill(0, 127, 128, 1, c)
+    s.fill(0, 1, 1, 126, c)
+    s.fill(127, 1, 1, 126, c)
+    s.fill(64, 1, 1, 126, c)
+    s.fill(1, 64, 126, 1, c)
+  var ghost = surface(128, 128)
+  ghost.fill(0, 0, 128, 128, [208'u8, 240, 240, 80])
+  ghost.lines([16'u8, 48, 240, 240])
+  var barrier = surface(128, 128)
+  barrier.fill(0, 0, 128, 128, [0'u8, 240, 20, 180])
+  barrier.lines([240'u8, 20, 0, 255])
+  var danger = surface(128, 128)
+  danger.fill(0, 0, 128, 128, [255'u8, 10, 0, 208])
+  danger.fill(52, 16, 24, 64, [255'u8, 255, 255, 255])
+  danger.fill(52, 96, 24, 16, [255'u8, 255, 255, 255])
+  var door = surface(128, 128)
+  door.fill(0, 0, 128, 128, [240'u8, 240, 0, 208])
+  for (x, y, w, h) in [(1, 1, 126, 1), (1, 1, 1, 126), (1, 126, 126, 1), (126, 1, 1, 126)]:
+    door.fill(x, y, w, h, [0'u8, 0, 240, 255])
+  var stairs = surface(128, 128)
+  stairs.fill(0, 0, 128, 128, [40'u8, 240, 0, 180])
+  for y in countup(0, 127, 32): stairs.fill(0, y, 128, 16, [40'u8, 0, 240, 180])
+  var impassable = surface(128, 128)
+  impassable.fill(0, 0, 128, 128, [240'u8, 0, 20, 180])
+  impassable.lines([240'u8, 20, 0, 255])
+  var blackness = surface(16, 16)
+  blackness.fill(0, 0, 16, 16, [0'u8, 0, 0, 255])
+  @[("_marker_ghost", ghost), ("_marker_barrier", barrier), ("_marker_danger", danger), ("_marker_door", door),
+    ("_marker_stairs", stairs), ("_marker_impassable", impassable), ("_marker_blackness", blackness)]
+
+proc writeMarkerTextures*(dir: string) =
+  ## The marker textures' pictures into dir (env/markers), leaving ones already there.
+  createDir(dir)
+  for (name, img) in markerPictures():
+    if not fileExists(dir / name & ".tga"): writeTga(dir / name & ".tga", img)

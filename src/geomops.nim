@@ -231,6 +231,135 @@ proc retexture*(g: Geometry, fi: int, texture: string, density: proc(tex: string
     # rescaling them would keep them squashed): World align instead.
     g.projectUVs(fi, d)
 
+# --- the Face tab's UV view: a face's mapping on its own plane ----------------------------
+
+type
+  UvAffine* = object
+    ## A face's UVs as an affine function of the points on its plane: uv = m·p + o,
+    ## p being faceCoords (world units along faceAxes' right and up). Fitted by
+    ## least squares, so imported UVs that aren't quite affine work too.
+    ok*: bool                 ## False: too few corners, or UVs squashed to a point or line.
+    m*: array[4, float]       ## [m11, m12, m21, m22]
+    o*: array[2, float]
+
+proc faceAxes*(n: Vec3): (Vec3, Vec3) =
+  ## Right and up of a view looking at a face's front (TrenchBroom's
+  ## computeCameraAxesForFaceNormal, with Y up instead of Z): walls have Y up,
+  ## floors -Z up, ceilings +Z, with X to the right.
+  let right = if abs(n.y) < 0.99999: normalize(vec3(0, 1, 0).cross(n)) else: vec3(1, 0, 0)
+  (right, normalize(n.cross(right)))
+
+proc faceCoords*(p: Vec3, axes: (Vec3, Vec3)): array[2, float] =
+  [p.dot(axes[0]).float, p.dot(axes[1]).float]
+
+proc fitUvAffine*(g: Geometry, f: Face, axes: (Vec3, Vec3)): UvAffine =
+  if f.verts.len < 3 or f.uvs.len != f.verts.len: return
+  let n = f.verts.len.float
+  var pm, um: array[2, float]
+  var ps: seq[array[2, float]]
+  for k, v in f.verts:
+    let q = faceCoords(g.points[v], axes)
+    ps.add q
+    for i in 0 .. 1: pm[i] += q[i] / n
+    um[0] += f.uvs[k].x.float / n
+    um[1] += f.uvs[k].y.float / n
+  var spp, sup: array[2, array[2, float]]
+  for k in 0 ..< ps.len:
+    let dp = [ps[k][0] - pm[0], ps[k][1] - pm[1]]
+    let du = [f.uvs[k].x.float - um[0], f.uvs[k].y.float - um[1]]
+    for i in 0 .. 1:
+      for j in 0 .. 1:
+        spp[i][j] += dp[i] * dp[j]
+        sup[i][j] += du[i] * dp[j]
+  let det = spp[0][0] * spp[1][1] - spp[0][1] * spp[1][0]
+  if spp[0][0] * spp[1][1] <= 0 or abs(det) < 1e-9 * spp[0][0] * spp[1][1]: return
+  let inv = [[spp[1][1] / det, -spp[0][1] / det], [-spp[1][0] / det, spp[0][0] / det]]
+  for i in 0 .. 1:
+    for j in 0 .. 1:
+      result.m[i * 2 + j] = sup[i][0] * inv[0][j] + sup[i][1] * inv[1][j]
+  for i in 0 .. 1:
+    result.o[i] = um[i] - (result.m[i * 2] * pm[0] + result.m[i * 2 + 1] * pm[1])
+  # A singular m (UVs on a line) has no inverse: nothing to scale or turn.
+  let md = result.m[0] * result.m[3] - result.m[1] * result.m[2]
+  var rows = 0.0
+  for x in result.m: rows += x * x
+  result.ok = rows > 0 and abs(md) > 1e-9 * rows
+
+proc lin*(m: array[4, float], d: array[2, float]): array[2, float] =
+  [m[0] * d[0] + m[1] * d[1], m[2] * d[0] + m[3] * d[1]]
+
+proc apply*(a: UvAffine, p: array[2, float]): array[2, float] =
+  let d = lin(a.m, p)
+  [d[0] + a.o[0], d[1] + a.o[1]]
+
+proc inverseM*(m: array[4, float]): array[4, float] =
+  let det = m[0] * m[3] - m[1] * m[2]
+  if det == 0: return [0.0, 0, 0, 0]
+  [m[3] / det, -m[1] / det, -m[2] / det, m[0] / det]
+
+proc mulM*(a, b: array[4, float]): array[4, float] =
+  [a[0] * b[0] + a[1] * b[2], a[0] * b[1] + a[1] * b[3],
+   a[2] * b[0] + a[3] * b[2], a[2] * b[1] + a[3] * b[3]]
+
+proc unapply*(a: UvAffine, uv: array[2, float]): array[2, float] =
+  ## The point on the plane (faceCoords) with these UVs (a.ok only).
+  lin(inverseM(a.m), [uv[0] - a.o[0], uv[1] - a.o[1]])
+
+proc mapUvs*(f: var Face, start: seq[Vec2], t: array[4, float], pivot: array[2, float],
+             shift = [0.0, 0.0]) =
+  ## The face's UVs from start through t about pivot, then shifted:
+  ## uv = t·(uv0 − pivot) + pivot + shift. Keeps whatever isn't affine in them.
+  if start.len != f.uvs.len: return
+  for k, uv in start:
+    let d = lin(t, [uv.x.float - pivot[0], uv.y.float - pivot[1]])
+    f.uvs[k] = vec2(float32(d[0] + pivot[0] + shift[0]), float32(d[1] + pivot[1] + shift[1]))
+
+proc rotationM*(deg: float): array[4, float] =
+  let r = deg.degToRad
+  [cos(r), -sin(r), sin(r), cos(r)]
+
+proc turnUvs*(g: Geometry, fi: int, deg: float): bool =
+  ## Turns the texture on face fi by deg (counter-clockwise from the face's
+  ## front) about the face's middle, rigidly in the world. False when its UVs
+  ## are squashed to a point or a line.
+  let f = g.faces[fi]
+  let axes = faceAxes(g.normal(f))
+  let a = g.fitUvAffine(f, axes)
+  if not a.ok: return false
+  var lo = [Inf, Inf]
+  var hi = [-Inf, -Inf]
+  for v in f.verts:
+    let q = faceCoords(g.points[v], axes)
+    for i in 0 .. 1:
+      lo[i] = min(lo[i], q[i])
+      hi[i] = max(hi[i], q[i])
+  let c = a.apply([(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2])
+  # A texture point at p goes to R(deg)·p: the UVs at p are those R(-deg) of it.
+  let t = mulM(mulM(a.m, rotationM(-deg)), inverseM(a.m))
+  let start = f.uvs
+  g.faces[fi].mapUvs(start, t, c)
+  true
+
+proc parallelAxes*(n: Vec3): (Vec3, Vec3) =
+  ## TrenchBroom's Valve-format UV reset (ParallelUvCoordSystem's
+  ## computeInitialAxes, with Y up): U along the face's plane, horizontal
+  ## unless the face is mostly a floor or ceiling, V down it. Unlike World
+  ## align, a slope's texture isn't stretched.
+  let a = vec3(abs(n.x), abs(n.y), abs(n.z))
+  let u = if a.y >= a.x and a.y >= a.z: normalize(vec3(0, 0, -1).cross(n))
+          else: normalize(vec3(0, 1, 0).cross(n))
+  (u, normalize(u.cross(n)))
+
+proc faceAlignUVs*(g: Geometry, fi: int, density: float32) =
+  ## Face align: UVs projected straight onto the face's own plane, at the
+  ## texture's usual size, shift 0.
+  var f = addr g.faces[fi]
+  let (ua, va) = parallelAxes(g.normal(f[]))
+  f.uvs.setLen f.verts.len
+  for k, v in f.verts:
+    let p = g.points[v]
+    f.uvs[k] = vec2(p.dot(ua) / density, p.dot(va) / density)
+
 proc mapNewFace*(g: Geometry, f: var Face, attr: FaceAttr, density: float32) =
   ## UVs for a new face: World align, then attr's mapping (shift, scale,
   ## rotation) when it has one, so the face looks like the one attr came from.
@@ -1416,6 +1545,19 @@ proc turnRotation*(rotDeg, axis: Vec3, deg: float32): Vec3 =
 proc moveObjectGeometry*(g: Geometry, objectId: int32, oldPos, oldRot, newPos, newRot: Vec3) =
   ## Moves the faces linked to an object along with it.
   let m = objectMatrix(newPos, newRot) * objectMatrix(oldPos, oldRot).inverse
+  var pts: HashSet[int32]
+  for f in g.faces:
+    if f.objectId == objectId:
+      for v in f.verts: pts.incl v
+  for v in pts: g.points[v] = m * g.points[v]
+  g.bump()
+
+proc scaleObjectGeometry*(g: Geometry, objectId: int32, pos, rot, oldScale, newScale: Vec3) =
+  ## Rescales the faces linked to an object along its own axes, about its
+  ## position. UVs stay, so textures stretch with the mesh.
+  let ratio = vec3(newScale.x / oldScale.x, newScale.y / oldScale.y, newScale.z / oldScale.z)
+  let o = objectMatrix(pos, rot)
+  let m = o * scale(ratio) * o.inverse
   var pts: HashSet[int32]
   for f in g.faces:
     if f.objectId == objectId:

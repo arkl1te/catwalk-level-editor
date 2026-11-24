@@ -19,6 +19,7 @@ type
     file*: ObjectFile
     pos*: Vec3
     rot*: Vec3              ## Degrees, as in the XML.
+    scale*: Vec3            ## Furniture: ScaleField (1 1 1 when missing).
     hidden*: bool
     selected*: bool
 
@@ -44,7 +45,16 @@ const
     ## Build strips it, packs the page as TxtC<consoleMessageName> and adds a Script event
     ## running consoleMessageName from a generated BSL file.
 
-  EditorFields = [RespawnField, MessageField]
+  ScaleField* = "Scale"
+    ## Catwalk's own element on furniture: its size along its own X, Y and Z ("1 1 1" or
+    ## missing: as made). Oni has no furniture scale (OBJiFurniture_UpdatePosition builds
+    ## the matrix from position and rotation only), but furniture is nothing but the level
+    ## geometry it owns, and that is scaled in place (setScale). Build strips the element.
+  ScaleTags* = ["FURN"]
+  MinScale* = 0.01'f32
+  MaxScale* = 100'f32
+
+  EditorFields = [RespawnField, MessageField, ScaleField]
 
   TypeNames* = {
     "CHAR": "Character", "CONS": "Console", "DOOR": "Door", "FLAG": "Flag",
@@ -107,15 +117,39 @@ proc fmtFloat(f: float32): string =
 
 proc fmtVec3*(v: Vec3): string = &"{fmtFloat(v.x)} {fmtFloat(v.y)} {fmtFloat(v.z)}"
 
+proc parseScale*(s: string): Vec3 =
+  ## ScaleField's value; 1 for a missing or unusable component.
+  let f = s.splitWhitespace
+  for i in 0 .. 2:
+    result[i] = 1
+    if i < f.len:
+      try:
+        let v = parseFloat(f[i])
+        if v > 0: result[i] = clamp(v.float32, MinScale, MaxScale)
+      except ValueError: discard
+
 proc syncFromNode*(o: LevelObject) =
   o.pos = parseVec3(o.node.xpath("Header/Position").str)
   o.rot = parseVec3(o.node.xpath("Header/Rotation").str)
+  o.scale = parseScale(o.node.xpath(ScaleField).str)
   try: o.id = parseInt(o.node.attr("Id"))
   except ValueError: o.id = 0
+
+proc removeChild(n: XmlNode, tag: string)
 
 proc syncToNode*(o: LevelObject) =
   o.node.xpath("Header/Position").setText(fmtVec3(o.pos))
   o.node.xpath("Header/Rotation").setText(fmtVec3(o.rot))
+  if o.tag in ScaleTags:
+    # Missing at 1 1 1, so unscaled furniture stays as OniSplit wrote it.
+    let e = o.node.xpath(ScaleField)
+    if o.scale == vec3(1, 1, 1):
+      if e != nil: o.node.removeChild(ScaleField)
+    elif e != nil: e.setText(fmtVec3(o.scale))
+    else:
+      let n = newElement(ScaleField)
+      n.add newText(fmtVec3(o.scale))
+      o.node.add n
   o.file.dirty = true
 
 proc label*(o: LevelObject): string =
@@ -126,6 +160,11 @@ proc label*(o: LevelObject): string =
   case o.tag
   of "FLAG": "flag " & o.node.xpath("OSD/FlagId").str
   else: typeName(o.tag) & " " & $o.id
+
+proc isSpawnPoint*(o: LevelObject): bool =
+  ## A player placement (a character with the IsPlayer flag): where Konoko can start. With two
+  ## or more, Arklite starts her at one picked at random (a multiplayer map).
+  o.tag == "CHAR" and "IsPlayer" in o.node.xpath("OSD/Flags").str.splitWhitespace
 
 proc readXmlFile*(path: string): XmlNode =
   ## An OniSplit XML file (it starts with a byte order mark).

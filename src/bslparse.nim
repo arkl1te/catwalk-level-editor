@@ -30,7 +30,9 @@ type
   RefKind* = enum
     ## What an argument names, judged by the argument list's names.
     rkNone, rkCharName, rkTrgvName, rkPatrName, rkNeutName, rkPartTag,
-    rkFlagId, rkDoorId, rkConsoleId, rkTriggerId, rkTurretId, rkTrgvId, rkFuncName
+    rkFlagId, rkDoorId, rkConsoleId, rkTriggerId, rkTurretId, rkTrgvId, rkFuncName,
+    rkPartCommand,   ## particle tag create/kill/reset/do
+    rkPartEvent      ## particle tag [do] event: one of ParticleEvents
 
   Tok* = object
     kind*: TokKind
@@ -41,6 +43,8 @@ type
     call*: int = -1             ## The call it's the name (arg -1) or an argument of.
     arg*: int = -1
     decl*: int = -1             ## semDeclName: index in Analysis.decls.
+    defines*: bool              ## Declares a name: a func's, a var's (global or local), an argument's.
+    fn*: int = -1               ## The function (index in Analysis.decls) whose header or body it's in.
 
   Decl* = object
     name*: string
@@ -122,8 +126,23 @@ proc lexBsl*(lines: seq[string]): seq[Tok] =
 
 # --- argument roles ------------------------------------------------------------------------
 
+const
+  ParticleEvents* = ["update", "pulse", "start", "stop", "bgfx_start", "bgfx_stop", "hit_wall",
+    "hit_char", "lifetime", "explode", "brokenlink", "create", "die", "newattractor",
+    "delay_start", "delay_stop"]
+    ## The event names `particle tag [do] event` takes, in the game's order (P3gEventName,
+    ## the same 16 in retail Oni.exe; compared case-sensitively): an event's index is its
+    ## number in p3_callevent and particleevents.EventDefs.
+  ParticleCommands* = ["create", "kill", "reset", "do"]
+
+proc gameCommand*(cmd: string): string =
+  ## The game's command an Arklite command stands in for ("ark_sound_dialog_play_interrupt" ->
+  ## "sound_dialog_play_interrupt"): its arguments name the same things.
+  if cmd.startsWith("ark_"): cmd[4 .. ^1] else: cmd
+
 proc refFor*(cmd, param: string): RefKind =
   ## What a command's argument names, by the argument list's name for it.
+  let cmd = gameCommand(cmd)
   case param
   of "ai_name", "target_name", "forget_char": rkCharName
   of "path_name": rkPatrName
@@ -217,6 +236,54 @@ proc stmtEnd(ps: Parser, line: int): bool =
 proc callAt(ps: var Parser)
 proc expr(ps: var Parser, line: int, closeParen: bool)
 
+proc checkParticle(ps: var Parser, ci: int) =
+  ## particle tag command / particle tag do event (ONiParticle3_Command, Oni_Particle3.c):
+  ## the roles of its words and what the game prints an error for (and then does nothing).
+  let c = ps.an.calls[ci]
+  let n = c.args.len
+  proc word(ps: Parser, k: int): (bool, string) =
+    ## Argument k as the text the game compares, unless it's a variable or an expression.
+    let s = c.args[k]
+    if s.a != s.b: return (false, "")
+    let t = ps.an.toks[s.a]
+    if t.kind == tkString: return (true, t.text.strip(chars = {'"'}))
+    if t.kind == tkIdent and not ps.typeOf(t.text)[0]: return (true, t.text)
+    (false, "")
+  if n > 0:
+    let s = c.args[0]
+    let t = ps.an.toks[s.a]
+    if s.a == s.b: ps.an.toks[s.a].refk = rkPartTag
+    if t.kind == tkNumber:
+      ps.warn(t, "A particle tag needs a letter: the game says so and does nothing")
+  if n < 2:
+    ps.warn(ps.an.toks[c.tok], "particle needs a tag and a command (create, kill, reset, do " &
+      "event or an event name): the game does nothing")
+    return
+  let (isWord, cmd) = ps.word(1)
+  if cmd == "do": ps.an.calls[ci].form = 1 else: ps.an.calls[ci].form = 0
+  if not isWord: return
+  let t1 = ps.an.toks[c.args[1].a]
+  proc unknownEvent(ps: var Parser, t: Tok, w: string, lead: string) =
+    var msg = lead
+    if w.toLowerAscii in ParticleEvents or w.toLowerAscii in ParticleCommands:
+      msg.add ": the game compares exactly, write " & w.toLowerAscii
+    else: msg.add ": the game does nothing"
+    ps.warn(t, msg)
+  if cmd in ParticleCommands:
+    ps.an.toks[c.args[1].a].refk = rkPartCommand
+  elif cmd in ParticleEvents:
+    ps.an.toks[c.args[1].a].refk = rkPartEvent
+  else:
+    ps.unknownEvent(t1, cmd, "Not a particle command or event (create, kill, reset, do, start, stop...)")
+  if cmd != "do": return
+  if n < 3:
+    ps.warn(t1, "do needs an event name (start, stop, explode...): the game does nothing")
+    return
+  let (isEvent, ev) = ps.word(2)
+  if not isEvent: return
+  if ev in ParticleEvents: ps.an.toks[c.args[2].a].refk = rkPartEvent
+  else: ps.unknownEvent(ps.an.toks[c.args[2].a], ev, "Not a particle event (start, stop, explode...)")
+
 proc checkArgs(ps: var Parser, ci: int) =
   ## Matches a call's arguments to its command's (or function's) argument list:
   ## gives each argument its role and reports what the game would reject.
@@ -256,8 +323,8 @@ proc checkArgs(ps: var Parser, ci: int) =
 
   if ps.defs != nil and c.name in ps.defs.commands:
     let cmd = ps.defs.commands[c.name]
-    if c.name == "particle" and n > 0:
-      ps.an.toks[c.args[0].a].refk = rkPartTag
+    if c.name == "particle":
+      ps.checkParticle(ci)
     if n > 8:
       ps.warn(ps.an.toks[c.args[8].a], "More than 8 arguments: the game skips the line", error = true)
       return
@@ -418,6 +485,7 @@ proc funcHeader(ps: var Parser) =
   d.col = ps.tk.col
   d.doc = docAbove(ps.lines, ps.an.toks[ni].line)
   ps.setSem(ni, semDeclName)
+  ps.an.toks[ni].defines = true
   inc ps.p
   if not ps.atEnd and ps.tk.isPunct("("):
     ps.setSem(ps.ti, semPunct)
@@ -431,6 +499,7 @@ proc funcHeader(ps: var Parser) =
         if t.text == "void" and ps.tk(1).isPunct(")"): d.params.add ("void", "")
       elif t.kind == tkIdent:
         ps.setSem(ps.ti, semLocal)
+        ps.an.toks[ps.ti].defines = true
         if typ.len == 0: ps.warn(t, "Give the argument a type: string, int, float or bool", error = true)
         d.params.add (typ, t.text)
         ps.locals[t.text] = typ
@@ -468,6 +537,7 @@ proc varDecl(ps: var Parser) =
   d.col = ps.tk.col
   d.doc = docAbove(ps.lines, d.line)
   ps.setSem(ni, semDeclName)
+  ps.an.toks[ni].defines = true
   inc ps.p
   if ps.depth > 0:
     ps.locals[d.name] = d.typ
@@ -518,6 +588,53 @@ proc statement(ps: var Parser) =
       ps.setSem(i, semKeyword)
       inc ps.p
       if not ps.atEnd and ps.tk.kind == tkIdent and ps.tk.line == t.line: ps.callAt()
+    of "schedule":
+      # schedule f(args) at ticks / schedule f(args) repeat times every ticks (the game's
+      # parser 0x47b590; tested in game). Without ( ) the call would take the rest as arguments.
+      ps.setSem(i, semKeyword)
+      inc ps.p
+      if ps.stmtEnd(t.line) or ps.tk.kind != tkIdent:
+        ps.warn(t, "schedule needs a call: schedule f() at 60, or schedule f() repeat 3 every 30", error = true)
+      elif not (ps.tk(1).isPunct("(") and ps.tk(1).line == t.line):
+        ps.warn(ps.tk, "Write the call with ( ): schedule " & ps.tk.text & "() at 60", error = true)
+        ps.callAt()
+      else:
+        ps.callAt()
+        proc word(ps: var Parser, w: string): bool =
+          not ps.stmtEnd(t.line) and ps.tk.kind == tkIdent and ps.tk.text == w
+        proc value(ps: var Parser, stop: string) =
+          ## The expression up to stop (or the statement's end).
+          while not ps.stmtEnd(t.line) and not ps.word(stop):
+            if ps.tk.kind == tkIdent and ps.p + 1 < ps.sig.len and ps.tk(1).isPunct("("):
+              ps.callAt()
+              continue
+            if ps.tk.kind == tkIdent: ps.classifyWord(ps.ti)
+            else: ps.literalSem(ps.ti)
+            inc ps.p
+        if ps.word("at"):
+          ps.setSem(ps.ti, semKeyword)
+          inc ps.p
+          if ps.stmtEnd(t.line): ps.warn(ps.an.toks[ps.ti(-1)], "at needs the ticks to wait: at 60", error = true)
+          ps.value("")
+        elif ps.word("repeat"):
+          let r = ps.ti
+          ps.setSem(r, semKeyword)
+          inc ps.p
+          ps.value("every")
+          if ps.word("every"):
+            ps.setSem(ps.ti, semKeyword)
+            inc ps.p
+            if ps.stmtEnd(t.line): ps.warn(ps.an.toks[ps.ti(-1)], "every needs the ticks between runs: every 30", error = true)
+            ps.value("")
+          else: ps.warn(ps.an.toks[r], "repeat needs every: schedule f() repeat 3 every 30", error = true)
+        elif not ps.stmtEnd(t.line):
+          ps.warn(ps.tk, "at or repeat should follow: schedule f() at 60, or schedule f() repeat 3 every 30", error = true)
+          while not ps.stmtEnd(t.line):   # the rest of the line: one error is enough
+            if ps.tk.kind == tkIdent and ps.tk.text in Keywords: ps.setSem(ps.ti, semKeyword)
+            else: ps.literalSem(ps.ti)
+            inc ps.p
+        else:
+          ps.warn(t, "schedule without at or repeat: say when, schedule f() at 60")
     else:
       if t.text in Keywords and t.text notin ["true", "false"]:
         ps.setSem(i, semKeyword)
@@ -571,6 +688,154 @@ proc analyze*(lines: seq[string], toks: seq[Tok], defs: BslDefs, idx: ProjectInd
   while not ps.atEnd: ps.statement()
   if ps.depth > 0 and ps.sig.len > 0:
     ps.warn(ps.an.toks[ps.sig[^1]], &"Missing }} ({ps.depth} block(s) left open)", error = true)
+  # Which function each token is in: from its name to the } that closes its body.
+  var fn = -1
+  var depth = 0
+  var opened = false
+  for i in 0 ..< ps.an.toks.len:
+    let t = ps.an.toks[i]
+    if t.sem == semDeclName and t.decl >= 0 and ps.an.decls[t.decl].isFunc and depth == 0:
+      fn = t.decl
+      opened = false
+    elif t.kind == tkPunct and t.text == "{":
+      inc depth
+      opened = true
+    elif t.kind == tkPunct and t.text == "}":
+      depth = max(0, depth - 1)
+      if depth == 0 and opened:
+        ps.an.toks[i].fn = fn
+        fn = -1
+        continue
+    ps.an.toks[i].fn = fn
+  # A return inside an if or else: the game's parser ends the function when it
+  # reads one, without checking whether that branch runs (Oni.exe 0x47b590,
+  # state 0x13; OniFoxed's SLcParseState_Statement_Return_ReturnFromExpr).
+  proc prevSig(i: int): int =
+    result = i - 1
+    while result >= 0 and ps.an.toks[result].kind == tkComment: dec result
+  proc isPunctAt(i: int, s: string): bool = i >= 0 and ps.an.toks[i].kind == tkPunct and ps.an.toks[i].text == s
+  proc ownedByIf(i: int): bool =
+    ## The statement starting after token i is an if's or else's body.
+    if i < 0: return false
+    let t = ps.an.toks[i]
+    if t.kind == tkIdent and t.text == "else": return true
+    if not isPunctAt(i, ")"): return false
+    var depth = 0
+    for j in countdown(i, 0):
+      if isPunctAt(j, ")"): inc depth
+      elif isPunctAt(j, "("):
+        dec depth
+        if depth == 0:
+          let k = prevSig(j)
+          return k >= 0 and ps.an.toks[k].kind == tkIdent and ps.an.toks[k].text == "if"
+    false
+  for i, t in ps.an.toks:
+    if t.kind != tkIdent or t.text != "return" or t.sem != semKeyword: continue
+    var inIf = ownedByIf(prevSig(i))
+    var depth = 0
+    var j = i - 1
+    while not inIf and j >= 0:
+      if isPunctAt(j, "}"): inc depth
+      elif isPunctAt(j, "{"):
+        if depth == 0:
+          if ownedByIf(prevSig(j)): inIf = true
+        else: dec depth
+      j.dec
+    if inIf:
+      ps.warn(t, "In the game this return ends the function even when the if around it is false (BSL ignores the if here)")
+  # Unreachable code: after a function's first return (which ends it even
+  # inside an if whose condition is false, see above), in an if whose
+  # condition is a constant false, and in the else of a constant true one.
+  # A warning per line, on its code (not lines of only braces or else).
+  let toks = ps.an.toks
+  var unreach: Table[int, (int, int, string)]
+  proc isReturn(j: int): bool = toks[j].kind == tkIdent and toks[j].text == "return" and toks[j].sem == semKeyword
+  proc stmtEndAfter(j: int): int =
+    ## The last token of the statement starting at j (to the line's end or a ;).
+    result = j
+    var k = j + 1
+    while k < toks.len and toks[k].line == toks[j].line and not isPunctAt(k, "}") and not isPunctAt(k, "{"):
+      if toks[k].kind != tkComment: result = k
+      if isPunctAt(k, ";"): break
+      inc k
+  proc mark(a, z: int, msg: string, keepReturns = false) =
+    var j = a
+    while j <= z:
+      let t = toks[j]
+      if keepReturns and isReturn(j):
+        j = stmtEndAfter(j) + 1
+        continue
+      if t.kind == tkComment or (t.kind == tkPunct and t.text in ["{", "}", ";"]) or
+         (t.kind == tkIdent and t.text == "else" and t.sem == semKeyword):
+        inc j
+        continue
+      if t.line notin unreach: unreach[t.line] = (t.col, t.col + t.len, msg)
+      elif unreach[t.line][2] == msg: unreach[t.line][1] = t.col + t.len
+      inc j
+  for f, d in ps.an.decls:
+    if not d.isFunc: continue
+    var first, close = -1
+    for j, t in toks:
+      if t.fn != f: continue
+      if first < 0 and isReturn(j): first = j
+      close = j
+    if first < 0 or close < 0 or not isPunctAt(close, "}"): continue
+    var inIf = ownedByIf(prevSig(first))
+    var depth = 0
+    var j = first - 1
+    while not inIf and j >= 0 and toks[j].fn == f:
+      if isPunctAt(j, "}"): inc depth
+      elif isPunctAt(j, "{"):
+        if depth == 0:
+          if ownedByIf(prevSig(j)): inIf = true
+        else: dec depth
+      dec j
+    let rl = $(toks[first].line + 1)
+    mark(stmtEndAfter(first) + 1, close - 1,
+         if inIf: "Never runs: the return on line " & rl & " ends the function even when its if is false"
+         else: "Never runs: the return on line " & rl & " ends the function before this")
+  proc nextSig(i: int): int =
+    result = i + 1
+    while result < toks.len and toks[result].kind == tkComment: inc result
+    if result >= toks.len: result = -1
+  proc closeOf(i: int): int =
+    let o = toks[i].text
+    let c = if o == "(": ")" else: "}"
+    var depth = 0
+    for j in i ..< toks.len:
+      if isPunctAt(j, o): inc depth
+      elif isPunctAt(j, c):
+        dec depth
+        if depth == 0: return j
+    -1
+  for i, t in toks:
+    if t.kind != tkIdent or t.text != "if" or t.sem != semKeyword: continue
+    let lp = nextSig(i)
+    if lp < 0 or not isPunctAt(lp, "("): continue
+    let c = nextSig(lp)
+    if c < 0 or nextSig(c) < 0 or not isPunctAt(nextSig(c), ")"): continue
+    let ct = toks[c]
+    var truth = -1
+    if ct.kind == tkIdent and ct.text in ["true", "false"]: truth = ord(ct.text == "true")
+    elif ct.kind == tkNumber:
+      try: truth = ord(parseFloat(numberValue(ct.text)) != 0)
+      except ValueError: discard
+    if truth < 0: continue
+    let bo = nextSig(nextSig(c))
+    if bo < 0 or not isPunctAt(bo, "{"): continue
+    let bc = closeOf(bo)
+    if bc < 0: continue
+    if truth == 0:
+      mark(bo + 1, bc - 1, "Never runs: this if's condition is always false", keepReturns = true)
+    else:
+      let e = nextSig(bc)
+      if e >= 0 and toks[e].kind == tkIdent and toks[e].text == "else":
+        let eo = nextSig(e)
+        if eo >= 0 and isPunctAt(eo, "{"):
+          let ec = closeOf(eo)
+          if ec > 0: mark(eo + 1, ec - 1, "Never runs: the if's condition is always true", keepReturns = true)
+  for l, (c0, c1, msg) in unreach:
+    ps.an.diags.add Diag(line: l, col: c0, len: max(1, c1 - c0), msg: msg, error: false)
   ps.an
 
 # --- where the caret is ----------------------------------------------------------------------

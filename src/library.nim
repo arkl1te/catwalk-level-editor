@@ -70,11 +70,12 @@ proc envMappedImages(oniDir: string): HashSet[string] =
 proc libraryFile*(): string = libraryDir() / "library.json"
 proc libraryImages*(): string = libraryDir() / "images"
 proc libraryOni*(): string = libraryDir() / "oni"
-proc prefabPath*(p: Preset): string = libraryDir() / "prefabs" / p.prefab
+proc prefabPath*(p: Preset): string =
+  if p.imported.len > 0: p.imported / p.prefab else: libraryDir() / "prefabs" / p.prefab
 proc thumbDir*(): string = libraryDir() / "thumbs"
 proc modelDir*(): string = libraryDir() / "models"
 
-const PreviewVersion = 7   ## Bump when previews should be rendered again (2: particles, 3: models, 4: env-mapped textures opaque, 5: doors/ for Build, 6: console screens, 7: classes/ kept).
+const PreviewVersion = 8   ## Bump when previews should be rendered again (2: particles, 3: models, 4: env-mapped textures opaque, 5: doors/ for Build, 6: console screens, 7: classes/ kept, 8: model vertex normals, lit as Oni lights them).
 
 var libraryLooked = -1.0   ## epochTime of the last look at the library's files (see lookAtLibrary).
 var libraryState: tuple[built, previews: bool, stamp: string]
@@ -166,10 +167,12 @@ proc thumbKey*(p: Preset): string =
   ## The preview's file name in thumbs/ (without .png); "" for presets without
   ## a model (generic objects, particles, the LSI).
   if p.generic: return ""
+  if p.imported.len > 0: return "imported_" & p.imported.lastPathPart & "_" & p.importStamp
   if p.prefab.len > 0: return p.prefab.changeFileExt("")
   classKey(p.tag, p.presetClass)
 
 proc thumbPath*(p: Preset): string =
+  if p.imported.len > 0: return p.imported / "preview.png"
   let k = p.thumbKey
   if k.len > 0: thumbDir() / k & ".png" else: ""
 

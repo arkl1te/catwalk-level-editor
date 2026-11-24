@@ -215,6 +215,7 @@ type
     display: DisplayKind
     texture: string
     invisible, scaleToVelocity, useYScale, edgeFade, oneSidedEdgeFade, lensFlare: bool
+    sky: bool   ## DrawAsSky: drawn with the sky, which the game never fogs (P3rDisplayClass).
     scale, yScale, rotation, alpha, tint: Value
     edgeFadeMin, edgeFadeMax: float32
     xOffset, xShorten: Value     ## Where the sprite sits along its X, and how much is cut off.
@@ -430,6 +431,7 @@ proc parseClassXml(xml: string): PClass =
   cls.lifetime = parseValue(o.sub("Lifetime"), cls)
   cls.collideWalls = o.text("CollideWithWalls").isTrue
   cls.initiallyHidden = o.text("InitiallyHidden").isTrue
+  cls.sky = o.text("DrawAsSky").isTrue
   cls.lockToLink = o.text("LockPositionToLink").isTrue
   let pr = n.sub("Properties")
   cls.hasVelocity = pr.text("HasVelocity").isTrue
@@ -1364,7 +1366,7 @@ proc sprites*(s: ParticleSim, camPos: Vec3): seq[SpriteInst] =
       xOffset: s.f(cls.xOffset, p), xShorten: s.f(cls.xShorten, p),
       col: [uint8(clamp(tint.x, 0, 1) * 255), uint8(clamp(tint.y, 0, 1) * 255),
             uint8(clamp(tint.z, 0, 1) * 255), uint8(a * 255)],
-      tex: s.frameOf(t, p), additive: t.additive, flare: cls.lensFlare,
+      tex: s.frameOf(t, p), additive: t.additive, flare: cls.lensFlare, sky: cls.sky,
       edgeFade: cls.edgeFade, oneSided: cls.oneSidedEdgeFade,
       edgeMin: cls.edgeFadeMin, edgeMax: cls.edgeFadeMax)
 
@@ -1473,7 +1475,7 @@ proc contrails(s: ParticleSim, camPos: Vec3, tris: var seq[ParticleTri]) =
     let c = [ca, ca, cb, cb]
     for (i, j, k) in [(0, 1, 2), (0, 2, 3)]:
       tris.add ParticleTri(p: [q[i], q[j], q[k]], uv: [uv[i], uv[j], uv[k]],
-                           col: [c[i], c[j], c[k]], tex: tex, additive: t.additive)
+                           col: [c[i], c[j], c[k]], tex: tex, additive: t.additive, sky: a.cls.sky)
 
 proc models(s: ParticleSim, tris: var seq[ParticleTri]) =
   ## Geometry particles (FUN_00460800): their M3GM, untinted.
@@ -1502,7 +1504,7 @@ proc models(s: ParticleSim, tris: var seq[ParticleTri]) =
       if tex.len == 0: continue
       var i = 0
       while i + 2 < b.verts.len:
-        var tri = ParticleTri(tex: tex, additive: additive, wrap: true)
+        var tri = ParticleTri(tex: tex, additive: additive, wrap: true, sky: cls.sky)
         for k in 0 .. 2:
           let v = b.verts[i + k]
           tri.p[k] = pos + (ax[0] * v.pos.x + ax[1] * v.pos.y + ax[2] * v.pos.z) * scale

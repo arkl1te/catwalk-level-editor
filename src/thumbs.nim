@@ -12,6 +12,7 @@ const ThumbSize* = 144   ## Pixels; the browser scales them down.
 type
   ThumbTri* = object
     p*: array[3, Vec3]
+    n*: array[3, Vec3]             ## Vertex normals (.dae models); all zero = none (prefab geometry).
     uv*: array[3, Vec2]
     col*: array[3, array[4, uint8]]
     tex*: int                      ## Index into images, -1 = untextured.
@@ -20,6 +21,39 @@ type
     tris*: seq[ThumbTri]
     images*: seq[string]           ## .tga paths.
     imageIndex: Table[string, int]
+
+# --- Oni's model lighting -----------------------------------------------------------------
+# Oni.exe lights every model (characters, weapons, doors, turrets, consoles)
+# per vertex from its M3GM vertex normal, with fixed world-space lights, and
+# multiplies the texture by that shade (Gouraud). The lights are
+# ONrGameState_SetupDefaultLighting (0x4f4a30): ambient 0.55 with two
+# directional lights at graphics quality 2-4 (0.65 and one light at 0-1),
+# light 0 along (-0.5, -1, -0.5) at 0.7, light 1 along (0.5, 0.5, 1) at 0.3.
+# The software geometry engine's setter (MS_GC_Method_Light.c, 0x4135e0)
+# reads the direction's x again for z and scales the color by the unnormalized
+# length, so light 1 really runs along (1, 1, 1) at 0.3 * |(0.5, 0.5, 0.5)|.
+# Per vertex (MS_Geom_Shade.c iComputeShade, 0x417fe4): ambient + the sum of
+# max(0, n . -direction) * color, at most 1, rounded to 8 bits.
+# No texture (flag 0x800) or M3GM (flag 0x10) in the game skips it.
+
+const
+  OniAmbient* = 0.55'f32
+  OniLightDirs* = [vec3(0.5, 1, 0.5) / sqrt(1.5'f32),     ## Toward each light (-direction).
+                   vec3(-1, -1, -1) / sqrt(3'f32)]
+  OniLightColors* = [0.7'f32 * sqrt(1.5'f32), 0.3'f32 * sqrt(0.75'f32)]
+
+proc oniShade*(n: Vec3): float32 =
+  ## The shade (0-1) Oni gives a model vertex with world normal n.
+  result = OniAmbient
+  for i in 0 .. 1: result += max(0'f32, n.dot(OniLightDirs[i])) * OniLightColors[i]
+  result = round(min(result * 255, 255)) / 255
+
+proc faceNormal*(t: ThumbTri): Vec3 =
+  let n = (t.p[1] - t.p[0]).cross(t.p[2] - t.p[0])
+  if n.length < 1e-12: vec3(0, 0, 0) else: n.normalize
+
+proc hasNormals*(t: ThumbTri): bool =
+  t.n[0].length > 0.5 and t.n[1].length > 0.5 and t.n[2].length > 0.5
 
 proc imageId(m: var ThumbMesh, path: string): int =
   if path.len == 0 or not fileExists(path): return -1
@@ -47,6 +81,7 @@ proc addDae*(m: var ThumbMesh, path: string, offset = vec3(0, 0, 0), image = "",
         let v = b.verts[i + k]
         let p = if upright: vec3(v.pos.x, -v.pos.z, v.pos.y) else: v.pos
         tri.p[k] = p + offset
+        tri.n[k] = if upright: vec3(v.nrm.x, -v.nrm.z, v.nrm.y) else: v.nrm
         tri.uv[k] = v.uv
         tri.col[k] = v.color
       m.tris.add tri
@@ -127,7 +162,13 @@ proc render*(m: ThumbMesh, size = ThumbSize, cutouts = true): Image =
     if nrm.length < 1e-12: continue
     nrm = nrm.normalize
     if nrm.dot(fwd) > 0: nrm = -nrm   # Two-sided.
-    let shade = 0.62'f32 + 0.5'f32 * max(0'f32, nrm.dot(light))
+    # Models: lit per vertex as Oni lights them (the preview is unturned, so
+    # model space is world space). Prefab geometry: a fixed light per face.
+    let smooth = t.hasNormals
+    let flatShade = 0.62'f32 + 0.5'f32 * max(0'f32, nrm.dot(light))
+    var vs: array[3, float32]
+    if smooth:
+      for k in 0 .. 2: vs[k] = oniShade(t.n[k])
     let x0 = max(0, int(floor(min(s[0].x, min(s[1].x, s[2].x)))))
     let x1 = min(n - 1, int(ceil(max(s[0].x, max(s[1].x, s[2].x)))))
     let y0 = max(0, int(floor(min(s[0].y, min(s[1].y, s[2].y)))))
@@ -155,6 +196,7 @@ proc render*(m: ThumbMesh, size = ThumbSize, cutouts = true): Image =
           let o = (ty * tw + tx) * 4
           if cutout and textures[tex].rgba[o + 3] < 128: continue
           for j in 0 .. 2: c[j] = textures[tex].rgba[o + j].float32 / 255
+        let shade = if smooth: vs[0] * w0 + vs[1] * w1 + vs[2] * w2 else: flatShade
         for j in 0 .. 2:
           let vc = (t.col[0][j].float32 * w0 + t.col[1][j].float32 * w1 + t.col[2][j].float32 * w2) / 255
           c[j] *= vc * shade
@@ -187,7 +229,9 @@ proc renderTo*(m: ThumbMesh, path: string, size = ThumbSize) =
 
 # --- saved models (the viewport draws them at their objects) ----------------------------
 
-const ModelMagic = "CWM1"
+const
+  ModelMagic = "CWM2"     ## 2: vertex normals.
+  ModelMagicV1 = "CWM1"   ## Read too (no normals) until the library is rebuilt.
 
 proc bounds*(m: ThumbMesh): (Vec3, Vec3) =
   var lo = vec3(Inf.float32)
@@ -224,7 +268,8 @@ proc saveModel*(m: ThumbMesh, path, base, imageDir, keep: string) =
   for t in m.tris:
     s.write t.tex.int32
     for k in 0 .. 2:
-      for c in [t.p[k].x, t.p[k].y, t.p[k].z, t.uv[k].x, t.uv[k].y]: s.write c
+      for c in [t.p[k].x, t.p[k].y, t.p[k].z, t.uv[k].x, t.uv[k].y, t.n[k].x, t.n[k].y, t.n[k].z]:
+        s.write c
       for c in t.col[k]: s.write c
   writeFile(path, s.data)
 
@@ -235,7 +280,9 @@ proc loadModel*(path, base: string): ThumbMesh =
   if s == nil: return
   defer: s.close()
   try:
-    if s.readStr(4) != ModelMagic: return
+    let magic = s.readStr(4)
+    if magic notin [ModelMagic, ModelMagicV1]: return
+    let normals = magic == ModelMagic
     for i in 0 ..< s.readInt32:
       let n = s.readInt32
       result.images.add base / s.readStr(n)
@@ -247,6 +294,9 @@ proc loadModel*(path, base: string): ThumbMesh =
         let (x, y, z, u, v) = (s.readFloat32, s.readFloat32, s.readFloat32, s.readFloat32, s.readFloat32)
         t.p[k] = vec3(x, y, z)
         t.uv[k] = vec2(u, v)
+        if normals:
+          let (nx, ny, nz) = (s.readFloat32, s.readFloat32, s.readFloat32)
+          t.n[k] = vec3(nx, ny, nz)
         for c in t.col[k].mitems: c = s.readUint8
   except IOError, OSError:
     result = ThumbMesh()

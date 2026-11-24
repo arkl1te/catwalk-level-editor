@@ -25,6 +25,8 @@ type
     oniFiles*: seq[string]            ## Library .oni files the object needs packed with the level.
     doorCenter*: string               ## DOOR: OSD/Center in object space.
     modelTexture*: string             ## DOOR: library image for its preview (the level's Texture1).
+    imported*: string                 ## A model imported as furniture: its folder (importedmodels.nim).
+    importStamp*: string              ## ...and when it was saved (a re-import gets a new preview).
 
 const
   ## (group, class, label, team, weapon, flags). Characters start in the level

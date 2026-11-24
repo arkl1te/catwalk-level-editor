@@ -230,6 +230,45 @@ proc recordingChoices*(c: Catalog): seq[Choice] =
     result.add Choice(value: n.toLowerAscii,
                       note: if (n & ".aif").toLowerAscii in own: "imported recording" else: "recording")
 
+type
+  SoundGroup* = enum
+    ## The Sound Browser's lists.
+    sgLoop = "Sound object ambients"        ## What a Sound object's Class takes: looping ambients.
+    sgMusic = "Music"                       ## Ambients sound_music_start plays (atm_, mus_).
+    sgOnce = "Played once"                  ## PlayOnce ambients: dialogue, cutscene effects, screams.
+    sgImpulse = "Impulses"                  ## One-off sounds (.imp): hits, footsteps, lights' flicker.
+    sgRecording = "Recordings"              ## Single SNDD sounds, as rec_ values.
+
+  SoundEntry* = object
+    value*: string                          ## What a sound field takes.
+    note*: string                           ## "this level's ambient", "imported recording"...
+    group*: SoundGroup
+
+proc soundEntries*(c: Catalog): seq[SoundEntry] =
+  ## Every sound the level can name, in the Sound Browser's lists: the
+  ## ambients a Sound object plays (level 0's, then the project's own), the
+  ## other ambients, impulses, then each single recording.
+  var seen: HashSet[string]
+  var list: seq[SoundEntry]
+  proc add(value, note: string, g: SoundGroup) =
+    if seen.containsOrIncl(value.toLowerAscii): return
+    list.add SoundEntry(value: value, note: note, group: g)
+  for n in c.loops: add(n, "", sgLoop)
+  for n in c.projNames.getOrDefault("OSBD"):
+    if n.endsWith(".amb"):
+      let v = n[0 ..< ^4]
+      add(v, if v.toLowerAscii in c.ownAmbients: "this level's ambient" else: "", sgLoop)
+  for n in c.names("OSBD", suffix = ".amb"):
+    let low = n.toLowerAscii
+    add(n, "", if low.startsWith("atm_") or low.startsWith("mus_"): sgMusic else: sgOnce)
+  seen.clear()
+  for n in c.names("OSBD", suffix = ".imp"): add(n, "", sgImpulse)
+  var own: HashSet[string]
+  for n in c.projNames.getOrDefault("SNDD"): own.incl n.toLowerAscii
+  for n in c.names("SNDD", suffix = ".aif"):
+    add(RecordingPrefix & n, if (n & ".aif").toLowerAscii in own: "imported recording" else: "", sgRecording)
+  list
+
 proc soundNamesTaken*(c: Catalog): HashSet[string] =
   ## Every OSBD name (without .amb, .grp or .imp), lower case: a new ambient needs another.
   for n in c.names("OSBD"):

@@ -1,5 +1,5 @@
 diff --git a/src/silky/contexts.nim b/src/silky/contexts.nim
-index aa6bf25..052f836 100644
+index aa6bf25..7a237d8 100644
 --- a/src/silky/contexts.nim
 +++ b/src/silky/contexts.nim
 @@ -80,6 +80,9 @@ type
@@ -12,7 +12,30 @@ index aa6bf25..052f836 100644
      ## Multiplies 9-patch borders for a denser atlas.
      sliceScale*: int = 1
      layoutStack*: seq[LayoutScope]
-@@ -278,7 +281,11 @@ proc getImageSize*(sk: Silky, image: string): Vec2 =
+@@ -116,10 +119,22 @@ type
+     avgFrameTime*: float64
+     interactor*: Interactor
+     window: Window
++    ## markHole: where in the normal layer the host draws with OpenGL itself
++    ## (-1 = nowhere this frame) and what draws it.
++    holeMark: int = -1
++    holeDraw: proc() {.closure.}
+ 
+ proc currentDrawLayer*(sk: Silky): int =
+   sk.drawer.currentLayer
+ 
++proc markHole*(sk: Silky, draw: proc() {.closure.}) =
++  ## endUi calls draw between the normal layer's vertices queued so far (under
++  ## it) and the rest (over it, with the popups layer). One per frame; ignored
++  ## while drawing to another layer or in tiles (an offscreen frame).
++  if sk.drawer.currentLayer != NormalLayer: return
++  sk.holeMark = sk.drawer.layers[NormalLayer].len
++  sk.holeDraw = draw
++
+ proc textInputs*(sk: Silky): TextInputs =
+   ## Provides internal text input state to the text widgets.
+   sk.inputs
+@@ -278,7 +293,11 @@ proc getImageSize*(sk: Silky, image: string): Vec2 =
      echo "[Warning] Image not found in atlas: " & image
      return vec2(0, 0)
    let uv = sk.atlas.entries[image]
@@ -25,7 +48,7 @@ index aa6bf25..052f836 100644
  
  proc nextRune(text: string, i: var int): Rune {.inline.} =
    ## Reads one UTF-8 rune and advances the byte index.
-@@ -531,7 +538,8 @@ proc drawText*(
+@@ -531,7 +550,8 @@ proc drawText*(
      layer = sk.drawer.currentLayer
      needsHAlign = hAlign != LeftAlign
      needsVAlign = vAlign != TopAlign
@@ -35,7 +58,7 @@ index aa6bf25..052f836 100644
  
    if clip:
      sk.pushClipRect(rect(pos, vec2(maxWidth, maxHeight)))
-@@ -550,9 +558,9 @@ proc drawText*(
+@@ -550,9 +570,9 @@ proc drawText*(
          of LeftAlign:
            0.0'f
          of CenterAlign:
@@ -47,7 +70,7 @@ index aa6bf25..052f836 100644
        if dx != 0:
          for j in lineStartIdx ..< sk.drawer.layers[layer].len:
            sk.drawer.layers[layer][j].pos.x += dx
-@@ -569,7 +577,7 @@ proc drawText*(
+@@ -569,7 +589,7 @@ proc drawText*(
      if rune == LineFeedRune:
        alignLine(currentPos.x - pos.x)
        currentPos.x = pos.x
@@ -56,7 +79,7 @@ index aa6bf25..052f836 100644
        hasPreviousRune = false
        continue
  
-@@ -588,15 +596,15 @@ proc drawText*(
+@@ -588,15 +608,15 @@ proc drawText*(
              break
            var wordEntry: ptr LetterEntry
            if fontData.lookupLetter(wordRune, 0, wordEntry):
@@ -75,7 +98,7 @@ index aa6bf25..052f836 100644
          (frac * fontData.subpixelSteps.float32).int mod
            fontData.subpixelSteps
        else:
-@@ -612,7 +620,7 @@ proc drawText*(
+@@ -612,7 +632,7 @@ proc drawText*(
        if wordWrap:
          alignLine(currentPos.x - pos.x)
          currentPos.x = pos.x
@@ -84,7 +107,7 @@ index aa6bf25..052f836 100644
        elif glyphClip:
          while i < text.len:
            var next: Rune
-@@ -621,26 +629,26 @@ proc drawText*(
+@@ -621,26 +641,26 @@ proc drawText*(
            discard text.nextRune(i)
          continue
  
@@ -117,7 +140,7 @@ index aa6bf25..052f836 100644
  
      previousRune = rune
      hasPreviousRune = true
-@@ -650,15 +658,15 @@ proc drawText*(
+@@ -650,15 +670,15 @@ proc drawText*(
    if needsVAlign:
      let
        textHeight =
@@ -136,7 +159,7 @@ index aa6bf25..052f836 100644
      if dy != 0:
        for j in textStartIdx ..< sk.drawer.layers[layer].len:
          sk.drawer.layers[layer][j].pos.y += dy
-@@ -670,10 +678,12 @@ proc getTextSize*(sk: Silky, font: string, text: string): Vec2 {.measure.} =
+@@ -670,10 +690,12 @@ proc getTextSize*(sk: Silky, font: string, text: string): Vec2 {.measure.} =
    if font notin sk.atlas.fonts:
      return vec2(0, 0)
  
@@ -151,7 +174,7 @@ index aa6bf25..052f836 100644
      maxWidth = 0.0'f
  
    while i < text.len:
-@@ -681,17 +691,17 @@ proc getTextSize*(sk: Silky, font: string, text: string): Vec2 {.measure.} =
+@@ -681,17 +703,17 @@ proc getTextSize*(sk: Silky, font: string, text: string): Vec2 {.measure.} =
      if rune == LineFeedRune:
        maxWidth = max(maxWidth, currentPos.x)
        currentPos.x = 0
@@ -172,7 +195,7 @@ index aa6bf25..052f836 100644
  
    maxWidth = max(maxWidth, currentPos.x)
    vec2(maxWidth, currentPos.y)
-@@ -763,8 +773,8 @@ proc drawImage*(
+@@ -763,8 +785,8 @@ proc drawImage*(
      mPos = vec2(m.x.float32, m.y.float32)
      mSize = vec2(m.width.float32, m.height.float32)
    sk.drawQuad(
@@ -183,6 +206,45 @@ index aa6bf25..052f836 100644
      vec2(uv.x.float32, uv.y.float32),
      vec2(uv.width.float32, uv.height.float32),
      color,
+@@ -958,6 +980,11 @@ proc clearScreen*(sk: Silky, color: ColorRGBX) {.measure.} =
+ 
+ proc endUi*(sk: Silky) =
+   ## Flushes the queued draws through the active drawer.
++  let
++    hole = sk.holeMark
++    holeDraw = sk.holeDraw
++  sk.holeMark = -1
++  sk.holeDraw = nil
+   for i in 1 ..< sk.drawer.layers.len:
+     sk.drawer.layers[NormalLayer].add(sk.drawer.layers[i])
+ 
+@@ -982,12 +1009,20 @@ proc endUi*(sk: Silky) =
+       quadsPtr = cast[pointer](unsafeAddr sk.drawer.layers[NormalLayer][0])
+   else:
+     quadsPtr = nil
+-  sk.drawer.endFrame(
+-    sk.image,
+-    sk.framebufferSize.vec2,
+-    quadsPtr,
+-    quadCount
+-  )
++  if holeDraw != nil and hole >= 0 and hole <= quadCount and sk.drawer.tiles.len == 0:
++    sk.drawer.endFrame(sk.image, sk.framebufferSize.vec2, quadsPtr, hole)
++    holeDraw()
++    let rest =
++      if quadsPtr == nil: nil
++      else: cast[pointer](cast[uint](quadsPtr) + uint(hole * sizeof(DrawerVertex)))
++    sk.drawer.endFrame(sk.image, sk.framebufferSize.vec2, rest, quadCount - hole)
++  else:
++    sk.drawer.endFrame(
++      sk.image,
++      sk.framebufferSize.vec2,
++      quadsPtr,
++      quadCount
++    )
+   sk.endUiShared()
+ 
+ proc buttonDown*(sk: Silky): ButtonView =
 diff --git a/src/silky/drawers/ogl.nim b/src/silky/drawers/ogl.nim
 index 254300f..dc2ff31 100644
 --- a/src/silky/drawers/ogl.nim

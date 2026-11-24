@@ -1,7 +1,7 @@
 ## Reads the Collada (.dae) files OniSplit writes for level geometry into
 ## world-space triangle batches, one batch per texture image.
 ## Supports what OniSplit emits: <triangles>, <polylist> and <polygons> with
-## VERTEX/TEXCOORD/COLOR inputs, and node <matrix>/<translate>/<rotate>/<scale>.
+## VERTEX/NORMAL/TEXCOORD/COLOR inputs, and node <matrix>/<translate>/<rotate>/<scale>.
 
 import std/[xmlparser, xmltree, strutils, tables, os, math]
 import vmath
@@ -9,6 +9,7 @@ import vmath
 type
   DaeVertex* = object
     pos*: Vec3
+    nrm*: Vec3              ## Unit normal (OniSplit writes the M3GM vertex normals); zero if none.
     uv*: Vec2
     color*: array[4, uint8]
 
@@ -55,6 +56,19 @@ proc apply(m: Mat, p: Vec3): Vec3 =
   vec3(m[0] * p.x + m[1] * p.y + m[2] * p.z + m[3],
        m[4] * p.x + m[5] * p.y + m[6] * p.z + m[7],
        m[8] * p.x + m[9] * p.y + m[10] * p.z + m[11])
+
+proc applyNormal(m: Mat, n: Vec3): Vec3 =
+  ## n through m's inverse transpose (its 3x3 cofactors, which are that
+  ## times the determinant: turned back when it mirrors), normalized; zero
+  ## stays zero.
+  let det = m[0] * (m[5] * m[10] - m[6] * m[9]) + m[1] * (m[6] * m[8] - m[4] * m[10]) +
+            m[2] * (m[4] * m[9] - m[5] * m[8])
+  var r = vec3(
+    (m[5] * m[10] - m[6] * m[9]) * n.x + (m[6] * m[8] - m[4] * m[10]) * n.y + (m[4] * m[9] - m[5] * m[8]) * n.z,
+    (m[2] * m[9] - m[1] * m[10]) * n.x + (m[0] * m[10] - m[2] * m[8]) * n.y + (m[1] * m[8] - m[0] * m[9]) * n.z,
+    (m[1] * m[6] - m[2] * m[5]) * n.x + (m[2] * m[4] - m[0] * m[6]) * n.y + (m[0] * m[5] - m[1] * m[4]) * n.z)
+  if det < 0: r = -r
+  if r.length > 1e-12: r.normalize else: vec3(0, 0, 0)
 
 proc floats(s: string): seq[float32] =
   for tok in s.splitWhitespace: result.add parseFloat(tok).float32
@@ -266,14 +280,16 @@ proc readDae*(path: string, firstFrame = false): DaeScene =
         scene.batches.add DaeBatch(image: image, material: matId)
       let bi = batchIndex[key]
       var stride = 0
-      var posSrc, uvSrc, colSrc: Source
-      var posOff, uvOff, colOff = -1
+      var posSrc, nrmSrc, uvSrc, colSrc: Source
+      var posOff, nrmOff, uvOff, colOff = -1
       for inp in prim.inputs:
         stride = max(stride, inp.offset + 1)
         case inp.semantic
         of "VERTEX":
           posOff = inp.offset
           posSrc = geo.sources.getOrDefault(geo.positionOf.getOrDefault(inp.source, inp.source))
+        of "NORMAL":
+          nrmOff = inp.offset; nrmSrc = geo.sources.getOrDefault(inp.source)
         of "TEXCOORD":
           if uvOff < 0 or inp.set == 0:
             uvOff = inp.offset; uvSrc = geo.sources.getOrDefault(inp.source)
@@ -287,6 +303,9 @@ proc readDae*(path: string, firstFrame = false): DaeScene =
         let base = (k) * stride
         let pi = prim.p[base + posOff] * posSrc.stride
         v.pos = m.apply(vec3(posSrc.data[pi], posSrc.data[pi + 1], posSrc.data[pi + 2]))
+        if nrmOff >= 0 and nrmSrc.stride >= 3 and nrmSrc.data.len > 0:
+          let ni = prim.p[base + nrmOff] * nrmSrc.stride
+          v.nrm = m.applyNormal(vec3(nrmSrc.data[ni], nrmSrc.data[ni + 1], nrmSrc.data[ni + 2]))
         if uvOff >= 0 and uvSrc.data.len > 0:
           let ti = prim.p[base + uvOff] * uvSrc.stride
           v.uv = vec2(uvSrc.data[ti], 1 - uvSrc.data[ti + 1])

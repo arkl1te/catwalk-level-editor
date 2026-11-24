@@ -23,7 +23,9 @@ const
   Instructions = "Catwalk is a level editor for the game Oni. World units are Oni's, " &
     "Y is up. Start with status. Every edit is one undo step, and nothing reaches the " &
     "disk until save or build. Faces are ordered counter-clockwise from their front. " &
-    "Objects are named by tag (CHAR, FLAG, ...) and id."
+    "Objects are named by tag (CHAR, FLAG, ...) and id. The level's BSL scripts: list_scripts " &
+    "and read_script give them as the user has them in the Scripts panel, unsaved edits " &
+    "included, with the problems the panel marks; read them there rather than from disk."
 
 type McpError* = object of CatchableError   ## A tool's failure, shown to the caller.
 
@@ -65,6 +67,13 @@ proc mcpTools*(): JsonNode =
     tool("undo", "Undoes the last step."),
     tool("redo", "Redoes the last undone step."),
     tool("list_menu", "Every menu item, with its path, shortcut and state."),
+    tool("list_scripts", "The level's BSL script files: which are open in the Scripts panel, " &
+      "which have unsaved edits, the tab shown and its caret, and each file's error and warning count."),
+    tool("read_script", "A script's text as the Scripts panel has it (unsaved edits included), " &
+      "with line numbers, and the problems the panel marks in it. file: its path relative to " &
+      "IGMD, its name or its full path (default: the tab shown). from_line/to_line (1-based) " &
+      "limit the lines returned.",
+      %*{"file": {"type": "string"}, "from_line": {"type": "integer"}, "to_line": {"type": "integer"}}),
     tool("run_menu", "Runs a menu item by path (\"View > Render > Sky\") or label. " &
       "Items ending in ... open a dialog on the user's screen.",
       %*{"path": {"type": "string"}}, @["path"]),
@@ -74,12 +83,22 @@ proc mcpTools*(): JsonNode =
     tool("create_object", "Creates an object and selects it; list_menu's Create entries and " &
       "status.object_types give the tags.",
       %*{"tag": {"type": "string"}, "pos": vec, "rot": vec}, @["tag", "pos"]),
-    tool("set_object", "Changes an object's position, rotation (degrees) and fields, as one undo step. " &
+    tool("import_model", "Imports model files (OBJ, glTF .gltf/.glb, Collada .dae; Blender's exports) " &
+      "as furniture, as File > Import > Models as furniture does: meters become Oni units (x10), " &
+      "the object's origin is the model's bottom center, textures fit 256x256. Runs as a job: status " &
+      "is busy until it ends, then the new FURN objects are selected. pos defaults to where the " &
+      "active view looks; several files go side by side along X.",
+      %*{"paths": {"type": "array", "items": {"type": "string"}}, "pos": vec}, @["paths"]),
+    tool("set_object", "Changes an object's position, rotation (degrees), scale (furniture only: " &
+      "along its own axes, scaling the geometry it owns), tint (furniture only: [r, g, b] 0-255 " &
+      "on every face it owns, 255 = none), flags (furniture only: {\"NoShadow\": true, ...} sets or " &
+      "clears surface flags on every face it owns; names as get_faces gives them) and fields, as one undo step. " &
       "Field keys are get_object's.",
-      %*{"tag": {"type": "string"}, "id": {"type": "integer"}, "pos": vec, "rot": vec,
+      %*{"tag": {"type": "string"}, "id": {"type": "integer"}, "pos": vec, "rot": vec, "scale": vec,
+         "tint": {"type": "array", "items": {"type": "integer"}}, "flags": {"type": "object"},
          "fields": {"type": "object"}}, @["tag", "id"]),
     tool("list_pieces", "Geometry pieces overlapping a box: bounds, face count, textures.", pieces),
-    tool("get_faces", "Faces with their corners, normal, texture and flags, filtered by piece, " &
+    tool("get_faces", "Faces with their corners, UVs (one per corner), normal, texture and flags, filtered by piece, " &
       "box, texture or flag.", faces),
     tool("list_textures", "Texture names usable on faces.", %*{"filter": {"type": "string"}}),
     tool("create_brush", "Creates a convex brush from a box (min, max) or the hull of points, " &

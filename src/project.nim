@@ -55,8 +55,18 @@ type
     showTriangles*: bool      ## Wireframes show the faces' triangles, else only their outlines.
     gridColor*: array[3, int] ## Grid lines, 0..255 (their opacity is gridOpacity).
     gridColor3D*: bool        ## The 3D face grid uses gridColor (else black or white per texture).
+    gridThickness*: float     ## Grid line width in pixels, in the 2D and 3D views.
     mcpEnabled*: bool         ## Start the MCP server (mcp.nim) with Catwalk.
     mcpPort*: int
+
+  Fog* = object
+    ## The fog a level starts with: BSL's gl_fog_red/green/blue (0..1),
+    ## gl_fog_start and gl_fog_end. Start and end are projected depth (0 at the
+    ## near plane, 1 at the far plane), as Oni's OpenGL fog compares them
+    ## (Bungie's gl_utility.c: linear fog on the screen z times 65535).
+    custom*: bool             ## Set in Catwalk (Build writes it); else what the scripts or Oni give.
+    color*: array[3, float32]
+    start*, finish*: float32
 
   Project* = ref object
     dir*: string
@@ -68,6 +78,7 @@ type
     source*: string           ## e.g. level1_Final
     geometryEdited*: bool     ## Build must rebuild the environment.
     startSavePoint*: int      ## Play starts here (0 = the level's beginning).
+    startSpawn*: int          ## Play's debug spawn point: a player placement's object id (0 = the usual pick).
     scratch*: bool            ## Made from scratch, not imported from a game level.
     music*: string            ## Track started when the level loads ("" = none).
     musicVolume*: float       ## 0..1
@@ -76,7 +87,12 @@ type
     ambient*: array[3, int]   ## Baked lighting: color every lit corner gets before the lights' light.
     softShadows*: float       ## Baked lighting: how far around a corner it takes its light from, 0 = hard.
     customTextures*: seq[string]      ## Textures in env/images imported by the user.
+    adoptedTextures*: seq[string]     ## Textures in env/images copied from a collection when applied
+                                      ## (adoptTexture): they go again once no face uses them.
     textureCollections*: seq[string]  ## Enabled collections, in the Texture Browser's order.
+    fog*: Fog                         ## Set in Level properties (fog.custom), else the scripts' own.
+    textureSources*: seq[string]      ## Picture files and folders added as texture collections
+                                      ## ("path:<path>"), enabled or not.
     preview*: bool            ## A throwaway copy of a game level, opened to look at (not saved
                               ## in project.json): Save asks for a project folder, Build is off.
 
@@ -97,6 +113,11 @@ const
     "atm_ft68", "atm_ft81", "atm_gr06", "atm_gr09", "atm_low1", "atm_low_perc1",
     "atm_low_perc2"]
   DefaultMusicVolume* = 0.75
+  ## Oni's fog after every level unload (0x40ca50, Bungie's gl_reset_fog_parameters):
+  ## gray 0.25, from depth 0.975 to 1.
+  DefaultFog* = Fog(color: [0.25'f32, 0.25, 0.25], start: 0.975, finish: 1)
+  FogNearPlane* = 2'f32       ## Oni's camera near plane (ONcMotoko_NearPlane).
+  DefaultFarPlane* = 10000'f32  ## Its far plane until gs_farclipplane_set changes it.
   DefaultAmbient* = [56, 56, 64]
   ## Faces of an ONSK skybox, in its SkyboxTextures order. The engine has no
   ## bottom face (Oni_Sky.c, M3cSkyBack is the last).
@@ -108,7 +129,10 @@ const
 
 proc configPath*(): string = getConfigDir() / "catwalk" / "config.json"
 
-const MaxRecentLimit* = 99
+const
+  MaxRecentLimit* = 99
+  MinGridThickness* = 0.5
+  MaxGridThickness* = 5.0
 
 proc resetViewPrefs*(c: var Config) =
   ## The View and Mouse preferences' defaults (paths are left alone).
@@ -124,6 +148,7 @@ proc resetViewPrefs*(c: var Config) =
   c.showTriangles = true
   c.gridColor = [255, 255, 255]
   c.gridColor3D = false
+  c.gridThickness = 1
 
 proc defaultConfig*(): Config =
   ## The AE folder and the game stay empty: the Setup window (setupwin.nim)
@@ -165,6 +190,8 @@ proc loadConfig*(): Config =
       if gc != nil and gc.kind == JArray and gc.len == 3:
         for i in 0 .. 2: result.gridColor[i] = clamp(gc[i].getInt, 0, 255)
       result.gridColor3D = j{"gridColor3D"}.getBool
+      result.gridThickness = clamp(j{"gridThickness"}.getFloat(result.gridThickness),
+                                   MinGridThickness, MaxGridThickness)
       result.mcpEnabled = j{"mcpEnabled"}.getBool
       result.mcpPort = clamp(j{"mcpPort"}.getInt(result.mcpPort), 1024, 65535)
       break
@@ -181,7 +208,7 @@ proc save*(c: Config) =
     "lookInvertY": c.lookInvertY, "panSpeed": c.panSpeed, "panInvertX": c.panInvertX,
     "panInvertY": c.panInvertY, "moveSpeed": c.moveSpeed, "invertWheel": c.invertWheel,
     "moveTowardCursor": c.moveTowardCursor, "showTriangles": c.showTriangles,
-    "gridColor": c.gridColor, "gridColor3D": c.gridColor3D,
+    "gridColor": c.gridColor, "gridColor3D": c.gridColor3D, "gridThickness": c.gridThickness,
     "mcpEnabled": c.mcpEnabled, "mcpPort": c.mcpPort}))
 
 proc noteOpened*(c: var Config, dir: string) =
@@ -441,6 +468,50 @@ proc levelTitles*(c: Config): Table[int, string] =
     return
   levelTitleCache = (stamp, result)
 
+var levelEnvCache: tuple[stamp: string, envs: Table[string, int]]
+
+proc levelEnvs*(c: Config): Table[string, int] =
+  ## The game levels' environment names (lowercase; also their IGMD folders)
+  ## -> level number: the name of the ONLV instance in each levelN_Final.dat.
+  ## Reads only the instance tables and name tables; cached while the files stay the same.
+  var files: seq[(int, string)]
+  var stamp = ""
+  for f in walkFiles(c.gameData / "level*_Final.dat"):
+    let n = f.extractFilename
+    try:
+      let level = parseInt(n["level".len ..< n.len - "_Final.dat".len])
+      if level == 0: continue
+      files.add (level, f)
+      stamp.add n & " " & $getFileSize(f) & " " & $getLastModificationTime(f).toUnix & ";"
+    except CatchableError: discard
+  if levelEnvCache.stamp == stamp: return levelEnvCache.envs
+  for (level, path) in files:
+    try:
+      var f = open(path)
+      defer: f.close()
+      var head = newString(0x40)
+      if f.readBuffer(head[0].addr, head.len) != head.len: continue
+      let count = head.le32(0x14).int
+      let namesAt = head.le32(0x28).int
+      let namesLen = head.le32(0x2c).int
+      var desc = newString(count * 20)
+      if count == 0 or f.readBuffer(desc[0].addr, desc.len) != desc.len: continue
+      var names = newString(namesLen)
+      f.setFilePos(namesAt)
+      if namesLen == 0 or f.readBuffer(names[0].addr, names.len) != names.len: continue
+      for i in 0 ..< count:
+        let at = i * 20
+        # Tags are stored backwards in the descriptors.
+        if desc[at .. at + 3] != "VLNO" or (desc.le32(at + 16) and DatUnique) != 0: continue
+        let n = desc.le32(at + 8).int
+        let stop = names.find('\0', n)
+        if n < 0 or stop < 0: continue
+        let env = names[n + "ONLV".len ..< stop]
+        if env.len > 0: result[env.toLowerAscii] = level
+    except CatchableError:
+      continue
+  levelEnvCache = (stamp, result)
+
 var projectInfoCache: Table[string, tuple[stamp: string, title: string, level: int, scratch: bool]]
 
 proc projectInfo*(dir: string): tuple[title: string, level: int, scratch: bool] =
@@ -547,12 +618,15 @@ proc save*(p: Project) =
   writeFile(p.dir / "project.json", pretty(%*{"title": p.title, "envName": p.envName,
     "sky": p.sky, "levelNumber": p.levelNumber, "source": p.source,
     "geometryEdited": p.geometryEdited, "startSavePoint": p.startSavePoint,
+    "startSpawn": p.startSpawn,
     "scratch": p.scratch, "music": p.music, "musicVolume": p.musicVolume,
     "skyBrightness": p.skyGrade.brightness, "skyBlend": $p.skyGrade.blend, "skyTint": p.skyGrade.tint,
     "autoBake": p.autoBake, "ambient": p.ambient, "softShadows": p.softShadows, "customTextures": p.customTextures,
-    "textureCollections": p.textureCollections}))
+    "adoptedTextures": p.adoptedTextures, "textureCollections": p.textureCollections, "textureSources": p.textureSources,
+    "fog": (if p.fog.custom: %*{"color": p.fog.color.mapIt(round(it.float, 4)), "start": round(p.fog.start.float, 4),
+                                "end": round(p.fog.finish.float, 4)} else: newJNull())}))
 
-proc globOni(dir, prefix: string): seq[string] =
+proc globOni*(dir, prefix: string): seq[string] =
   for p in walkFiles(dir / prefix & "*.oni"): result.add p
   result.sort
 
@@ -565,7 +639,7 @@ proc openProject*(dir: string): Project =
   result = Project(dir: dir, folder: dir.lastPathPart, title: j{"title"}.getStr(dir.lastPathPart),
     envName: j{"envName"}.getStr, sky: j{"sky"}.getStr, levelNumber: j{"levelNumber"}.getInt(1),
     source: j{"source"}.getStr, geometryEdited: j{"geometryEdited"}.getBool,
-    startSavePoint: j{"startSavePoint"}.getInt, scratch: j{"scratch"}.getBool,
+    startSavePoint: j{"startSavePoint"}.getInt, startSpawn: j{"startSpawn"}.getInt, scratch: j{"scratch"}.getBool,
     music: j{"music"}.getStr, musicVolume: j{"musicVolume"}.getFloat(DefaultMusicVolume),
     autoBake: j{"autoBake"}.getBool, ambient: DefaultAmbient, skyGrade: PlainSky,
     softShadows: j{"softShadows"}.getFloat)
@@ -581,7 +655,18 @@ proc openProject*(dir: string): Project =
   if result.sky.len == 0 and not result.scratch and not j.hasKey("textureCollections"):
     result.sky = result.findSky
   for t in j{"customTextures"}.getElems: result.customTextures.add t.getStr
+  for t in j{"adoptedTextures"}.getElems: result.adoptedTextures.add t.getStr
   for t in j{"textureCollections"}.getElems: result.textureCollections.add t.getStr
+  for t in j{"textureSources"}.getElems: result.textureSources.add t.getStr
+  let fog = j{"fog"}
+  if fog != nil and fog.kind == JObject:
+    result.fog = DefaultFog
+    result.fog.custom = true
+    let c = fog{"color"}
+    if c != nil and c.kind == JArray and c.len == 3:
+      for k in 0 .. 2: result.fog.color[k] = clamp(c[k].getFloat(0.25), 0, 1).float32
+    result.fog.start = clamp(fog{"start"}.getFloat(DefaultFog.start), 0, 1).float32
+    result.fog.finish = clamp(fog{"end"}.getFloat(DefaultFog.finish), 0, 1).float32
   if not j.hasKey("textureCollections"): result.textureCollections = @["level", "custom"]
 
 proc isProject*(dir: string): bool = fileExists(dir / "project.json")
@@ -634,7 +719,7 @@ proc oniSplitCmd*(c: Config): seq[string] =
   when defined(windows): @[c.oniSplit]
   else: @[c.mono, c.oniSplit]
 
-proc splitArgs(c: Config, args: varargs[string]): seq[string] =
+proc splitArgs*(c: Config, args: varargs[string]): seq[string] =
   result = c.oniSplitCmd
   for a in args: result.add a
 
@@ -830,7 +915,8 @@ proc textureSteps(c: Config, p: Project, n: int, src: string): seq[Step] =
 proc newLevelJob*(c: Config, folder, title: string, textureLevels: seq[int], sky: string,
                   onDone: proc(p: Project)): Job =
   ## A new, empty level: a floor and a player start, with the environment
-  ## textures of the given game levels to build with.
+  ## textures of the given game levels to build with (none: the floor has no
+  ## texture until one is given from Texture Collections).
   let
     dir = c.projectsDir / folder
     tex = dir / "build" / "textures"
@@ -838,7 +924,6 @@ proc newLevelJob*(c: Config, folder, title: string, textureLevels: seq[int], sky
                 levelNumber: ScratchLevelNumber, source: "level" & $ScratchLevelNumber & "_Final",
                 scratch: true, ambient: DefaultAmbient, skyGrade: PlainSky, textureCollections: @["level", "custom"])
   if dirExists(dir): raise newException(IOError, "A project named " & folder & " already exists")
-  if textureLevels.len == 0: raise newException(ValueError, "Pick at least one level for textures")
   for n in textureLevels:
     if not fileExists(c.gameData / "level" & $n & "_Final.dat"):
       raise newException(IOError, "Not found: " & c.gameData / "level" & $n & "_Final.dat")
@@ -861,6 +946,8 @@ proc newLevelJob*(c: Config, folder, title: string, textureLevels: seq[int], sky
       discard g.addBox(vec3(-256, -16, -256), vec3(256, 0, 256), defaultAttr(floor),
                        proc(t: string): float32 = 64)
       g.save(p.geometryPath)
+      # No game level's textures: the marker textures their extraction brings.
+      if textureLevels.len == 0: writeMarkerTextures(p.markersDir)
       createDir(p.objectsDir)
       writeFile(p.objectsDir / "BINACJBOCharacter.xml", PlayerStart)
       let igmd = p.dir / "IGMD" / p.envName
@@ -944,6 +1031,7 @@ proc importTexturesJob*(c: Config, p: Project, files: seq[string],
       while fileExists(p.imagesDir / name & ".tga"):
         name = base & "_" & $n
         inc n
+      createDir(p.imagesDir)   # A level made with no textures has no env/images yet.
       fitPicture(f, p.imagesDir / name & ".tga")
       names[].add name)
   var all: seq[Step]
@@ -953,6 +1041,76 @@ proc importTexturesJob*(c: Config, p: Project, files: seq[string],
     p.save()
     onDone(names[]))
   newJob("Importing textures", p.logPath, all)
+
+# --- texture collections from picture files and folders ----------------------
+
+const SourcePrefix* = "path:"
+  ## A texture collection's id when it's a picture file or a folder of them.
+
+proc isPictureFile*(path: string): bool =
+  let ext = path.splitFile.ext.toLowerAscii
+  ext.len > 1 and (ext[1 .. ^1] in DirectFormats or ext[1 .. ^1] in OniSplitFormats)
+
+proc sourcePictures*(src: string): seq[string] =
+  ## The pictures a file or folder collection holds: the file, or the
+  ## folder's own pictures (not its subfolders'), by name.
+  if fileExists(src): return (if src.isPictureFile: @[src] else: @[])
+  if not dirExists(src): return
+  for kind, f in walkDir(src):
+    if kind in {pcFile, pcLinkToFile} and f.isPictureFile: result.add f
+  result.sort(proc(x, y: string): int = cmpIgnoreCase(x.extractFilename, y.extractFilename))
+
+proc sourceTexturesDir*(src: string): string =
+  ## Where a file or folder collection's pictures are kept as textures.
+  var h: uint32 = 2166136261'u32   # FNV-1a of the path: one folder per source.
+  for ch in src:
+    h = (h xor ch.uint32) * 16777619'u32
+  catwalkCache() / "textures" / "sources" / src.lastPathPart.safeName & "-" & toHex(h.int64, 8).toLowerAscii
+
+proc sourceTexturesReady*(src: string): bool = fileExists(sourceTexturesDir(src) / ".done")
+
+proc sourceTextureNames*(files: seq[string]): seq[string] =
+  ## The texture names of a source's pictures, in order: CW_<NAME> as imports
+  ## get (so that no game texture takes their place), _2, _3... for repeats.
+  var taken: HashSet[string]
+  for f in files:
+    let base = "CW_" & safeName(f)
+    var name = base
+    var n = 2
+    while name in taken:
+      name = base & "_" & $n
+      inc n
+    taken.incl name
+    result.add name
+
+proc sourceTexturesJob*(c: Config, sources: seq[string], logPath: string): Job =
+  ## Turns the pictures of file and folder collections into textures (sides
+  ## of powers of 2, at most MaxTextureSide), each source in its own cache
+  ## folder. Pictures that can't be read are listed in its skipped.txt.
+  var all: seq[Step]
+  proc sourceSteps(src: string): seq[Step] =
+    let dir = sourceTexturesDir(src)
+    let work = dir / "work"
+    let files = sourcePictures(src)
+    let names = sourceTextureNames(files)
+    var skipped = new seq[string]
+    result.add action("Preparing " & src.lastPathPart, proc() =
+      if not fileExists(src) and not dirExists(src): raise newException(IOError, "Not found: " & src)
+      if dirExists(dir): removeDir(dir)
+      createDir(dir)
+      writeFile(dir / "source.txt", src & "\n"))
+    proc pictureStep(i: int): seq[Step] =
+      let (file, name) = (files[i], names[i])
+      pictureSteps(c, file.extractFilename, file, work / $i, proc(f: string) =
+        try: fitPicture(f, dir / name & ".tga")
+        except CatchableError as e: skipped[].add file.extractFilename & ": " & e.msg)
+    for i in 0 ..< files.len: result.add pictureStep(i)
+    result.add action("Finishing " & src.lastPathPart, proc() =
+      if dirExists(work): removeDir(work)
+      if skipped[].len > 0: writeFile(dir / "skipped.txt", skipped[].join("\n") & "\n")
+      writeFile(dir / ".done", ""))
+  for src in sources: all.add sourceSteps(src)
+  newJob("Reading texture pictures", logPath, all)
 
 proc skyFolderPictures*(dir: string): seq[string] =
   ## A folder's pictures, by name.
@@ -1209,6 +1367,12 @@ proc writeAnims(p: Project, model, built: Geometry) =
               " light ambients (vertexlight.bin, played by Arklite)"
   f.close()
 
+proc logCollision(p: Project, r: tuple[cleared, unmatched: int]) =
+  let f = open(p.logPath, fmAppend)
+  f.writeLine $r.cleared & " quads given back the character collision OniSplit took away" &
+              (if r.unmatched > 0: " (" & $r.unmatched & " without a matching face left as built)" else: "")
+  f.close()
+
 proc scratchSteps(c: Config, p: Project, work, geo: string): seq[Step] =
   ## The whole level from geometry.json: OniSplit -create:level writes the
   ## environment, the ONLV and (empty) object lists, and the textures used.
@@ -1265,17 +1429,20 @@ proc scratchSteps(c: Config, p: Project, work, geo: string): seq[Step] =
     # Geometry owned by objects (furniture, consoles, triggers): OniSplit doesn't
     # link it, so the quads' ObjectId and the ONLV's object quad lists are put
     # in afterwards, as for rebuilt game levels.
+    # Read back always: OniSplit's own collision changes are undone here too.
     command("Reading level back", proc(): seq[string] =
-      if not linkedObjects and not model.hasAnims: return @[]
       c.splitArgs("-extract:xml", geo / "xml", geo / "out" / akevName, geo / "out" / onlvName)),
     action("Linking object geometry", proc() =
+      let akevXml = geo / "xml" / "AKEV" & p.envName & ".xml"
       if not linkedObjects:
-        writeAnims(p, model, if model.hasAnims: importAkevXml(geo / "xml" / "AKEV" & p.envName & ".xml")
-                             else: Geometry())
+        let built = importAkevXml(akevXml)
+        built.snapToModel(model)
+        logCollision(p, restoreCollision(model, built, akevXml, geo / "out" / akevName))
+        writeAnims(p, model, built)
         return
       let onlvXml = geo / "xml" / "ONLV" & p.envName & ".xml"
-      let r = restoreObjectIds(model, geo / "xml" / "AKEV" & p.envName & ".xml", geo / "out" / akevName,
-                               doors.ids)
+      let r = restoreObjectIds(model, akevXml, geo / "out" / akevName, doors.ids)
+      logCollision(p, restoreCollision(model, r.built, akevXml, geo / "out" / akevName))
       writeAnims(p, model, r.built)
       if doors.ids.len > 0:
         # OniSplit's quad lists for its door numbers become Catwalk's door ids.
@@ -1306,6 +1473,10 @@ proc scratchSteps(c: Config, p: Project, work, geo: string): seq[Step] =
     commandFiles("Writing marker textures", proc(): FileCommand =
       var tgas: seq[string]
       for f in walkFiles(p.markersDir / "_marker_*.tga"): tgas.add f
+      if tgas.len == 0:
+        # A level made with no game level's textures: drawn as OniSplit draws them.
+        writeMarkerTextures(p.markersDir)
+        for f in walkFiles(p.markersDir / "_marker_*.tga"): tgas.add f
       if tgas.len == 0: raise newException(IOError, "no marker textures in " & p.markersDir)
       (c.splitArgs("-create:txmp", geo / "markers"), tgas)),
     action("Collecting level", proc() =
@@ -1322,10 +1493,15 @@ proc scratchSteps(c: Config, p: Project, work, geo: string): seq[Step] =
       var known: HashSet[string]
       for t in walkFiles(work / "TXMP*.oni"): known.incl t.extractFilename[4 .. ^5].toLowerAscii
       var missing: seq[string]
+      var untextured = 0
       if p.hasGeometry:
         for fc in loadGeometry(p.geometryPath).faces:
-          if markerMaterial(fc).len == 0 and fc.texture.toLowerAscii notin known and
-             fc.texture notin missing: missing.add fc.texture
+          if markerMaterial(fc).len > 0: continue
+          if fc.texture == "NONE": inc untextured
+          elif fc.texture.toLowerAscii notin known and fc.texture notin missing: missing.add fc.texture
+      if untextured > 0:
+        raise newException(ValueError, &"{untextured} face(s) have no texture: give them one from the " &
+          "Texture Browser (enable a collection in Texture Collections first)")
       if missing.len > 0:
         raise newException(ValueError, "textures used but not in env/images: " & missing.join(", ")))]
   if p.sky.len == 0:
@@ -1340,10 +1516,83 @@ proc scratchSteps(c: Config, p: Project, work, geo: string): seq[Step] =
         c.splitArgs("-create", geo / "onlv", geo / "onlv-xml" / "ONLV" & p.envName & ".xml")),
       action("Linking level", proc() = copyCreated(geo / "onlv", work))]
 
+proc mainBody(s: string): (int, int) =
+  ## Where main()'s body is in a script: just after its { up to its } (the
+  ## text's end when it's never closed); (-1, -1) when it has no main().
+  let (first, open) = findMainFunc(s)
+  if first < 0: return (-1, -1)   # No match is (-1, 0).
+  var depth = 1
+  var i = open + 1
+  while i < s.len:
+    case s[i]
+    of '#':   # A comment, to the line's end.
+      while i < s.len and s[i] != '\n': inc i
+    of '"':
+      inc i
+      while i < s.len and s[i] notin {'"', '\n'}: inc i
+    of '{': inc depth
+    of '}':
+      dec depth
+      if depth == 0: return (open + 1, i)
+    else: discard
+    inc i
+  (open + 1, s.len)
+
+proc fogText(v: float32): string =
+  result = formatFloat(v.float, ffDecimal, 4)
+  result.trimZeros()
+
+proc scriptFog*(p: Project): tuple[fog: Fog, far: float32, file: string, found: bool] =
+  ## The fog the level's main() sets by assigning gl_fog_red/green/blue/start/end
+  ## (as Bungie's levels do), on top of Oni's defaults, and its far plane
+  ## (gs_farclipplane_set); file names the script, found whether it sets fog.
+  result = (DefaultFog, DefaultFarPlane, "", false)
+  var files: seq[string]
+  for f in walkFiles(p.dir / "IGMD" / p.envName / "*.bsl"): files.add f
+  files.sort
+  for f in files:
+    var s: string
+    try: s = readFile(f)
+    except IOError: continue
+    let (a, b) = mainBody(s)
+    if a < 0: continue
+    result.file = f.extractFilename
+    for l in s[a ..< b].splitLines:
+      var m: array[2, string]
+      try:
+        if matchFogAssign(l, m):
+          let v = clamp(parseFloat(m[1]), 0, 1).float32
+          result.found = true
+          case m[0]
+          of "gl_fog_red": result.fog.color[0] = v
+          of "gl_fog_green": result.fog.color[1] = v
+          of "gl_fog_blue": result.fog.color[2] = v
+          of "gl_fog_start": result.fog.start = v
+          else: result.fog.finish = v
+        elif matchFarPlane(l, m):
+          let v = parseFloat(m[0]).float32
+          if v > FogNearPlane: result.far = v
+      except ValueError: discard
+    return   # Function names are global: there's one main().
+
+proc fogDistance*(depth, far: float32): float32 =
+  ## The distance from the camera (world units) at which Oni's projected depth
+  ## reaches depth: its projection is OpenGL's, z = (f+n)/(f-n) - 2fn/((f-n)d).
+  let (n, f) = (FogNearPlane, max(far, FogNearPlane + 1))
+  let den = (f + n) - depth * (f - n)
+  if den <= 2 * f * n / f: return f   # At or past the far plane.
+  2 * f * n / den
+
 proc startOnLoad(p: Project, igmd: string) =
-  ## Makes the built level's main() start the particles tagged AutoStartTag and
-  ## the project's music.
+  ## Makes the built level's main() start the particles tagged AutoStartTag,
+  ## the project's music and the fog set in Level properties.
   var line = ""
+  if p.fog.custom:
+    # Before main()'s own fog lines, which are commented out below so they can't undo it.
+    line.add "\n\t# Added by Catwalk: the level's fog (Properties, Level).\n" &
+             &"\tgl_fog_red={fogText(p.fog.color[0])}\n\tgl_fog_green={fogText(p.fog.color[1])}\n" &
+             &"\tgl_fog_blue={fogText(p.fog.color[2])}\n\tgl_fog_start={fogText(p.fog.start)}\n" &
+             &"\tgl_fog_end={fogText(p.fog.finish)}\n"
   let objs = p.objectsDir / "BINACJBOParticle.xml"
   if fileExists(objs) and ("<Tag>" & AutoStartTag & "</Tag>") in readFile(objs):
     line.add "\n\t# Added by Catwalk: particles placed to run from the start.\n\tparticle " &
@@ -1359,11 +1608,17 @@ proc startOnLoad(p: Project, igmd: string) =
              " " & formatFloat(clamp(p.musicVolume, 0.0, 1.0), ffDecimal, 2) & "\n"
   if line.len == 0: return
   if dirExists(igmd):
-    for f in walkFiles(igmd / "*.bsl"):
+    var files: seq[string]
+    for f in walkFiles(igmd / "*.bsl"): files.add f
+    files.sort
+    for f in files:
       let s = readFile(f)
-      let (first, last) = findMainFunc(s)
-      if first >= 0:   # No main() is (-1, 0).
-        writeFile(f, s[0 .. last] & line & s[last + 1 .. ^1])
+      let (a, b) = mainBody(s)
+      if a >= 0:
+        var body = s[a ..< b]
+        if p.fog.custom:
+          body = commentFogLines(body, "# Catwalk: Properties, Level sets the fog instead: ")
+        writeFile(f, s[0 ..< a] & line & body & s[b .. ^1])
         return
   createDir(igmd)
   writeFile(igmd / "catwalk_main.bsl", "func void main(void)\n{" & line & "}\n")
@@ -1833,7 +2088,7 @@ proc classSources(p: Project, dir: string): seq[string] =
   for f in walkFiles(p.objectsDir / "*.xml"):
     let renameChars = edited.len > 0 and f.extractFilename == "BINACJBOCharacter.xml"
     let renameParts = particleNames.len > 0 and f == partList
-    # Lists with Catwalk's own fields (RespawnTime, ActivationMessage) go through a
+    # Lists with Catwalk's own fields (RespawnTime, ActivationMessage, Scale) go through a
     # copy without them.
     let addSounds = lightSounds.len > 0 and f.extractFilename == "BINACJBOSound.xml"
     if not renameChars and not renameParts and not addSounds and not hasEditorFields(readFile(f)):
@@ -2038,11 +2293,16 @@ proc buildJob*(c: Config, p: Project, then: seq[Step] = @[]): Job =
       commandFiles("Writing marker textures", proc(): FileCommand =
         var tgas: seq[string]
         for f in walkFiles(p.markersDir / "_marker_*.tga"): tgas.add f
+        if tgas.len == 0:
+          writeMarkerTextures(p.markersDir)   # As OniSplit draws them (pictures.nim).
+          for f in walkFiles(p.markersDir / "_marker_*.tga"): tgas.add f
         if tgas.len == 0: raise newException(IOError, "no marker textures in " & p.markersDir)
         (c.splitArgs("-create:txmp", geo / "markers"), tgas)),
       action("Linking object geometry", proc() =
         let akevOni = geo / "out" / akevName
         linked = restoreObjectIds(model, geo / "xml" / "AKEV" & p.envName & ".xml", akevOni)
+        logCollision(p, restoreCollision(model, linked.built, geo / "xml" / "AKEV" & p.envName & ".xml",
+                                         akevOni))
         writeAnims(p, model, linked.built)
         let dst = work / akevName
         if fileExists(dst): removeFile(dst)
@@ -2140,8 +2400,9 @@ proc buildJob*(c: Config, p: Project, then: seq[Step] = @[]): Job =
   steps.add then
   newJob("Building " & p.folder, p.logPath, steps)
 
-proc launchStep*(c: Config, p: Project): Step =
-  ## Starts the game straight into the project's level.
+proc launchStep*(c: Config, p: Project, spawn = 0): Step =
+  ## Starts the game straight into the project's level; at the player placement with object id
+  ## spawn when not 0 (Arklite, ARKLITE_SPAWN).
   let savePoint = p.gameSavePoint
   action("Starting Oni", proc() =
     if c.game.len == 0:
@@ -2152,6 +2413,8 @@ proc launchStep*(c: Config, p: Project): Step =
     for k, v in envPairs(): env[k] = v
     env["ARKLITE_AUTOSTART"] = p.folder
     env["ARKLITE_SAVEPOINT"] = $savePoint
+    if spawn > 0: env["ARKLITE_SPAWN"] = $spawn
+    else: env.del "ARKLITE_SPAWN"
     # The game's output (Wine's crash address and backtrace) goes to build/game.log.
     createDir(p.buildDir)
     let log = p.buildDir / "game.log"

@@ -29,6 +29,7 @@ type
     picking*: bool                 ## Eyedropper: the next click anywhere takes that pixel's color.
     under: RGB                     ## Pixel under the mouse in the last frame (while picking).
     pickEnded: bool                ## The eyedropper ended this frame (its key or click is spent).
+    box: Rect                      ## Where it was drawn last.
     hex: string
 
 var pick: Picker
@@ -118,6 +119,14 @@ proc closePicker*() =
   if t.done != nil: t.done(changed)
 
 proc pickerOpen*(id: string): bool = pick.id == id
+
+proc pickerBox*(): Rect =
+  ## The open picker's rect as last drawn, or empty.
+  if pick.id.len > 0: pick.box else: Rect()
+
+proc eyedropperJustEnded*(): bool =
+  ## The eyedropper ended this frame: its click or key is spent.
+  pick.pickEnded
 
 proc openPicker(id: string, c: RGB, target: ColorTarget) =
   closePicker()
@@ -257,6 +266,7 @@ proc drawColorPicker*(ui: Ui) =
   let over = ui.popupHit
   let typing = ui.focusId.len > 0   # Esc and Enter end the typing, not the picker
   ui.popupRect = box
+  pick.box = box
   # Its own widgets take the mouse over it (popupHit blocks the ones below).
   let wasHit = ui.popupHit
   ui.popupHit = false

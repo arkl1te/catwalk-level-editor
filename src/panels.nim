@@ -8,7 +8,8 @@ import silky, vmath, bumpy, pixie
 import theme, ui, dialogs, icons, music, sky, menutree, colorpick, mcp, pictures, skyconvert, skyfit, tga
 import crashlog, shellopen
 import particleevents, levelobjects, project, jobs, camera, render, geometry, geomops, objtemplates, appstate, viewtools,
-  presets, library, thumbs, fieldchoices, fieldtypes, classes, files, soundscene, particlesim, ambients
+  presets, library, thumbs, fieldchoices, fieldtypes, classes, files, soundscene, particlesim, ambients,
+  modelimport, importedmodels
 
 const
   ToolbarHeight* = 38'f32
@@ -126,11 +127,7 @@ proc dropdown(a: App, id: string, r: Rect, label: string, items: seq[string], cl
                   colW - 8, 24)
     if i == a.dropdownHi: ui.rect(ir, colAccentDim)
     elif ui.mouse.inside(ir): ui.rect(ir, colHover)
-    # View options marks its rows; the font has no glyph for these two.
-    let (on, off) = (it.startsWith("● "), it.startsWith("◌ "))
-    if on: ui.icon("check16", vec2(ir.x + 13, ir.y + ir.h / 2), colAccent)
-    let shownText = if on or off: it.split(' ', 1)[1] else: it
-    ui.textIn(shownText, rect(ir.x + (if on or off: 26 else: 8), ir.y, ir.w - 8, ir.h), colText)
+    ui.textIn(it, rect(ir.x + 8, ir.y, ir.w - 8, ir.h), colText)
     if ui.mouse.inside(ir) and ui.window.buttonPressed[MouseLeft]:
       result = i
       if clickFocus: ui.navId = id
@@ -412,8 +409,11 @@ proc invertSelection(a: App) =
     if a.unitOf(g.id) == g.id and not a.groupLocked(g.parent):
       a.selectGroup(g.id, g.id notin wasUnits)
 
-proc askName*(a: App, title, initial: string, done: proc(name: string)) =
+proc askName*(a: App, title, initial: string, done: proc(name: string), back = "") =
   ## A one-line name prompt (TrenchBroom's queryGroupName); done runs on OK.
+  ## back: the widget that gets the keyboard back when it closes (OK or Cancel),
+  ## the frame after.
+  a.namePromptBack = back
   a.namePromptTitle = title
   a.namePromptText = initial
   a.namePrompt = done
@@ -572,11 +572,16 @@ proc recentItems(a: App): seq[MenuItem] =
     except CatchableError: discard)
 
 proc importMenuItems(a: App, hasProj: bool): seq[MenuItem] =
-  ## File > Import: recordings from sound files, and a new ambient sound from scratch.
+  ## File > Import: recordings from sound files, a new ambient sound from
+  ## scratch, and models as furniture.
   @[item("Sounds...", "", hasProj and not a.busy and a.dialog == nil, action = proc() =
       a.dialog = startDialog(dkOpenFiles, "sounds", "Import sounds", getHomeDir(),
                              @SoundFormats, "Sounds")),
-    item("New ambient sound...", "", hasProj and not a.busy, action = proc() = a.newAmbientSound())]
+    item("New ambient sound...", "", hasProj and not a.busy, action = proc() = a.newAmbientSound()),
+    item("Models as furniture...", "", hasProj and a.geo != nil and not a.busy and a.dialog == nil, action = proc() =
+      a.dialog = startDialog(dkOpenFiles, "models", "Import models as furniture",
+                             (if a.modelImportDir.len > 0: a.modelImportDir else: getHomeDir()),
+                             @ModelFormats, "Models (OBJ, glTF, Collada)"))]
 
 proc ambientMenuItems(a: App, hasProj: bool): seq[MenuItem] =
   ## File > Ambient sounds: each of the project's own ambients to edit (none: no submenu).
@@ -656,7 +661,8 @@ proc menus*(a: App): seq[(string, seq[MenuItem])] =
     sep(),
     item("Reset texture alignment", "Shift+R", a.selFaces.len > 0 or a.selPieces.len > 0,
          action = proc() = a.resetTextures()),
-    item("UV lock", "U", true, a.uvLock, action = proc() = a.uvLock = not a.uvLock)])
+    item("UV lock", "U", true, a.uvLock, action = proc() = a.toggleUvLock()),
+    item("Local gizmo axes", "L", true, a.gizmoLocal, action = proc() = a.toggleGizmoLocal())])
   result.add ("Selection", @[
     item("Select all", "Ctrl+A", hasProj, action = proc() = a.selectAll()),
     item("Select none", "Ctrl+Shift+A", hasSel, action = proc() = a.clearSelection()),
@@ -789,6 +795,7 @@ proc drawMenuBar*(a: App) =
 # --- map view context menu ---------------------------------------------------------------
 
 proc fileContextTree(a: App, rel: string): MenuNode
+proc scriptContextTree(a: App): MenuNode
 
 proc realtimeTree(a: App): MenuNode =
   ## Right click on a view's Realtime preview button: what it plays.
@@ -895,15 +902,45 @@ proc classAddTree(a: App, what: string): MenuNode =
       for d in ActionDefs:
         if d.group == g: actionItem(menu, d)
 
+proc dockTree(a: App, leaf: DockNode): MenuNode =
+  ## Right click on a panel stack's tab bar: any panel can join it, from
+  ## wherever it is (the Viewport always stays where it is).
+  result = newMenuRoot()
+  let add = result.sub("Add panel")
+  proc panelItem(menu: MenuNode, kind: PanelKind) =
+    # A proc per item: a closure made in the loop would share its variable.
+    menu.check($kind, checked = a.dock.leafOf(kind) != nil, enabled = kind notin leaf.tabs,
+               action = proc() = a.addPanelTo(kind, leaf))
+  for k in PanelKind:
+    if k != pkViewport: panelItem(add, k)
+
+proc soundTree(a: App, value: string, group: SoundGroup): MenuNode
+
 proc contextTree(a: App): MenuNode =
   ## Right click in a view (TrenchBroom's map view menu, for Oni's objects).
   let c = a.ctx
+  if c.dockLeaf != nil: return a.dockTree(c.dockLeaf)
+  if c.sound.len > 0: return a.soundTree(c.sound, SoundGroup(c.soundGroup))
   if c.file.len > 0: return a.fileContextTree(c.file)
+  if c.scripts: return a.scriptContextTree()
   if c.realtime: return a.realtimeTree()
   if c.gizmos: return a.gizmosTree()
   if c.editorOnly: return a.editorOnlyTree()
   if c.classAdd.len > 0: return a.classAddTree(c.classAdd)
   if c.classParentsOf.len > 0: return a.classParentsTree(c.classParentsOf)
+  if c.importedModel.len > 0:
+    result = newMenuRoot()
+    let dir = c.importedModel
+    result.item("Remove from the Entity Browser", action = proc() =
+      for p in a.presets:
+        if p.imported == dir:
+          try:
+            removeImported(p)
+            a.say "Removed " & p.label & " from the Entity Browser (furniture placed from it stays)"
+          except CatchableError as e: a.say("Could not remove " & p.label & ": " & e.msg, true)
+          break
+      a.refreshImported())
+    return
   if c.texture.len > 0:
     # TrenchBroom's material browser menu.
     result = newMenuRoot()
@@ -939,6 +976,15 @@ proc contextTree(a: App): MenuNode =
     let menu = create.sub(c.name)
     for t in tags:
       if t in c.tags: createItem(menu, t)
+  if c.obj != nil and c.obj.isSpawnPoint and a.proj != nil:
+    let o = c.obj
+    result.check("Use as Play's spawn point", checked = a.playSpawn == o, action = proc() =
+      if a.playSpawn == o:
+        a.proj.startSpawn = 0
+        a.say "Play's spawn point is back to the default"
+      else:
+        a.proj.startSpawn = o.id
+        a.say &"Play starts at {o.label} #{o.id}")
   if c.obj != nil:
     let tag = c.obj.tag
     result.item("Select all " & typeName(tag), action = proc() =
@@ -1114,7 +1160,8 @@ proc build*(a: App, play: bool) =
     return
   a.saveProject()
   var then: seq[Step]
-  if play: then.add launchStep(a.cfg, a.proj)
+  let spawn = a.playSpawn
+  if play: then.add launchStep(a.cfg, a.proj, if spawn != nil: spawn.id else: 0)
   let p = a.proj
   try:
     a.startJob(buildJob(a.cfg, p, then), proc() =
@@ -1123,7 +1170,8 @@ proc build*(a: App, play: bool) =
           if p.startSavePoint == TrainingSavePoint: " at Combat Training"
           elif p.startSavePoint > 0: &" at save point {p.startSavePoint}"
           else: ""
-        a.say &"Started Oni with {p.folder}{at}"
+        let spawnAt = if spawn != nil: &", spawn point {spawn.label} #{spawn.id}" else: ""
+        a.say &"Started Oni with {p.folder}{at}{spawnAt}"
       else: a.say "Built CustomLevels/" & p.folder)
   except CatchableError as e:
     a.say(e.msg, true)
@@ -1158,7 +1206,7 @@ proc newEmptyLevel*(a: App, name: string) =
   if folder.len == 0 or folder.contains({'/', '\\'}):
     a.say("Choose a folder name for the project", true)
     return
-  let levels = if a.newTexLevel > 0: @[a.newTexLevel] else: a.cfg.gameLevels
+  let levels = if a.newTexLevel > 0: @[a.newTexLevel] elif a.newTexLevel < 0: @[] else: a.cfg.gameLevels
   try:
     createDir(a.cfg.projectsDir)
     var made: Project
@@ -1472,7 +1520,10 @@ proc drawToolbar*(a: App) =
     discard a.runMenu("Flip vertically")
   gap()
   if btn("tb.uvlock", "uvlock", "UV lock (U): textures move with geometry", true, a.uvLock):
-    a.uvLock = not a.uvLock
+    a.toggleUvLock()
+  if btn("tb.localaxes", "localaxes", "Local axes (L): the move arrows and rotate rings follow " &
+         "the selected object's own rotation; off, they stay on the world's", true, a.gizmoLocal):
+    a.toggleGizmoLocal()
   if btn("tb.snap", "magnet", "Snap to grid (Alt+0)", true, a.snap): a.snap = not a.snap
   x += 6
   var gridItems: seq[string]
@@ -1485,6 +1536,7 @@ proc drawToolbar*(a: App) =
   let playR = rect(ui.size.x - 104, y, 96, 28)
   let buildR = rect(playR.x - 88, y, 82, 28)
   let startR = rect(buildR.x - 184, y, 176, 28)
+  let spawnR = rect(startR.x - 192, y, 184, 28)
   let can = hasProj and not a.busy and not a.proj.preview
   if hasProj:
     var starts = @[0]
@@ -1496,7 +1548,19 @@ proc drawToolbar*(a: App) =
     let pick = a.dropdown("tb.start", startR, a.proj.startLabel(a.proj.startSavePoint), labels,
                           clickFocus = false)
     if pick >= 0: a.proj.startSavePoint = starts[pick]
-    ui.tip(startR, "Where Play starts the level. Save points use your saved game from the original level.")
+    ui.tip(startR, "Where Play starts the level. A save point uses the map's own saved game, else the original level's.")
+    # Play's debug spawn point, when there's room left of the start point.
+    if spawnR.x >= x:
+      let points = a.spawnPoints
+      let chosen = a.playSpawn
+      var labels = @[spawnLabel(nil, points.len)]
+      for o in points: labels.add spawnLabel(o, points.len)
+      let pick = a.dropdown("tb.spawn", spawnR, spawnLabel(chosen, points.len), labels, clickFocus = false)
+      if pick == 0: a.proj.startSpawn = 0
+      elif pick > 0: a.proj.startSpawn = points[pick - 1].id
+      ui.tip(spawnR, "Which player placement (a character with the IsPlayer flag) Play starts Konoko at. " &
+                     "Random: Arklite picks one when the map has two or more (a multiplayer map). " &
+                     "Right-click a placement for Use as Play's spawn point. A save point's script can still move her.")
   if can:
     if ui.textButton("tb.build", buildR, "Build", clickFocus = false): a.build(play = false)
     if ui.textButton("tb.play", playR, "", primary = true, clickFocus = false): a.build(play = true)
@@ -1521,7 +1585,7 @@ proc parseVec(s: string): (bool, Vec3) =
 
 const
   LayoutButtonW = 30'f32
-  LayoutButtonsW = 4 * (LayoutButtonW + 4) + 6   ## The four buttons and the gap before View options.
+  LayoutButtonsW = 4 * (LayoutButtonW + 4) + 6   ## The four buttons and the gap before Overlays.
 
 proc layoutCells(layout: PaneLayout, r: Rect): seq[Rect] =
   ## The panes of layout drawn small inside r, in view order (as layoutViews
@@ -1560,9 +1624,132 @@ proc layoutButtons(a: App, x0, y: float32) =
       a.layout = l
       a.maximized = -1
 
+const
+  OverlaysId = "opt.overlays"
+  OverlaysColorId = "overlays.gridcolor"
+
+proc drawOverlays(a: App, anchor: Rect) =
+  ## Blender's Viewport Overlays popover, under its button: the grid's look
+  ## (the same config values as View > Settings > View > Grid, saved as they
+  ## change) and Entity directions. A click outside it or Esc closes it.
+  let ui = a.ui
+  const
+    Pad = 10'f32
+    LabelW = 78'f32
+    ValueW = 46'f32
+    RowH = 28'f32
+    W = 300'f32
+  let h = Pad + 26 + RowH * 5 + 8 + 26 + RowH + Pad - 6
+  var box = rect(anchor.x + anchor.w - W, anchor.y + anchor.h + 4, W, h)
+  box.x = max(4'f32, box.x)
+  let pb = pickerBox()
+  let overPicker = pb.w > 0 and ui.mouse.inside(pb)
+  let inside = ui.mouse.inside(box)
+  let w = ui.window
+  if a.modalOpen:
+    a.overlaysOpen = false
+  elif not eyedropperActive() and not eyedropperJustEnded() and not inside and not overPicker and
+       not ui.mouse.inside(anchor) and
+       (w.buttonPressed[MouseLeft] or w.buttonPressed[MouseRight] or w.buttonPressed[MouseMiddle]):
+    # Closes it and goes on to what's under it.
+    a.overlaysOpen = false
+  elif w.buttonPressed[KeyEscape] and ui.focusId.len == 0 and pb.w == 0 and not eyedropperJustEnded():
+    a.overlaysOpen = false
+    ui.captured = true   # the Esc only closes it
+  if not a.overlaysOpen: return
+  let c = addr a.cfg
+  let wasHit = ui.popupHit
+  ui.popupHit = overPicker   # its own widgets take the mouse, unless the picker is over them
+  ui.popupRect = box
+  ui.sk.pushLayer(PopupsLayer)
+  ui.sk.pushRawClipRect(rect(0, 0, ui.size.x, ui.size.y))   # It may reach past the Viewport panel.
+  ui.hitClips.add rect(0, 0, ui.size.x, ui.size.y)
+  ui.rect(rect(box.x + 3, box.y + 3, box.w, box.h), colShadow)
+  ui.rect(box, colPopup)
+  ui.border(box, colBorder)
+  let x = box.x + Pad
+  let iw = box.w - 2 * Pad
+  var y = box.y + Pad
+  proc label(s: string) = ui.textIn(s, rect(x, y, LabelW, 24), colText)
+  proc slider(id, name: string, value: var float, lo, hi, step: float, shown: string, tip: string) =
+    label name
+    let sr = rect(x + LabelW + 6, y, iw - LabelW - ValueW - 18, 24)   # room for the knob at both ends
+    if ui.slider(id, sr, value, lo, hi, step): a.overlaysUnsaved = true
+    ui.textIn(shown, rect(x + iw - ValueW, y, ValueW, 24), colTextDim, h = RightAlign)
+    ui.tip(rect(x, y, iw, 24), tip)
+    y += RowH
+  ui.groupHeader(vec2(x, y), iw, "Grid")
+  y += 26
+  var show = a.showGrid
+  if ui.checkbox("overlays.show", vec2(x, y), "Show grid", show): a.showGrid = show
+  ui.textIn("0", rect(x, y, iw, 22), colTextDisabled, FontSmall, h = RightAlign)
+  y += RowH
+  label "Color"
+  if not pickerOpen(OverlaysColorId): a.fieldText[OverlaysColorId] = fmtRgb(c.gridColor)
+  let app = a
+  let target = ColorTarget(
+    live: proc(col: RGB) =
+      for i in 0 .. 2: app.cfg.gridColor[i] = clamp(col[i], 0, 255)
+      app.overlaysUnsaved = true,
+    done: proc(changed: bool) = discard)
+  let ev = ui.colorField(OverlaysColorId, rect(x + LabelW, y, iw - LabelW, 24), a.fieldText[OverlaysColorId], target)
+  if eeCommitted in ev:
+    let (ok, col) = parseColor(a.fieldText[OverlaysColorId])
+    if ok: target.live(col)
+  y += RowH
+  slider("overlays.opacity", "Opacity", c.gridOpacity, 0, 1, 0.01, $int(round(c.gridOpacity * 100)) & "%",
+         "How strong the grid lines are, in the 2D and 3D views")
+  slider("overlays.thickness", "Thickness", c.gridThickness, MinGridThickness, MaxGridThickness, 0.5,
+         &"{c.gridThickness:.1f}", "Line width in pixels, in the 2D and 3D views")
+  var on3D = c.gridColor3D
+  if ui.checkbox("overlays.color3d", vec2(x, y), "Color on the 3D faces too", on3D):
+    c.gridColor3D = on3D
+    a.overlaysUnsaved = true
+  ui.tip(rect(x, y, iw, 22), "Off: the 3D grid is black or white, whichever shows on each texture " &
+    "(TrenchBroom's choice)")
+  y += RowH + 8
+  ui.groupHeader(vec2(x, y), iw, "Objects")
+  y += 26
+  var dirs = a.showDirections
+  if ui.checkbox("overlays.directions", vec2(x, y), "Entity directions", dirs): a.showDirections = dirs
+  ui.tip(rect(x, y, iw, 22), "Arrows showing where characters, flags and other entities face")
+  discard ui.hitClips.pop()
+  ui.sk.popClipRect()
+  ui.sk.popLayer()
+  ui.popupHit = wasHit
+  let mine = ui.activeId.startsWith("overlays.")
+  if (inside and not overPicker) or mine:
+    ui.captured = true   # the views under it don't take the mouse
+    if inside and not overPicker and ui.window.buttonPressed[MouseLeft]: ui.consumeClick()
+  if a.overlaysUnsaved and not mine and not pickerOpen(OverlaysColorId):
+    a.overlaysUnsaved = false
+    try: a.cfg.save()
+    except CatchableError as e: a.say("Couldn't save the settings: " & e.msg, true)
+
+proc overlaysButton(a: App, r: Rect) =
+  ## Opens the Overlays popover (drawOverlays).
+  let ui = a.ui
+  let open = a.overlaysOpen
+  let hov = ui.hover(r)
+  let focused = ui.tabStop(OverlaysId, r)
+  ui.rect(r, if open: colPressed elif hov: colHover else: colPanel)
+  ui.border(r, colBorder)
+  ui.icon("overlays16", vec2(r.x + 15, r.y + r.h / 2), if open or hov: colText else: colTextDim)
+  ui.textIn("Overlays", rect(r.x + 28, r.y, r.w - 48, r.h), colText)
+  ui.icon("expand16", vec2(r.x + r.w - 12, r.y + r.h / 2), colTextDim)
+  if focused: ui.focusRing(r)
+  ui.tip(r, "Overlays: the grid's color, opacity and thickness, and entity directions")
+  if hov and ui.pressed():
+    ui.consumeClick()
+    ui.navId = OverlaysId
+    a.overlaysOpen = not open
+  elif ui.navActivate(OverlaysId):
+    a.overlaysOpen = not open
+  if a.overlaysOpen: a.drawOverlays(r)
+
 proc drawToolOptions*(a: App, r: Rect) =
   ## The strip above the views: settings for the current tool (TrenchBroom's
-  ## info bar) and the view options on the right.
+  ## info bar), the pane layouts and the Overlays popover on the right.
   let ui = a.ui
   ui.rect(r, colPanel)
   ui.rect(rect(r.x, r.y + r.h - 1, r.w, 1), colBorder)
@@ -1641,53 +1828,39 @@ proc drawToolOptions*(a: App, r: Rect) =
       axis[a.rotAxis] = 1
       a.rotateKeyed(axis, 1, "Rotate")
   of toolScale:
-    label "Scale objects"
-    let mode = a.dropdown("opt.scalemode", rect(x, y, 104, 24),
-                          if a.scaleBySize: "to size" else: "by factors", @["to size", "by factors"])
-    if mode >= 0: a.scaleBySize = mode == 0
-    x += 112
-    let (okb, lo, hi) = a.selectionBounds
-    if a.scaleText.len == 0 or (ui.focusId != "opt.scale" and okb and a.scaleBySize):
-      a.scaleText = if okb and a.scaleBySize: fmtVec(hi - lo) else: "1 1 1"
-    discard ui.textField("opt.scale", rect(x, y, 140, 24), a.scaleText, "x y z")
-    x += 148
-    if button("opt.scaleapply", "Apply") and okb:
-      let (ok, v) = parseVec(a.scaleText)
-      if ok:
-        var f = v
-        if a.scaleBySize:
-          for i in 0 .. 2: f[i] = if hi[i] - lo[i] > 1e-4: v[i] / (hi[i] - lo[i]) else: 1
-        a.scaleSelection(f)
-    label "Drag the handles: Shift scales proportionally, Alt from the center."
+    if a.objScaleShown:
+      label "Scale furniture by"
+      if a.objScaleText.len == 0: a.objScaleText = "1 1 1"
+      discard ui.textField("opt.objscale", rect(x, y, 140, 24), a.objScaleText, "x y z")
+      x += 148
+      if button("opt.objscaleapply", "Apply"):
+        let (ok, v) = parseVec(a.objScaleText)
+        if ok and v.x > 0 and v.y > 0 and v.z > 0: a.scaleObjects(v)
+      label "Drag a handle to scale along the furniture's own axis (Shift: all three), the middle square for all three."
+    else:
+      label "Scale objects"
+      let mode = a.dropdown("opt.scalemode", rect(x, y, 104, 24),
+                            if a.scaleBySize: "to size" else: "by factors", @["to size", "by factors"])
+      if mode >= 0: a.scaleBySize = mode == 0
+      x += 112
+      let (okb, lo, hi) = a.selectionBounds
+      if a.scaleText.len == 0 or (ui.focusId != "opt.scale" and okb and a.scaleBySize):
+        a.scaleText = if okb and a.scaleBySize: fmtVec(hi - lo) else: "1 1 1"
+      discard ui.textField("opt.scale", rect(x, y, 140, 24), a.scaleText, "x y z")
+      x += 148
+      if button("opt.scaleapply", "Apply") and okb:
+        let (ok, v) = parseVec(a.scaleText)
+        if ok:
+          var f = v
+          if a.scaleBySize:
+            for i in 0 .. 2: f[i] = if hi[i] - lo[i] > 1e-4: v[i] / (hi[i] - lo[i]) else: 1
+          a.scaleSelection(f)
+      label "Drag the handles: Shift scales proportionally, Alt from the center."
   ui.popClip()
-  # View options, right-aligned (after the tool's controls in the Tab order).
+  # Overlays, right-aligned (after the tool's controls in the Tab order).
   let vr = rect(r.x + r.w - 134, y, 126, 24)
   a.layoutButtons(vr.x - LayoutButtonsW, y)
-  # The render modes first, then the toggles.
-  let toggles = [("Marker faces", a.opts.markers),
-                 ("AI rooms", a.opts.rooms), ("Entity models", a.opts.models),
-                 ("Object names in 2D", a.showObjectNames), ("Entity directions", a.showDirections),
-                 ("Grid", a.showGrid), ("Sky", a.opts.sky), ("Realtime preview", a.realtime),
-                 ("Gizmos", a.showGizmos), ("Editor-only", a.showEditorOnly)]
-  var items: seq[string]
-  for m in RenderMode: items.add (if a.opts.mode == m: "● " else: "◌ ") & $m
-  for (n, on) in toggles: items.add (if on: "● " else: "◌ ") & n
-  let picked = a.dropdown("opt.view", vr, "View options", items)
-  if picked in 0 .. RenderMode.high.ord: a.opts.mode = RenderMode(picked)
-  case picked - RenderMode.high.ord - 1
-  of 0:
-    a.opts.markers = not a.opts.markers
-    if a.geo != nil: a.geo.bump()
-  of 1: a.opts.rooms = not a.opts.rooms
-  of 2: a.opts.models = not a.opts.models
-  of 3: a.showObjectNames = not a.showObjectNames
-  of 4: a.showDirections = not a.showDirections
-  of 5: a.showGrid = not a.showGrid
-  of 6: a.opts.sky = not a.opts.sky
-  of 7: a.switchRealtime()
-  of 8: a.showGizmos = not a.showGizmos
-  of 9: a.switchEditorOnly()
-  else: discard
+  a.overlaysButton(vr)
 
 # --- dividers ---------------------------------------------------------------------------------
 
@@ -1841,10 +2014,25 @@ proc previewClassSound(a: App, name: string, impulse: bool) =
     try: playSound(name, 1, 1, impulse)
     except CatchableError as e: a.say(e.msg, true))
 
+proc levelFog(a: App): tuple[fog: Fog, far: float32, file: string, found: bool]
+
+proc updateFog(a: App) =
+  ## Realtime preview's fog in the 3D views: the fog the level starts with
+  ## (Properties, Level: set there, else main()'s, else Oni's default).
+  if a.rend == nil: return
+  if not (a.realtime and a.proj != nil and ppFog in a.previewParts):
+    a.rend.fog.on = false
+    return
+  let own = a.levelFog
+  let f = if a.proj.fog.custom: a.proj.fog else: own.fog
+  a.rend.fog = FogLook(on: true, color: vec3(f.color[0], f.color[1], f.color[2]), start: f.start,
+                       finish: f.finish, near: FogNearPlane, far: own.far)
+
 proc updateRealtime*(a: App) =
   ## Realtime preview's sound, every frame: the visible Sound objects play as
   ## they would in the game, heard from the 3D camera (soundscene.nim), and the
-  ## level music starts as when the level loads.
+  ## level music starts as when the level loads. Its fog is set for the views.
+  a.updateFog()
   if a.musicUndone:
     # Undo or redo changed the track: a preview (not Realtime's music) follows, as on a pick.
     a.musicUndone = false
@@ -2047,6 +2235,96 @@ proc skyGradeRows(a: App, x: float32, y: var float32, w: float32) =
       a.editProject("Change Sky Tint", old)
   y += 30
 
+var scriptFogSeen: tuple[at: float, dir: string, fog: tuple[fog: Fog, far: float32, file: string, found: bool]]
+
+proc levelFog(a: App): tuple[fog: Fog, far: float32, file: string, found: bool] =
+  ## The fog the level's main() sets (and its far plane), read again every two seconds.
+  let now = epochTime()
+  if scriptFogSeen.dir != a.proj.dir or now - scriptFogSeen.at > 2:
+    scriptFogSeen = (now, a.proj.dir, a.proj.scriptFog)
+  scriptFogSeen.fog
+
+proc fogRows(a: App, x: float32, y: var float32, w: float32) =
+  ## The fog the level starts with (BSL's gl_fog_* variables, which Oni puts back
+  ## to its defaults at every level unload). Shown from the level's main() until
+  ## it's changed here; then Build sets it at the top of the built main().
+  let ui = a.ui
+  let p = a.proj
+  let own = a.levelFog
+  let shown = if p.fog.custom: p.fog else: own.fog
+  proc change(label, merge: string, edit: proc(f: var Fog)) =
+    let before = p.projSettings
+    var f = shown
+    f.custom = true
+    edit(f)
+    p.fog = f
+    a.editProject(label, before, merge)
+  a.propGroup("Fog", x, y, w)
+  const id = "map.fogcolor"
+  proc rgbOf(f: Fog): RGB = [int(round(f.color[0] * 255)), int(round(f.color[1] * 255)), int(round(f.color[2] * 255))]
+  if ui.focusId != id and not pickerOpen(id): a.fieldText[id] = fmtRgb(shown.rgbOf)
+  var before: ProjSettings
+  var started = false
+  let target = ColorTarget(
+    live: proc(c: RGB) =
+      if not started:
+        before = p.projSettings
+        started = true
+      var f = (if p.fog.custom: p.fog else: a.levelFog.fog)
+      f.custom = true
+      for k in 0 .. 2: f.color[k] = c[k].float32 / 255
+      p.fog = f
+      p.save(),
+    done: proc(changed: bool) =
+      if not started or p != a.proj: return
+      if changed: a.editProject("Change Fog Color", before)
+      else:
+        p.fog = before.fog
+        p.save())
+  let cr = a.propName("Color", x, y, w, "What the distance fades into (0-255 here; Oni's gl_fog_red, green and blue " &
+                      "take 0-1). Bungie's levels use dark grays and black.")
+  let ev = ui.colorField(id, cr, a.fieldText[id], target)
+  if eeCommitted in ev:
+    let (ok, c) = parseColor(a.fieldText[id])
+    if ok and c != shown.rgbOf:
+      change("Change Fog Color", "", proc(f: var Fog) =
+        for k in 0 .. 2: f.color[k] = c[k].float32 / 255)
+  y += 30
+  template depthRow(rowName, rowId, rowTip: string, rowValue: float32, rowStart: bool) {.dirty.} =
+    block:
+      let r = a.propName(rowName, x, y, w, rowTip)
+      const DistW = 92'f32
+      var v = rowValue.float
+      if ui.numberField(rowId, rect(r.x, y, r.w - DistW, 26), v, 0.001, 0, 1, 3):
+        let nv = v.float32
+        change(if rowStart: "Change Fog Start" else: "Change Fog End", rowId, proc(f: var Fog) =
+          if rowStart: f.start = nv else: f.finish = nv)
+      let d = fogDistance(rowValue, own.far)
+      let dist = if d >= own.far: "far plane" else: &"~{int(round(d))} units"
+      ui.textIn(dist, rect(r.x + r.w - DistW + 6, y, DistW - 6, 26), colTextDim, FontSmall)
+      ui.tip(rect(r.x + r.w - DistW, y, DistW, 26), &"How far from the camera that is, with the far plane at " &
+             &"{int(own.far)} (gs_farclipplane_set) and Oni's near plane at {int(FogNearPlane)}")
+      y += 30
+  depthRow("Start", "map.fogstart", "Where the fog begins: Oni's projected depth, 0 at the camera, 1 at the far " &
+           "plane (gl_fog_start). Bungie's levels use 0.975 to 0.995.", shown.start, true)
+  depthRow("End", "map.fogend", "Where the fog is complete, as the start (gl_fog_end). Oni's default is 1, " &
+           "the far plane.", shown.finish, false)
+  if p.fog.custom:
+    let br = rect(x + w * KeyShare, y, min(w * (1 - KeyShare), 160), 26)
+    if ui.textButton("map.fogreset", br, if own.found: "Use the script's" else: "Use Oni's default"):
+      let before = p.projSettings
+      p.fog = Fog()
+      a.editProject("Reset Fog", before)
+    ui.tip(br, if own.found: "Leave the fog to main() in " & own.file & " again" else: "Leave the fog at Oni's default again")
+    y += 32
+    a.propNote("Build sets this fog at the start of the level's main()" &
+               (if own.found: &" and turns off main()'s own fog lines in the built copy ({own.file} is left as it is)."
+                else: "."), x, y, w)
+  elif own.found:
+    a.propNote("As main() in " & own.file & " sets it. A change here takes over when you Build.", x, y, w)
+  else:
+    a.propNote("Oni's default: nothing in the level's scripts sets the fog.", x, y, w)
+
 proc lightingRows(a: App, x: float32, y: var float32, w: float32) =
   ## Baked lighting: ambient color, automatic or manual baking, Bake light.
   let ui = a.ui
@@ -2145,9 +2423,53 @@ proc openSpawned(a: App, key: string) =
   if sel.len == 1: a.classFor = sel[0]
   a.showPanel(pkClasses)
 
+proc mapMatch(q, name: string, id: int): bool =
+  ## The Map tab's search (q stripped, lower case): "#N" is the object with
+  ## id N; anything else is a part of the name, and a plain number an id too.
+  if q.len == 0: return true
+  if q[0] == '#':
+    let n = q[1 .. ^1].strip
+    if n.len == 0: return id >= 0
+    try: return id >= 0 and parseInt(n) == id
+    except ValueError: return false
+  if q in name.toLowerAscii: return true
+  if id >= 0 and q.allCharsInSet(Digits):
+    try: return parseInt(q) == id
+    except ValueError: discard
+
 proc drawMapTab(a: App, r: Rect) =
   let ui = a.ui
   ui.sectionTitle(rect(r.x, r.y, r.w, 26), "Layers")
+  # The search, at the right of the header. Ctrl+F goes to it with the mouse
+  # over the tab, or the list focused and the mouse off the views (there it flips).
+  const FilterId = "map.filter"
+  let fx0 = r.x + 16 + ui.textSize("Layers", FontSmall).x + 22   # the magnifier left of it
+  let fw = clamp(r.x + r.w - 4 - fx0, 0, 240)
+  let fr = rect(r.x + r.w - 4 - fw, r.y + 2, fw, 22)
+  let w = a.window
+  if w.ctrl and not w.alt and not w.shiftDown and w.buttonPressed[KeyF] and fw > 0 and
+     (ui.focusId.len == 0 or ui.focusId == FilterId) and
+     (ui.mouse.inside(r) or (ui.navId == "map.layers" and not ui.mouse.inside(a.viewsArea))):
+    ui.focusId = FilterId
+    ui.navId = FilterId
+    ui.focusFresh = true
+    ui.navTaken.incl KeyF
+  var selectFound = false
+  if fw > 40:
+    let wasFocused = ui.focusId == FilterId
+    let enter = wasFocused and (w.buttonPressed[KeyEnter] or w.buttonPressed[NumpadEnter])
+    let esc = wasFocused and w.buttonPressed[KeyEscape]
+    ui.icon("search16", vec2(fr.x - 11, fr.y + fr.h / 2), colTextDim)
+    discard ui.textField(FilterId, fr, a.mapFilter, "Name or #id")
+    ui.tip(fr, "Shows the rows whose name holds this, or the object with this #id (Ctrl+F). " &
+                "Enter selects what it finds; Escape clears it.")
+    if esc or enter: ui.navTaken.incl {KeyEscape, KeyEnter, NumpadEnter}   # not the views' too
+    if esc: a.mapFilter = ""
+    if enter:
+      selectFound = true
+      ui.enterUsed = true
+  let query = a.mapFilter.strip.toLowerAscii
+  let filtering = query.len > 0
   let list = rect(r.x, r.y + 26, r.w, max(0'f32, r.h - 26))
   let info = a.pieceInfo
   # Layers: geometry, then one per object type.
@@ -2155,11 +2477,31 @@ proc drawMapTab(a: App, r: Rect) =
   for o in a.objects: counts.inc o.tag
   var tags = toSeq(counts.keys)
   tags.sort(proc(x, y: string): int = cmp(typeName(x), typeName(y)))
-  var worldCount = 0
-  for pi in info:
-    if pi.world: inc worldCount
-  var layers = @[(GeometryLayer, "Geometry", worldCount, "pieces")]
-  for t in tags: layers.add (t, typeName(t), counts[t], "objects")
+  proc found(m: TreeRow): bool =
+    ## A member the search shows (all of them without one).
+    if not filtering: true
+    elif m.obj != nil: mapMatch(query, m.obj.label, m.obj.id)
+    else: mapMatch(query, "Piece " & $m.piece & (if a.geo.pieces[m.piece].brush: " (brush)" else: ""), -1)
+  var worldCount, worldFound = 0
+  for pc, pi in info:
+    if pi.world:
+      inc worldCount
+      if found(TreeRow(layer: GeometryLayer, piece: pc.int32)): inc worldFound
+  var foundCounts: CountTable[string]
+  if filtering:
+    for o in a.objects:
+      if found(TreeRow(layer: o.tag, obj: o, piece: -1)): foundCounts.inc o.tag
+  var layers: seq[(string, string, int, string)]
+  if not filtering or worldFound > 0: layers.add (GeometryLayer, "Geometry", worldCount, "pieces")
+  for t in tags:
+    if not filtering or foundCounts[t] > 0: layers.add (t, typeName(t), counts[t], "objects")
+  proc countText(key: string, n: int, unit: string): string =
+    ## "12 objects", or while searching "3 of 12 objects".
+    if not filtering: return &"{n} {unit}"
+    let f = if key == GeometryLayer: worldFound else: foundCounts[key]
+    &"{f} of {n} {unit}"
+  let newSearch = query != a.mapFilterSeen
+  a.mapFilterSeen = query
   # Groups are folds inside each layer, before its loose members; a group
   # shows the layer's members it holds, groups inside it first.
   var objGid: Table[LevelObject, int32]
@@ -2231,6 +2573,21 @@ proc drawMapTab(a: App, r: Rect) =
         let i = a.groupAt(g)
         g = if i >= 0: a.groups[i].parent else: 0
         inc guard
+    # While searching: the groups holding a match, nested too. A new search opens
+    # them and the layer, as a selection made in the views does.
+    var foundGroups: HashSet[int32]
+    if filtering:
+      for gid, ms in direct:
+        if not ms.anyIt(it.found): continue
+        var g = gid
+        var guard = 0
+        while g != 0 and a.groupAt(g) >= 0 and guard < 1000:
+          foundGroups.incl g
+          g = a.groups[a.groupAt(g)].parent
+          inc guard
+      if newSearch:
+        a.expanded.incl key
+        for g in foundGroups: a.expanded.incl key & "/" & $g
     if key notin a.expanded: continue
     proc spawnRows(cls, fold: string, depth: int, above: seq[string]) =
       ## What cls spawns. A class already above is left out, as classes can loop.
@@ -2243,14 +2600,15 @@ proc drawMapTab(a: App, r: Rect) =
         if r.fold.len > 0 and r.fold in a.expanded: spawnRows(k, r.fold, depth + 1, path)
     proc emit(gid: int32, depth: int) =
       for c in kids.getOrDefault(gid):
-        if (key, c) notin groupMembers: continue
+        if (key, c) notin groupMembers or (filtering and c notin foundGroups): continue
         let gr = TreeRow(layer: key, depth: depth, piece: -1, group: c)
         rows.add gr
         if gr.foldKey in a.expanded: emit(c, depth + 1)
       for m in direct.getOrDefault(gid):
+        if not m.found: continue
         var m = m
         m.depth = depth
-        let root = if m.obj != nil and m.obj.tag == "PART":
+        let root = if m.obj != nil and m.obj.tag == "PART" and not filtering:
                      ParticlePrefix & m.obj.node.xpath("OSD/Class").str.strip.toLowerAscii
                    else: ""
         if root.len > 0 and a.spawnKids(root).len > 0: m.fold = "PART/#" & $m.obj.id
@@ -2259,6 +2617,23 @@ proc drawMapTab(a: App, r: Rect) =
     emit(0, 1)
   let links = a.affectedLinks
   let rowH = 22'f32
+  if filtering and newSearch:
+    a.layersScroll = 0
+    a.layersCursor = 0
+    for i, row in rows:
+      if row.isMember:
+        a.layersCursor = i
+        break
+  if selectFound and filtering:
+    # Enter in the search: what it found becomes the selection, framed in the views.
+    a.clearSelection()
+    a.groupPicked = 0
+    for row in rows:
+      if not row.isMember: continue
+      if row.obj != nil:
+        if a.pickable(row.obj): row.obj.selected = true
+      elif not a.pieceLocked(row.piece) and not a.geo.pieces[row.piece].hidden: a.selPieces.incl row.piece
+    if a.hasSelection: a.frameSelection()
   if a.mapReveal != nil:
     # Scrolled to the row of an object shown from elsewhere (the Scripts panel's Ctrl+click).
     for i, row in rows:
@@ -2289,7 +2664,7 @@ proc drawMapTab(a: App, r: Rect) =
   # The member count is a column after the widest layer name; lock and eye sit at the right.
   var countW, nameColW = 0'f32
   for (key, name, n, unit) in layers:
-    countW = max(countW, ui.textSize(&"{n} {unit}", FontSmall).x)
+    countW = max(countW, ui.textSize(countText(key, n, unit), FontSmall).x)
     nameColW = max(nameColW, ui.textSize(name).x)
   if ui.hover(list) and not ui.scrollConsumed:
     a.layersScroll += ui.wheelNotches * rowH * 3
@@ -2337,7 +2712,7 @@ proc drawMapTab(a: App, r: Rect) =
       let countR = rect(min(nx + nameColW + 10, eyeR.x - 8 - countW), rr.y, countW, rowH)
       ui.textIn(ui.ellipsize(name, countR.x - nx - 6), rect(nx, rr.y, countR.x - nx - 6, rowH),
                 if hidden: colTextDisabled else: colText)
-      ui.textIn(&"{n} {unit}", countR, colTextDim, FontSmall, h = RightAlign)
+      ui.textIn(countText(key, n, unit), countR, colTextDim, FontSmall, h = RightAlign)
       let hit = rect(rr.x, rr.y, 20, rowH)
       let body = rect(rr.x + 20, rr.y, eyeR.x - rr.x - 20, rowH)
       if ui.hover(hit) and ui.pressed():
@@ -2353,10 +2728,12 @@ proc drawMapTab(a: App, r: Rect) =
           if key == GeometryLayer:
             if a.geo != nil:
               for f in a.geo.faces:
-                if f.objectId == -1 and not a.geo.pieces[f.piece].hidden: a.selPieces.incl f.piece
+                if f.objectId == -1 and not a.geo.pieces[f.piece].hidden and
+                   found(TreeRow(layer: key, piece: f.piece)): a.selPieces.incl f.piece
           else:
             for o in a.objects:
-              if o.tag == key and a.pickable(o): o.selected = true
+              if o.tag == key and a.pickable(o) and found(TreeRow(layer: key, obj: o, piece: -1)):
+                o.selected = true
         else:
           if open: a.expanded.excl key else: a.expanded.incl key
       return
@@ -2544,6 +2921,9 @@ proc drawMapTab(a: App, r: Rect) =
     ui.popClip()
     stuckTop = rr.y + rowH
   if stuck.len > 0: ui.rect(rect(list.x, below - 1, list.w, 1), colBorder)
+  if filtering and rows.len == 0:
+    ui.textIn("Nothing named like that, nor with that #id", rect(list.x + 10, list.y + 6, list.w - 20, 20),
+              colTextDim, FontSmall)
   var rowRects = newSeq[Rect](rows.len)
   for i in 0 ..< rows.len:
     rowRects[i] = rect(list.x, list.y + i.float32 * rowH - a.layersScroll, list.w, rowH)
@@ -2629,6 +3009,7 @@ proc drawLevelInfo(a: App, r: Rect) =
     if a.proj.sky.len > 0: a.skyGradeRows(x, y, w)
     a.musicRow(x, y, w)
     a.lightingRows(x, y, w)
+    a.fogRows(x, y, w)
     if a.proj.scratch: a.propText("Source", "Made in Catwalk", x, y, w)
     else: a.propText("Source", &"Level {a.proj.levelNumber} ({a.proj.source})", x, y, w)
     a.propText("Environment", a.proj.envName, x, y, w)
@@ -2701,6 +3082,105 @@ proc colorTarget(a: App, objs: seq[LevelObject], fld: ObjectField, suffix = ""):
       if changed: a.push editCmd(label, objs, before)
       else:
         for i, o in objs: o.restore(before[i]))
+
+proc furnitureTintTarget(a: App, objs: seq[LevelObject]): ColorTarget =
+  ## The color picker tints the furnitures' faces as it goes; closing it
+  ## leaves one undo step, or puts the old tints back.
+  var before: Geometry
+  var old: seq[(int, array[3, uint8])]
+  ColorTarget(
+    live: proc(c: RGB) =
+      if before == nil:
+        before = a.geo.clone
+        for o in objs:
+          for fi in a.ownedFaces(o): old.add (fi, a.geo.faces[fi].tint)
+      for o in objs: discard a.setObjectTint(o, c),
+    done: proc(changed: bool) =
+      if before == nil: return
+      if changed: a.push geoCmd("Tint", before, a.geo)
+      else:
+        for (fi, t) in old: a.geo.faces[fi].tint = t
+        a.geo.bump())
+
+proc tintValues(a: App, objs: seq[LevelObject]): seq[string] =
+  ## The Tint row's values for the faces objs own, as colorField's placeholder
+  ## reads them: one when every face has the same tint, else the first face's
+  ## and, for each channel that differs anywhere, one tint where it differs (so
+  ## the row blanks exactly those channels, however many faces there are).
+  var first: array[3, uint8]
+  var have = false
+  var odd: array[3, int] = [-1, -1, -1]   # A face whose channel k differs from first's.
+  for o in objs:
+    for fi in a.ownedFaces(o):
+      let t = a.geo.faces[fi].tint
+      if not have:
+        first = t
+        have = true
+        continue
+      for k in 0 .. 2:
+        if odd[k] < 0 and t[k] != first[k]: odd[k] = fi
+  if not have: return
+  result.add fmtRgb([first[0].int, first[1].int, first[2].int])
+  for k in 0 .. 2:
+    if odd[k] >= 0:
+      let t = a.geo.faces[odd[k]].tint
+      let s = fmtRgb([t[0].int, t[1].int, t[2].int])
+      if s notin result: result.add s
+
+proc tintRow(a: App, objs: seq[LevelObject], id: string, x: float32, y: var float32, w: float32) =
+  ## Furniture's Tint row (one or several): the tint of the faces they own;
+  ## a channel that differs shows blank, and typing it sets only that channel.
+  let ui = a.ui
+  let tints = a.tintValues(objs)
+  if id notin a.fieldText or ui.focusId != id: a.fieldText[id] = if tints.len == 1: tints[0] else: ""
+  let tr = a.propName("Tint", x, y, w,
+    if objs.len > 1: "The color of the geometry these furnitures own: the light their faces get " &
+      "is multiplied by it, in the views and the game (the Face tab's Tint, for all their faces). " &
+      "A channel that differs between them is blank; typing it sets only that channel. 255 255 255 = none."
+    else: "The color of the geometry this furniture owns: the light its faces get is multiplied " &
+      "by it, in the views and the game (the Face tab's Tint, for all its faces). 255 255 255 = none.")
+  let ev = ui.colorField(id, tr, a.fieldText[id], a.furnitureTintTarget(objs),
+                         if tints.len > 1: tints.join(";") else: "")
+  if eeCommitted in ev:
+    let (ok, c) = parseColor(a.fieldText[id])
+    if ok:
+      let before = a.geo.clone
+      var changed = false
+      for o in objs:
+        if a.setObjectTint(o, c, colorComponent): changed = true
+      if changed: a.push geoCmd("Tint", before, a.geo)
+  y += 30
+
+proc furnitureFlagRows(a: App, objs: seq[LevelObject], id: string, x: float32, y: var float32, w: float32) =
+  ## Furniture's Surface flags (one or several): the Face tab's flags for every
+  ## face they own; a flag only some of those faces have shows as mixed.
+  let ui = a.ui
+  var any, all: uint32
+  all = not 0'u32
+  for o in objs:
+    let (oa, ol) = a.objectFlags(o)
+    any = any or oa
+    all = all and ol
+  var shown: seq[int]
+  for i, (name, bit, desc) in EditableFlags:
+    if matchesFilter(a.fieldFilter, name, "") or matchesFilter(a.fieldFilter, "Surface flags", ""): shown.add i
+  if shown.len == 0: return
+  a.propGroup("Surface flags", x, y, w)
+  let cellW = (w - 10) / 2
+  for k, i in shown:
+    let (name, bit, desc) = EditableFlags[i]
+    var v = (all and bit) != 0
+    let cx = x + (k mod 2).float32 * (cellW + 10)
+    if ui.checkbox(id & "." & name, vec2(cx, y + 1), ui.ellipsize(name, cellW - 24), v,
+                   mixed = (any and bit) != 0 and (all and bit) == 0):
+      let before = a.geo.clone
+      var changed = false
+      for o in objs:
+        if a.setObjectFlag(o, bit, v): changed = true
+      if changed: a.push geoCmd(name, before, a.geo)
+    ui.tip(rect(cx, y, cellW, 26), name & ": " & desc &
+      (if objs.len > 1: " (Every face these furnitures own.)" else: " (Every face this furniture owns.)"))
+    if k mod 2 == 1 or k == shown.high: y += 28
 
 proc commitColor(a: App, objs: seq[LevelObject], fld: ObjectField, text: string, suffix = "") =
   ## A color typed into the field, in any form parseColor takes, stored as "R G B".
@@ -2967,7 +3447,8 @@ proc followSound(a: App) =
   ## A Sound object's preview follows its Class and level, and stops once
   ## it's no longer selected.
   if not soundPlaying() or a.soundObj == nil: return
-  if not a.soundObj.selected or a.soundObj notin a.objects:
+  if not (a.soundObj.selected or a.propsLock.kind == plObjects and a.soundObj in a.propsLock.objs) or
+     a.soundObj notin a.objects:
     stopSound()
     a.soundObj = nil
     return
@@ -3129,10 +3610,100 @@ proc offLightSoundField(o: LevelObject, path: string): bool =
   o.tag in LightTags and not o.lightSoundAmbient and
     path in ["OSD/Animation/SoundMinRadius", "OSD/Animation/SoundMaxRadius"]
 
+type PoseKind = enum pkPosition, pkRotation, pkScale
+
+proc poseOf(o: LevelObject, k: PoseKind): Vec3 =
+  case k
+  of pkPosition: o.pos
+  of pkRotation: o.rot
+  of pkScale: o.scale
+
+proc multiPoseRow(a: App, sel: seq[LevelObject], k: PoseKind, x: float32, y: var float32, w: float32) =
+  ## Position, Rotation or Scale of several objects: an axis whose value differs
+  ## is blank, and typing it sets that axis on all of them (each keeps its
+  ## other axes); the geometry they own follows.
+  let ui = a.ui
+  let title = ["Position", "Rotation", "Scale"][k.ord]
+  let tip = case k
+    of pkPosition: "Where they are. An axis that differs between them is blank; typing it " &
+                   "puts them all there on that axis."
+    of pkRotation: "Their rotation, in degrees. An axis that differs between them is blank; " &
+                   "typing it sets that axis on all of them."
+    of pkScale: "Size along each furniture's own X, Y and Z (1: as made). Oni has no furniture " &
+                "scale: Catwalk scales the geometry they own, and the level is built with it. " &
+                "An axis that differs between them is blank."
+  let vr = a.propName(title, x, y, w, tip)
+  let cw = (vr.w - 4) / 3
+  let v0 = sel[0].poseOf(k)
+  for i in 0 .. 2:
+    let mixed = sel.anyIt(it.poseOf(k)[i] != v0[i])
+    var f = v0[i].float
+    let rr = rect(vr.x + i.float32 * (cw + 2), y, cw, 26)
+    let step = case k
+      of pkPosition: a.grid.float
+      of pkRotation: 15.0
+      of pkScale: 0.1
+    if ui.numberField(&"mprop.{title}.{i}", rr, f, step, -100000, 100000,
+                      (if k == pkRotation: 1 else: 2), axis = i, mixed = mixed):
+      var val = f.float32
+      if k == pkScale: val = clamp(val, MinScale, MaxScale)   # As setScale stores it.
+      var changed: seq[LevelObject]
+      for o in sel:
+        if o.poseOf(k)[i] != val: changed.add o
+      if changed.len > 0:
+        # Taken only now: a level's geometry is too big to copy every frame.
+        let before = snapshotObjects(changed)
+        let geoBefore = if changed.anyIt(a.hasGeometry(it)): a.geo.clone else: nil
+        for o in changed:
+          var v = o.poseOf(k)
+          v[i] = val
+          case k
+          of pkPosition: a.setPose(o, v, o.rot)
+          of pkRotation: a.setPose(o, o.pos, v)
+          of pkScale: a.setScale(o, v)
+        a.push editCmd(["Move", "Rotate", "Scale"][k.ord], changed, before, geoBefore, a.geo)
+  y += 30
+
+var crossFields: Table[string, bool]   ## drawMultiFields, several types: field key -> same meaning in each.
+var crossSel: seq[LevelObject]
+
+proc sameMeaning(a: App, sel: seq[LevelObject], fld: ObjectField): bool =
+  ## Several types that all have fld: whether it's the same property in each,
+  ## the same input with the same values to pick from (every object's Flags,
+  ## yes; a character's Class and a particle's Class, no). Worked out once per
+  ## selection.
+  if crossSel != sel:
+    crossSel = sel
+    crossFields.clear()
+  let key = fld.path & "@" & fld.attr
+  if key in crossFields: return crossFields[key]
+  result = true
+  let ft = objectFieldType(sel[0], fld.path, fld.attr)
+  var tags: seq[string]
+  for o in sel:
+    if objectFieldType(o, fld.path, fld.attr) != ft or
+       isScriptField(o.tag, fld) != isScriptField(sel[0].tag, fld):
+      result = false
+      break
+    if o.tag notin tags: tags.add o.tag
+  if result:
+    proc values(o: LevelObject): seq[string] =
+      for c in a.fieldChoices(o, fld): result.add c.value & "\t" & c.note
+    let first = values(sel[0])
+    for t in tags[1 .. ^1]:
+      for o in sel:
+        if o.tag == t:
+          if values(o) != first: result = false
+          break
+      if not result: break
+  crossFields[key] = result
+
 proc drawMultiFields(a: App, sel: seq[LevelObject], props: Rect) =
-  ## Several objects of one type: the fields they all have. A field whose
-  ## values differ is blank, with the values (joined by ';') as placeholder;
-  ## typing a value sets it on all of them.
+  ## Several objects: the properties they all have. Position and Rotation,
+  ## Scale and Tint when they're all furniture, and the fields they share (of
+  ## several types, those that mean the same in each). A field whose values
+  ## differ is blank, with the values (joined by ';') as placeholder; typing a
+  ## value sets it on all of them.
   let ui = a.ui
   if a.fieldSel != sel:
     a.fieldSel = sel
@@ -3141,17 +3712,37 @@ proc drawMultiFields(a: App, sel: seq[LevelObject], props: Rect) =
   var y = props.y + 8 - a.propsScroll
   let x = props.x + 10
   let w = props.w - 20
+  let sameType = sel.allIt(it.tag == sel[0].tag)
+  let allLights = sel.allIt(it.tag in LightTags)
   a.propText("Selected", &"{sel.len} objects", x, y, w)
+  if not sameType:
+    var order: seq[string]
+    var counts: CountTable[string]
+    for o in sel:
+      let t = typeName(o.tag)
+      if t notin order: order.add t
+      counts.inc t
+    for t in order: a.propText(t, $counts[t], x, y, w)
+  var shown = 0
+  for k in PoseKind:
+    if k == pkScale and not sel.allIt(it.canScale): continue
+    if not matchesFilter(a.fieldFilter, ["Position", "Rotation", "Scale"][k.ord], ""): continue
+    a.multiPoseRow(sel, k, x, y, w)
+    inc shown
+  if sel.allIt(a.canTint(it)) and matchesFilter(a.fieldFilter, "Tint", ""):
+    a.tintRow(sel, "mprop.tint", x, y, w)
+    inc shown
   # Fields every object has, in the first one's order, with each object's value.
   var values: Table[string, seq[string]]
   for o in sel:
     for fld in o.fields: values.mgetOrPut(fld.path & "@" & fld.attr, @[]).add fld.value
   for fld in sel[0].fields:
-    if sel[0].tag in LightTags and fld.path.isLightAnimField: continue   # drawLightObjAnims
+    if allLights and fld.path.isLightAnimField: continue   # drawLightObjAnims
     if sel.allIt(it.offLightSoundField(fld.path)): continue
     let key = fld.path & "@" & fld.attr
     let vals = values.getOrDefault(key)
     if vals.len != sel.len: continue
+    if not sameType and not a.sameMeaning(sel, fld): continue
     var uniq: seq[string]
     for v in vals:
       if v notin uniq: uniq.add v
@@ -3161,6 +3752,7 @@ proc drawMultiFields(a: App, sel: seq[LevelObject], props: Rect) =
     let name = (if fld.path.startsWith("OSD/"): fld.path[4 .. ^1] else: fld.path) &
                (if fld.attr.len > 0: " ." & fld.attr else: "")
     if not matchesFilter(a.fieldFilter, name, uniq.join(" ")): continue
+    inc shown
     if fld.path == MessageField and fld.attr.len == 0:
       let (ev, h) = a.messageField(id, x, y, w, a.fieldText[key],
                                    if mixed: "(different messages)" else: "")
@@ -3214,11 +3806,23 @@ proc drawMultiFields(a: App, sel: seq[LevelObject], props: Rect) =
       if eeCommitted in ev and not (mixed and a.fieldText[key].len == 0):
         a.commitFieldAll(sel, fld, a.fieldText[key])
     y += 30
-  if sel[0].tag in LightTags: a.drawLightObjAnims(sel, x, y, w)
+  if allLights:
+    let before = y
+    a.drawLightObjAnims(sel, x, y, w)
+    if y != before: inc shown
+  if sel.allIt(a.canTint(it)):
+    let y0 = y
+    a.furnitureFlagRows(sel, "mprop.flag", x, y, w)
+    if y != y0: inc shown
+  if shown == 0:
+    ui.textIn(if a.fieldFilter.strip.len > 0: "No field matches" else: "No property they all have",
+              rect(x, y, w, 22), colTextDim, FontSmall)
+    y += 28
   let contentH = y + a.propsScroll - props.y
   if ui.hover(props) and not ui.scrollConsumed:
     a.propsScroll += ui.wheelNotches * RowH * 3
   a.propsScroll = clamp(a.propsScroll, 0, max(0, contentH - props.h + 20))
+  propsContent = contentH + 20
 
 proc placeAtView(a: App): Vec3 =
   ## Where the entity browser puts new objects: the point the active view looks at.
@@ -3229,6 +3833,53 @@ proc placeAtView(a: App): Vec3 =
   let hit = a.pickAt(vi, b.xy + b.wh / 2)
   if hit.kind != hkNone: return a.snapV(hit.point)
   a.snapV(cam.pos + cam.forward * 200)
+
+proc importModels*(a: App, files: seq[string], at = vec3(0, 0, 0), atGiven = false) =
+  ## Model files (File > Import > Models as furniture, MCP import_model) become
+  ## furniture placed where the active view looks (or at at), side by side
+  ## along X when there are several, and selected.
+  if a.busy or a.proj == nil:
+    a.say("Busy: import the models once the current job ends", true)
+    return
+  if a.geo == nil:
+    a.say("This project has no editable geometry, so it can't take furniture", true)
+    return
+  let models = files.filterIt(it.isModelFile)
+  if models.len < files.len:
+    a.say("Not models Catwalk reads (" & ModelFormats.join(", ") & "): " &
+          files.filterIt(not it.isModelFile).mapIt(it.extractFilename).join(", "), true)
+  if models.len == 0: return
+  a.modelImportDir = models[0].parentDir
+  let start = if atGiven: at else: a.placeAtView
+  let app = a
+  a.startJob(importModelsJob(a.cfg, a.proj, models, proc(rs: seq[ImportedModel]) =
+    var objs: seq[LevelObject]
+    var x = 0'f32
+    var notes: seq[string]
+    var warn = false
+    for i, r0 in rs:
+      var r = r0
+      if i > 0: x += rs[i - 1].size.x / 2 + 5 + r.size.x / 2
+      let o = app.addImportedModel(r, start + vec3(x, 0, 0))
+      if o == nil: return
+      objs.add o
+      # Kept in the entity browser, to place again here or in other levels.
+      try: discard saveImported(r, app.proj.imagesDir)
+      except CatchableError as e: r.warnings.add "not in the Entity Browser (" & e.msg & ")"
+      var note = &"{r.name} ({r.faces} faces, {r.size.x.round.int} x {r.size.y.round.int} x {r.size.z.round.int} units)"
+      if r.dropped > 0: note.add &", {r.dropped} faces with no area left out"
+      for w in r.warnings: note.add ", " & w
+      if r.warnings.len > 0: warn = true
+      notes.add note
+    app.refreshCollections()
+    if "custom" notin app.proj.textureCollections:
+      app.proj.textureCollections.add "custom"
+      app.proj.save()
+    app.refreshImported()
+    app.browserOpen.incl ImportedGroup
+    app.clearSelection()
+    for o in objs: o.selected = true
+    app.say("Imported as furniture: " & notes.join("; "), warn)))
 
 proc drawCornerAnims(a: App, corners: seq[(int, int)], baked: array[4, uint8], x: float32,
                      y: var float32, w: float32)
@@ -3569,42 +4220,27 @@ proc nothingSelected(a: App): bool =
   ## No object, piece, face or vertex handle: Properties shows the level.
   a.selection.len == 0 and a.selPieces.len == 0 and a.selFaces.len == 0 and a.selHandles.len == 0
 
-proc drawObjectsPage(a: App, r: Rect) =
-  ## Properties for selected objects: the type as the header, then one row per
-  ## property (several of one type: the fields they share).
+proc showClassOf(a: App, o: LevelObject)
+
+proc drawObjectsPage(a: App, r: Rect, sel: seq[LevelObject]) =
+  ## Properties for objects (the selection, or what the lock keeps): the type
+  ## as the header, then one row per property (several: the properties they
+  ## share, drawMultiFields).
   let ui = a.ui
-  let sel = a.selection
-  let sameType = sel.len > 1 and sel.allIt(it.tag == sel[0].tag)
-  ui.sectionTitle(rect(r.x, r.y, r.w, 26),
-                  if sel.len == 1 or sameType: typeName(sel[0].tag) else: "Objects")
+  let sameType = sel.allIt(it.tag == sel[0].tag)
+  ui.sectionTitle(rect(r.x, r.y, r.w, 26), if sameType: typeName(sel[0].tag) else: "Objects")
   var props = rect(r.x, r.y + 26, r.w, max(0'f32, r.h - 26))
-  if sel.len == 1 or sameType:
-    # Above the scrolled fields, so it stays put while they scroll.
-    discard ui.textField("entity.fieldFilter", rect(props.x + 8, props.y + 6, props.w - 16, 26),
-                         a.fieldFilter, "Search fields...")
-    props = rect(props.x, props.y + 38, props.w, max(0'f32, props.h - 38))
+  # Above the scrolled fields, so it stays put while they scroll.
+  discard ui.textField("entity.fieldFilter", rect(props.x + 8, props.y + 6, props.w - 16, 26),
+                       a.fieldFilter, "Search fields...")
+  props = rect(props.x, props.y + 38, props.w, max(0'f32, props.h - 38))
   propsContent = 0
-  if ui.hover(props) and not ui.scrollConsumed and sel.len > 1 and not sameType:
-    a.propsScroll += ui.wheelNotches * RowH * 3
   ui.scrollArea("props", props, a.propsScroll)
   ui.pushClip(props)
   ui.scrollIntoView(a.propsScroll)
-  if sameType:
+  if sel.len > 1:
     a.fieldObj = nil
     a.drawMultiFields(sel, props)
-  elif sel.len > 1:
-    a.fieldSel = @[]
-    a.fieldObj = nil
-    var counts: CountTable[string]
-    for o in sel: counts.inc typeName(o.tag)
-    let x = props.x + 10
-    let w = props.w - 20
-    var y = props.y + 8 - a.propsScroll
-    a.propText("Selected", &"{sel.len} objects", x, y, w)
-    for k, v in counts: a.propText(k, $v, x, y, w)
-    let contentH = y + a.propsScroll - props.y + 12
-    a.propsScroll = clamp(a.propsScroll, 0, max(0, contentH - props.h))
-    propsContent = contentH
   else:
     a.fieldSel = @[]
     let o = sel[0]
@@ -3634,7 +4270,7 @@ proc drawObjectsPage(a: App, r: Rect) =
       let br = rect(vr.x + vr.w - 88, y, 88, 26)
       if ui.textButton("entity.editClass", br, "Edit class"):
         a.showPanel(pkClasses)
-        a.classFor = nil   # Follow this character's class.
+        a.showClassOf(o)
       ui.tip(br, "Edit " & cls & ", the values every character of that class starts with")
       y += 30
     if o.tag == "PART":
@@ -3643,7 +4279,7 @@ proc drawObjectsPage(a: App, r: Rect) =
       let br = rect(vr.x, y, min(vr.w, 88), 26)
       if ui.textButton("entity.editParticle", br, "Edit class"):
         a.showPanel(pkClasses)
-        a.classFor = nil   # Follow this particle's class.
+        a.showClassOf(o)
       ui.tip(br, "Edit " & cls & " for this level: every Particle object of that class changes")
       y += 30
     if a.hasGeometry(o): a.propText("Geometry", "Owns level geometry (moves with it)", x, y, w)
@@ -3661,8 +4297,8 @@ proc drawObjectsPage(a: App, r: Rect) =
         o.file.dirty = true
         a.push editCmd((if on: "Enable " else: "Disable ") & typeName(o.tag), @[o], before)
       y += 30
-    proc vecRow(title: string, v: var Vec3, step: float, isRot: bool): bool =
-      let vr = a.propName(title, x, y, w)
+    proc vecRow(title: string, v: var Vec3, step: float, isRot: bool, tip = ""): bool =
+      let vr = a.propName(title, x, y, w, tip)
       let cw = (vr.w - 4) / 3
       for i in 0 .. 2:
         var f = v[i].float
@@ -3684,7 +4320,18 @@ proc drawObjectsPage(a: App, r: Rect) =
       let geoBefore = if a.hasGeometry(o): a.geo.clone else: nil
       a.setPose(o, p, rr)
       a.push editCmd(if posChanged: "Move" else: "Rotate", @[o], objBefore, geoBefore, a.geo)
-    # Key / value table.
+    if o.canScale and matchesFilter(a.fieldFilter, "Scale", ""):
+      var sc = o.scale
+      if vecRow("Scale", sc, 0.1, false, "Size along the furniture's own X, Y and Z (1: as made). " &
+                "Oni has no furniture scale: Catwalk scales the geometry it owns, and the level is " &
+                "built with it. Scale tool (T): drag the gizmo."):
+        let objBefore = @[o.snapshot]
+        let geoBefore = if a.hasGeometry(o): a.geo.clone else: nil
+        a.setScale(o, sc)
+        a.push editCmd("Scale", @[o], objBefore, geoBefore, a.geo)
+    if a.canTint(o) and matchesFilter(a.fieldFilter, "Tint", ""):
+      a.tintRow(@[o], "entity.tint." & $o.id, x, y, w)
+    # Key / value table (furniture's Surface flags come after it).
     var shown = 0
     for fld in o.fields:
       let key = fld.path & "@" & fld.attr
@@ -3773,6 +4420,10 @@ proc drawObjectsPage(a: App, r: Rect) =
     if o.tag in LightTags:
       let before = y
       a.drawLightObjAnims(@[o], x, y, w)
+      if y != before: inc shown
+    if a.canTint(o):
+      let before = y
+      a.furnitureFlagRows(@[o], "entity.flag." & $o.id, x, y, w)
       if y != before: inc shown
     if shown == 0:
       ui.textIn("No field matches", rect(x, y, w, 22), colTextDim, FontSmall)
@@ -3917,12 +4568,17 @@ proc drawEntityBrowser(a: App, br: Rect) =
         var tip = p.label
         if p.detail.len > 0: tip.add " · " & p.detail
         if not p.generic: tip.add " (" & typeName(p.tag) & ")"
-        if p.prefab.len > 0: tip.add ", with its geometry"
+        if p.imported.len > 0: tip.add ". Right click to remove it from the browser"
+        elif p.prefab.len > 0: tip.add ", with its geometry"
         ui.tip(cell, tip)
       if hov and ui.pressed() and a.proj != nil:
         ui.consumeClick()
         a.entityCursor = ck
         a.browserPress = (i, ui.mouse)
+      if hov and p.imported.len > 0 and ui.pressed(MouseRight):
+        a.entityCursor = ck
+        a.ctx = CtxMenu(pos: ui.mouse, view: -1, face: -1, importedModel: p.imported)
+        a.menuSys.openContext(ui.mouse)
       if a.browserPress[0] == i and ui.window.buttonDown[MouseLeft] and
          (ui.mouse - a.browserPress[1]).length > 4:
         # Dragged out of the browser: the object follows the mouse in the views.
@@ -4745,27 +5401,48 @@ proc readParticles(a: App) =
     app.particleClasses = particleNames()
     app.say &"Read {app.particleClasses.len} particle classes from level 0")
 
+proc openClassOf(a: App, o: LevelObject) =
+  ## A character's or Particle object's class opens, on its side.
+  a.classFor = o
+  let cn = o.node.xpath("OSD/Class").str.strip
+  if o.tag == "PART":
+    if a.particleClasses.len == 0 and hasParticleCache(): a.particleClasses = particleNames()
+    let key = ParticlePrefix & cn.toLowerAscii
+    if key in a.particleClasses:
+      if not a.classParticles: a.classOther = a.className
+      a.classParticles = true
+      a.className = key
+  else:
+    if a.classList.len == 0 and hasClassCache(): a.classList = classNames()
+    if cn in a.classList:
+      if a.classParticles: a.classOther = a.className
+      a.classParticles = false
+      a.className = cn
+
+proc showClassOf(a: App, o: LevelObject) =
+  ## Properties' Edit class: o's class, even with the Classes tab locked
+  ## (asking for it unlocks the tab).
+  a.classLock = false
+  a.classLockFollow = nil
+  a.openClassOf(o)
+
+proc classFollows(a: App) =
+  ## The selected character or Particle object's class opens. While the tab
+  ## is locked, the last one that would have opened is kept for when it's
+  ## unlocked, so it then shows what the selection would have shown.
+  let sel = a.selection
+  if a.classLock:
+    if sel.len == 1 and sel[0].tag in ["CHAR", "PART"]: a.classLockFollow = sel[0]
+    return
+  if a.classLockFollow != nil:
+    let o = a.classLockFollow
+    a.classLockFollow = nil
+    if o in a.objects and not (sel.len == 1 and sel[0].tag in ["CHAR", "PART"]): a.openClassOf(o)
+  if sel.len == 1 and sel[0].tag in ["CHAR", "PART"] and a.classFor != sel[0]: a.openClassOf(sel[0])
+
 proc drawClassesPage(a: App, whole: Rect) =
   ## Character and particle classes: the open one's fields above, every class below.
   let ui = a.ui
-  # Follow the selected object: its class opens, on its side.
-  let sel = a.selection
-  if sel.len == 1 and sel[0].tag in ["CHAR", "PART"] and a.classFor != sel[0]:
-    a.classFor = sel[0]
-    let cn = sel[0].node.xpath("OSD/Class").str.strip
-    if sel[0].tag == "PART":
-      if a.particleClasses.len == 0 and hasParticleCache(): a.particleClasses = particleNames()
-      let key = ParticlePrefix & cn.toLowerAscii
-      if key in a.particleClasses:
-        if not a.classParticles: a.classOther = a.className
-        a.classParticles = true
-        a.className = key
-    else:
-      if a.classList.len == 0 and hasClassCache(): a.classList = classNames()
-      if cn in a.classList:
-        if a.classParticles: a.classOther = a.className
-        a.classParticles = false
-        a.className = cn
   const SideH = 32'f32
   for (i, side) in [(0, "Characters"), (1, "Particles")]:
     let b = rect(whole.x + 8 + i.float32 * 104, whole.y + 3, 100, 26)
@@ -4912,6 +5589,8 @@ proc faceEdit(a: App, label: string, fn: proc(fi: int)) =
   else: a.push geoCmd(label, before, a.geo)
   a.faceUndo = (label, a.geo, a.geo.version, a.undoStack.len, key)
 
+include uvedit
+
 proc drawFaceProps(a: App, x, y0, w: float32): float32 =
   ## Properties for selected faces (or pieces): texture mapping, flags, script
   ## id, shade and tint. Returns where the rows end.
@@ -4929,6 +5608,7 @@ proc drawFaceProps(a: App, x, y0, w: float32): float32 =
   let size = a.texSizeText(f0.texture)
   a.propText("Selected", &"{faces.len} face(s)", x, y, w)
   a.propText("Texture", f0.texture & (if size.len > 0: " · " & size else: ""), x, y, w)
+  a.drawUvEditor(x, y, w, faces, first)
   # Texture mapping, absolute and live: shown for the first face, an edit
   # sets that one value on every selected face.
   let key = a.faceKey(faces)
@@ -4984,22 +5664,6 @@ proc drawFaceProps(a: App, x, y0, w: float32): float32 =
           app.texFrames[fi] = app.geo.setTexFrame(fi, old, t))
         a.texFramesFor.version = a.geo.version
     if i mod 2 == 1 or i == 4: y += 30
-  let br = a.propName("Adjust", x, y, w, "Flip the textures along U or V, or World align them " &
-                      "(project them from the nearest axis, at the texture's usual size)")
-  let bw = (br.w - 4) / 3
-  if ui.textButton("face.flipu", rect(br.x, y, bw, 26), "Flip U"):
-    let app = a
-    a.applyToFaces("Flip texture", proc(fi: int) = app.geo.transformUVs(fi, vec2(0, 0), vec2(-1, 1), 0))
-  if ui.textButton("face.flipv", rect(br.x + bw + 2, y, bw, 26), "Flip V"):
-    let app = a
-    a.applyToFaces("Flip texture", proc(fi: int) = app.geo.transformUVs(fi, vec2(0, 0), vec2(1, -1), 0))
-  let ar = rect(br.x + 2 * (bw + 2), y, bw, 26)
-  if ui.textButton("face.align", ar, "Align"):
-    let app = a
-    a.applyToFaces("Align texture", proc(fi: int) =
-      app.geo.projectUVs(fi, app.density(app.geo.faces[fi].texture)))
-  ui.tip(ar, "World align")
-  y += 30
   # Script id and shade.
   let sr = a.propName("Script id", x, y, w, "For env_show and friends; 0 = none")
   var sid = f0.scriptId.float
@@ -5126,18 +5790,28 @@ proc drawGroupProps(a: App, r: Rect, gid: int32) =
     let (ok, lo, hi) = a.groupBounds(gid)
     if ok: a.propText("Size", fmtVec(hi - lo), x, y, w)
     y += 4
-    if ui.textButton("group.ungroup", rect(x, y, 96, 26), "Ungroup"): a.ungroupSelection()
+    if ui.textButton("group.ungroup", rect(x, y, 96, 26), "Ungroup"):
+      if a.propsLock.kind == plGroup:
+        # Locked on this group, whatever is selected: it's selected (as a Map
+        # tab click does) and ungrouped; the lock has nothing left to show.
+        discard a.openTo(g.parent)
+        a.clearSelection()
+        a.groupPicked = gid
+        a.selectGroup(gid)
+        a.propsLock = PropsLock()
+      a.ungroupSelection()
     y + 30)
 
-proc selectionGroup(a: App): (int32, bool) =
-  ## The group the selection is in (0 = none), and whether its parts are in
-  ## different ones.
+proc selectionGroup(a: App, objs: seq[LevelObject], withGeometry = true): (int32, bool) =
+  ## The group objs (and with geometry, the selected pieces and faces) are in
+  ## (0 = none), and whether they're in different ones.
   var seen: HashSet[int32]
-  for o in a.selection: seen.incl a.objGroup(o)
-  for pc in a.selPieces: seen.incl a.pieceGroup(pc)
-  if a.geo != nil:
-    for fi in a.selFaces:
-      if fi in 0 .. a.geo.faces.high: seen.incl a.pieceGroup(a.geo.faces[fi].piece)
+  for o in objs: seen.incl a.objGroup(o)
+  if withGeometry:
+    for pc in a.selPieces: seen.incl a.pieceGroup(pc)
+    if a.geo != nil:
+      for fi in a.selFaces:
+        if fi in 0 .. a.geo.faces.high: seen.incl a.pieceGroup(a.geo.faces[fi].piece)
   seen.excl 0
   if seen.len == 1:
     for g in seen: return (g, false)
@@ -5151,13 +5825,40 @@ proc drawProperties(a: App, r0: Rect) =
   let ui = a.ui
   a.drop.live = false
   var r = r0
-  let picked = a.pickedGroup
+  # Locked (the lock on its tab): what it showed then, whatever is selected now.
+  let lock = a.propsLock
+  var lockedObjs: seq[LevelObject]
+  if lock.kind != plNone:
+    proc gone(what: string) =
+      ui.textIn(what & " no longer exists (undo brings it back); unlock to show the selection",
+                rect(r.x + 10, r.y, r.w - 20, min(r.h, 80'f32)), colTextDim, FontSmall, h = CenterAlign)
+    case lock.kind
+    of plGroup:
+      a.fieldObj = nil
+      a.fieldSel = @[]
+      if a.groupAt(lock.group) >= 0: a.drawGroupProps(r, lock.group)
+      else: gone("The locked group")
+      return
+    of plLevel:
+      a.fieldObj = nil
+      a.fieldSel = @[]
+      a.drawLevelInfo(r)
+      return
+    else:
+      lockedObjs = lock.objs.filterIt(it in a.objects)
+      if lockedObjs.len == 0:
+        a.fieldObj = nil
+        a.fieldSel = @[]
+        gone(if lock.objs.len == 1: "The locked object" else: "The locked objects")
+        return
+  let picked = if lock.kind == plNone: a.pickedGroup else: 0
   if picked != 0:
     a.fieldObj = nil
     a.fieldSel = @[]
     a.drawGroupProps(r, picked)
     return
-  let (inGroup, severalGroups) = a.selectionGroup
+  let (inGroup, severalGroups) = if lock.kind == plObjects: a.selectionGroup(lockedObjs, false)
+                                 else: a.selectionGroup(a.selection)
   if inGroup != 0 or severalGroups:
     var path = a.groupName(inGroup)
     var g = if inGroup != 0: a.groups[a.groupAt(inGroup)].parent else: 0
@@ -5169,12 +5870,14 @@ proc drawProperties(a: App, r0: Rect) =
     ui.icon("folder16", vec2(strip.x + 16, strip.y + 13), colText)
     ui.textIn(ui.ellipsize(if severalGroups: "Several groups" else: path, strip.w - 36),
               rect(strip.x + 30, strip.y, strip.w - 36, strip.h), colText)
-    ui.tip(strip, "The group the selection is in")
+    ui.tip(strip, if lock.kind == plObjects: "The group the locked objects are in" else: "The group the selection is in")
     r = rect(r.x, r.y + 26, r.w, max(0'f32, r.h - 26))
   let vertexColors = a.geo != nil and a.tool in {toolVertex, toolEdge, toolFace} and a.selHandles.len > 0
   let body = rect(r.x, r.y + 26, r.w, max(0'f32, r.h - 26))
   let (x, w) = (r.x + 10, r.w - 20)
-  if vertexColors:
+  if lock.kind == plObjects:
+    a.drawObjectsPage(r, lockedObjs)
+  elif vertexColors:
     a.fieldObj = nil
     a.fieldSel = @[]
     ui.sectionTitle(rect(r.x, r.y, r.w, 26), $a.tool)
@@ -5182,7 +5885,7 @@ proc drawProperties(a: App, r0: Rect) =
     a.scrolledRows("props.vertex", body, a.propsScroll, proc(y: float32): float32 =
       app.drawVertexColors(x, y, w))
   elif a.selection.len > 0:
-    a.drawObjectsPage(r)
+    a.drawObjectsPage(r, a.selection)
   elif a.geo != nil and a.selectedFaceSet.len > 0:
     a.fieldObj = nil
     a.fieldSel = @[]
@@ -5221,28 +5924,34 @@ proc drawTextureBrowser(a: App, br: Rect) =
   if ui.textButton("tex.collections", collR, "Collections"): a.showPanel(pkTextureCollections)
   ui.tip(collR, "Which texture collections are listed here")
   # Drops the enabled game levels whose textures no face uses; the extracted
-  # textures stay on disk, so adding one back is instant.
+  # textures stay on disk, so adding one back is instant. Textures copied into
+  # the level from a collection go too once no face uses them.
   if ui.textButton("tex.cleanup", cleanR, "Clean up unused") and a.proj != nil:
+    let removedTex = a.dropUnusedAdopted()
     var used: HashSet[string]
     if a.geo != nil:
       for fc in a.geo.faces: used.incl fc.texture
     var dropped: seq[string]
     for c in a.texCollections:
-      if c.level != 0 and c.id in a.proj.textureCollections and c.ready and
+      if c.level > 0 and c.id in a.proj.textureCollections and c.ready and
          not c.textures.anyIt(it in used):
         dropped.add c.id
-    if dropped.len == 0:
-      a.say("Every enabled level collection has a texture in use")
-    else:
-      var names: seq[string]
-      for c in a.texCollections:
-        if c.id in dropped: names.add c.name
+    var names: seq[string]
+    for c in a.texCollections:
+      if c.id in dropped: names.add c.name
+    if dropped.len > 0:
       a.proj.textureCollections.keepItIf(it notin dropped)
       a.proj.save()
       for id in dropped: a.collEnabled.excl id
-      a.say("Removed unused collections: " & names.join(", "))
-  ui.tip(cleanR, "Remove the level collections none of whose textures the level uses " &
-                 "(their textures stay extracted; add them back in Collections)")
+    var said: seq[string]
+    if names.len > 0: said.add "collections " & names.join(", ")
+    if removedTex.len > 0: said.add "textures " & removedTex.join(", ")
+    if said.len == 0:
+      a.say("Nothing unused: every enabled level collection and every texture applied here is in use")
+    else:
+      a.say("Removed unused " & said.join("; "))
+  ui.tip(cleanR, "Remove the level collections none of whose textures the level uses, and the textures " &
+                 "applied from a collection that no face uses now (they stay in their collections)")
   discard ui.textField("tex.filter", rect(br.x + 8, br.y + 32, max(40'f32, br.w - 276), 26), a.texFilter,
                        "Search name or size...")
   let alphaR = rect(br.x + br.w - 260, br.y + 32, 56, 26)
@@ -5275,32 +5984,42 @@ proc drawTextureBrowser(a: App, br: Rect) =
     break
   var shown: seq[string]
   var shownIn: seq[int]    # Its collection.
+  # Grouped: the collections with a match, in order, and how many each has.
+  # A folded one keeps its heading; a search shows every group open.
+  var groups: seq[int]
+  var groupCount: CountTable[int]
+  proc folded(ci: int): bool =
+    a.texGroup and f.len == 0 and a.texCollections[ci].id in a.texClosed
   # The search also matches sizes: "256" or "128x" (an x stands for ×).
   let fs = f.replace("x", "×")
   for (t, ci) in a.enabledTextures:
     if (f.len == 0 or f in t.toLowerAscii or (fs.len > 0 and fs in a.texSizeText(t))) and
        (not a.texUsedOnly or t in used) and (not a.texAlphaOnly or a.texAlpha.getOrDefault(t)):
-      shown.add t
-      shownIn.add ci
+      if groups.len == 0 or groups[^1] != ci: groups.add ci
+      groupCount.inc ci
+      if not folded(ci):
+        shown.add t
+        shownIn.add ci
   # Where everything goes at a tile size, in the list's own coordinates: a
   # new collection starts a new row under its heading.
   const HeadH = 24'f32
-  proc layout(thumb: float32): (seq[Rect], seq[(float32, string)], float32) =
+  proc layout(thumb: float32): (seq[Rect], seq[(float32, int)], float32) =
     let cell = thumb + 18
     let rowStep = cell + 14
     let cols = max(1, int((list.w - 8) / cell))
     var cells = newSeq[Rect](shown.len)
-    var heads: seq[(float32, string)]
-    var (top, col, lastIn) = (4'f32, 0, -1)
-    for i in 0 ..< shown.len:
-      if a.texGroup and shownIn[i] != lastIn:
+    var heads: seq[(float32, int)]   # (top, collection)
+    var (top, col, i) = (4'f32, 0, 0)
+    for gi in 0 ..< (if a.texGroup: groups.len else: 1):
+      if a.texGroup:
         if col > 0: (top, col) = (top + rowStep, 0)
-        heads.add (top, a.texCollections[shownIn[i]].name)
+        heads.add (top, groups[gi])
         top += HeadH
-        lastIn = shownIn[i]
-      cells[i] = rect(list.x + 6 + col.float32 * cell, top, cell - 6, cell - 6)
-      inc col
-      if col == cols: (top, col) = (top + rowStep, 0)
+      while i < shown.len and (not a.texGroup or shownIn[i] == groups[gi]):
+        cells[i] = rect(list.x + 6 + col.float32 * cell, top, cell - 6, cell - 6)
+        inc col
+        if col == cols: (top, col) = (top + rowStep, 0)
+        inc i
     (cells, heads, top + (if col > 0: rowStep else: 0))
   # Ctrl+wheel over the list zooms the tiles. The texture under the pointer
   # (else the nearest one) stays under it.
@@ -5343,11 +6062,29 @@ proc drawTextureBrowser(a: App, br: Rect) =
         app.geo.retexture(fi, t, app.densityFn))
   # One Tab stop: the arrow keys move through the textures, Space/Enter apply one.
   let listFocused = ui.tabStop("tex.list", list)
-  for (hy, name) in heads:
+  # Group headings: a click folds or unfolds the group.
+  let inList = ui.mouse.inside(list)
+  for (hy, ci) in heads:
     let y = list.y + hy - a.texScroll
     if y + HeadH < list.y or y > list.y + list.h: continue
-    ui.textIn(ui.ellipsize(name, list.w - 16), rect(list.x + 8, y, list.w - 16, HeadH - 4), colAccent, FontSmall)
+    let hr = rect(list.x + 4, y, list.w - 8, HeadH - 4)
+    let hov = inList and ui.hover(hr) and f.len == 0
+    if hov: ui.rect(hr, colHover)
+    let id = a.texCollections[ci].id
+    let name = a.texCollections[ci].name
+    let count = $groupCount[ci]
+    let cw = ui.textSize(count, FontSmall).x
+    ui.foldArrow(not folded(ci), vec2(hr.x + 10, hr.y + hr.h / 2))
+    let nameW = max(0'f32, hr.w - 22 - cw - 16)
+    let shownName = ui.ellipsize(name, nameW, FontSmall)
+    ui.textIn(shownName, rect(hr.x + 22, hr.y, nameW, hr.h), colAccent, FontSmall)
+    let nx = hr.x + 22 + ui.textSize(shownName, FontSmall).x + 8
+    ui.textIn(count, rect(nx, hr.y, cw + 4, hr.h), colTextDim, FontSmall)
     ui.rect(rect(list.x + 8, y + HeadH - 5, list.w - 16, 1), colBorder)
+    if hov and ui.pressed():
+      ui.consumeClick()
+      if id in a.texClosed: a.texClosed.excl id else: a.texClosed.incl id
+    if hov: ui.tip(hr, if folded(ci): "Show this collection's textures" else: "Fold this collection")
   for i, t in shown:
     let r = cells[i]
     let (cx, cy) = (r.x, r.y)
@@ -5386,6 +6123,48 @@ proc drawTextureBrowser(a: App, br: Rect) =
   ui.popClip()
   ui.scrollbar("tex.list", list, a.texScroll, contentH)
 
+proc readTextureSources(a: App, sources: seq[string]) =
+  ## Turns picture file and folder collections into textures, in the
+  ## background (again: they're read anew, as their pictures may have changed).
+  if a.proj == nil: return
+  let app = a
+  let logPath = a.proj.buildDir / "textures.log"
+  proc one(src: string) =
+    a.startLoad("texsource:" & src, "Reading textures from " & src.lastPathPart, proc(): Job =
+      createDir(logPath.parentDir)
+      sourceTexturesJob(app.cfg, @[src], logPath),
+      proc() =
+        app.refreshCollections()
+        let skipped = sourceTexturesDir(src) / "skipped.txt"
+        if fileExists(skipped):
+          app.say("Pictures left out of " & src.lastPathPart & " (they can't be read): " &
+                  readFile(skipped).strip.splitLines.join("; "), true))
+  for src in sources: one(src)
+
+proc addTextureSource*(a: App, path: string) =
+  ## Texture Collections' Add file / Add folder: a picture file or a folder
+  ## of them becomes a collection of this project, enabled.
+  if a.proj == nil or path.len == 0: return
+  let p = a.proj
+  var src = path.absolutePath.normalizedPath
+  if src.len > 1 and src.endsWith(DirSep): src.setLen src.len - 1
+  if dirExists(src):
+    if sourcePictures(src).len == 0:
+      a.say(&"{src} has no pictures (PNG, JPG, BMP, GIF, QOI, PPM, TGA, DDS or TIFF); subfolders aren't read", true)
+      return
+  elif not fileExists(src) or not src.isPictureFile:
+    a.say(src & " isn't a picture Catwalk reads (PNG, JPG, BMP, GIF, QOI, PPM, TGA, DDS or TIFF)", true)
+    return
+  let id = SourcePrefix & src
+  if src notin p.textureSources: p.textureSources.add src
+  if id notin p.textureCollections: p.textureCollections.add id
+  p.save()
+  a.refreshCollections()
+  a.collEnabled = [id].toHashSet
+  a.collAvailable.clear()
+  a.readTextureSources(@[src])
+  a.say("Added the texture collection " & src)
+
 proc drawTextureCollections(a: App, r: Rect) =
   ## TrenchBroom's material collection editor: what's available above, what's
   ## enabled below, in the Texture Browser's order. Double-click moves a row;
@@ -5399,17 +6178,21 @@ proc drawTextureCollections(a: App, r: Rect) =
     -1
   proc enable(ids: seq[string]) =
     var missing: seq[int]
+    var sources: seq[string]
     for id in ids:
       if id in p.textureCollections or rowOf(id) < 0: continue
       p.textureCollections.add id
       let c = a.texCollections[rowOf(id)]
+      if c.level < 0:
+        if not c.ready: sources.add c.source
       # Extracted before the library took levels this way: its classes still join.
-      if not c.ready or (c.level > 0 and libraryBuilt() and c.level notin libraryLevels()):
+      elif not c.ready or (c.level > 0 and libraryBuilt() and c.level notin libraryLevels()):
         missing.add c.level
     p.save()
     a.collAvailable.clear()
     a.thumbsLoaded = false
     if missing.len > 0: a.extractCollections(missing)
+    if sources.len > 0: a.readTextureSources(sources)
   proc disable(ids: seq[string]) =
     p.textureCollections.keepItIf(it notin ids)
     p.save()
@@ -5441,9 +6224,14 @@ proc drawTextureCollections(a: App, r: Rect) =
       let rr = rect(body.x, body.y + i.float32 * rowH - scroll, body.w, rowH)
       let on = cid in pick
       ui.rect(rr, if on: colAccentDim elif ui.hover(rr): colHover else: colPanel)
-      let n = if col.ready: &"{col.textures.len} textures" else: "not extracted yet"
+      let n = if col.level < 0 and a.loading("texsource:" & col.source): "reading..."
+              elif col.level < 0 and not fileExists(col.source) and not dirExists(col.source): "missing"
+              elif col.ready: &"{col.textures.len} textures"
+              elif col.level < 0: "not read yet"
+              else: "not extracted yet"
       ui.textIn(ui.ellipsize(col.name, rr.w * 0.6), rect(rr.x + 10, rr.y, rr.w * 0.6, rowH), colText)
       ui.textIn(n, rect(rr.x + rr.w * 0.6, rr.y, rr.w * 0.4 - 10, rowH), colTextDim, FontSmall, h = RightAlign)
+      if col.level < 0: ui.tip(rr, col.source)
       if ui.hover(rr) and ui.pressed():
         ui.consumeClick()
         let dbl = ui.countClick(id & cid) >= 2
@@ -5458,17 +6246,51 @@ proc drawTextureCollections(a: App, r: Rect) =
     ui.popClip()
     ui.scrollbar(id, body, scroll, contentH)
   const BarH = 34'f32
-  let half = (r.h - 2 * BarH) / 2
+  let fileW = ui.textSize("Add file...").x + 20
+  let dirW = ui.textSize("Add folder...").x + 20
+  let forgetW = ui.textSize("Forget").x + 20
+  # The Available bar's buttons, on two rows when they don't fit on one.
+  let twoRows = 8 + 74 + fileW + 4 + dirW + 4 + forgetW + 8 > r.w
+  let bar1H = if twoRows: BarH + 30 else: BarH
+  let half = (r.h - bar1H - BarH) / 2
   let upper = rect(r.x, r.y, r.w, half)
-  let lower = rect(r.x, r.y + half + BarH, r.w, half)
+  let lower = rect(r.x, r.y + half + bar1H, r.w, half)
   var available: seq[string]
   for c in a.texCollections:
     if c.id notin p.textureCollections: available.add c.id
   list("coll.a.", "Available", upper, available, a.collAvailable, a.collScroll[0],
        proc(ids: seq[string]) = enable(ids))
   let y1 = upper.y + upper.h + 4
-  if ui.textButton("coll.add", rect(r.x + 8, y1, 70, 26), "Add"):
+  var bx = r.x + 8
+  if ui.textButton("coll.add", rect(bx, y1, 70, 26), "Add"):
     enable(a.collAvailable.toSeq)
+  bx += 74
+  var by = y1
+  if twoRows: (bx, by) = (r.x + 8, y1 + 30)
+  # Pictures from outside the game: one file, or every picture in a folder.
+  let fileR = rect(bx, by, fileW, 26)
+  if ui.textButton("coll.addfile", fileR, "Add file...") and a.dialog == nil:
+    a.dialog = startDialog(dkOpenFile, "texsource", "Picture to use as textures", getHomeDir(),
+                           @DirectFormats & @OniSplitFormats, "Pictures")
+  ui.tip(fileR, &"A picture file as a collection of its own: PNG, JPG, BMP, GIF, QOI, PPM, TGA, DDS or TIFF. " &
+                &"Sides become powers of 2, at most {MaxTextureSide}.")
+  bx += fileW + 4
+  let dirR = rect(bx, by, dirW, 26)
+  if ui.textButton("coll.adddir", dirR, "Add folder...") and a.dialog == nil:
+    a.dialog = startDialog(dkOpenDir, "texsource", "Folder of pictures to use as textures", getHomeDir())
+  ui.tip(dirR, "A folder's pictures as a collection (not its subfolders'). Reload reads them again after they change.")
+  bx += dirW + 4
+  var picked: seq[string]   # Selected file and folder collections among the available ones.
+  for id in a.collAvailable:
+    if id.startsWith(SourcePrefix) and id[SourcePrefix.len .. ^1] in p.textureSources: picked.add id[SourcePrefix.len .. ^1]
+  let forgetR = rect(bx, by, forgetW, 26)
+  if ui.textButton("coll.forget", forgetR, "Forget") and picked.len > 0:
+    p.textureSources.keepItIf(it notin picked)
+    p.save()
+    a.collAvailable.clear()
+    a.refreshCollections()
+  ui.tip(forgetR, "Take the selected picture file and folder collections off this list " &
+                  "(textures the level already uses stay)")
   list("coll.e.", "Enabled", lower, p.textureCollections, a.collEnabled, a.collScroll[1],
        proc(ids: seq[string]) = disable(ids))
   let y2 = lower.y + lower.h + 4
@@ -5486,7 +6308,258 @@ proc drawTextureCollections(a: App, r: Rect) =
       if not f.splitFile.name.startsWith("bnv_grid"): a.textures.add f.splitFile.name
     a.textures.sort
     a.refreshCollections()
-  ui.tip(rr, "Read the textures from disk again")
+    # Picture files and folders are read again: their pictures may have changed.
+    var sources: seq[string]
+    for id in p.textureCollections:
+      if id.startsWith(SourcePrefix) and id[SourcePrefix.len .. ^1] in p.textureSources:
+        sources.add id[SourcePrefix.len .. ^1]
+    a.readTextureSources(sources)
+  ui.tip(rr, "Read the textures from disk again, and the pictures of the enabled picture files and folders")
+
+# --- sound browser ---------------------------------------------------------------------------
+
+proc soundCatalog(a: App): Catalog
+
+const SoundObjectGroups = {sgLoop, sgRecording}  ## What a Sound object's Class takes.
+
+proc soundKey(value: string): string =
+  ## A sound value as the Sound Browser compares them: lower case, a recording
+  ## without its pitch.
+  let v = value.strip
+  if v.toLowerAscii.startsWith(RecordingPrefix): recordingValue(splitRecording(v).name, 1).toLowerAscii
+  else: v.toLowerAscii
+
+proc soundUses(a: App): CountTable[string] =
+  ## How often each sound is named by the level's objects (Sound objects,
+  ## neutral characters' speech, lights' sounds) and its music.
+  if a.proj == nil: return
+  let stamp = (a.pushCount, a.undoStack.len, a.redoStack.len, a.proj.music)
+  if stamp != a.soundUsedStamp:
+    a.soundUsedStamp = stamp
+    a.soundUsed.clear()
+    if a.proj.music.len > 0: a.soundUsed.inc a.proj.music.soundKey
+    for o in a.objects:
+      if o.tag notin ["SNDG", "NEUT"] and o.tag notin LightTags: continue
+      for f in o.fields:
+        if f.attr.len > 0 or f.value.strip.len == 0: continue
+        var path = ""   # Without element indexes ("DialogLine[2]").
+        var skip = false
+        for ch in f.path:
+          if ch == '[': skip = true
+          elif ch == ']': skip = false
+          elif not skip: path.add ch
+        let named = o.tag == "SNDG" and path == "OSD/Class" or
+                    o.tag == "NEUT" and path in ["OSD/Speech/Trigger", "OSD/Speech/Abort", "OSD/Speech/Enemy",
+                                                 "OSD/DialogLines/DialogLine/SpeechName"] or
+                    o.tag in LightTags and path == "OSD/Animation/Sound"
+        if named: a.soundUsed.inc f.value.soundKey
+  a.soundUsed
+
+proc soundGroupNote(g: SoundGroup): string =
+  case g
+  of sgLoop: "A looping ambient: a Sound object's Class plays it"
+  of sgMusic: "Music: the Map tab's level music, or BSL sound_music_start"
+  of sgOnce: "An ambient played once (PlayOnce): dialogue, cutscene effects, screams; for speech fields and scripts"
+  of sgImpulse: "An impulse: a one-off sound for impulse fields (hits, lights' flicker) and sound_impulse_play"
+  of sgRecording: "One recording: a Sound object loops it, an impulse field plays it once"
+
+proc previewBrowserSound(a: App, value: string, g: SoundGroup) =
+  ## Plays a Sound Browser row (again: stops it). Impulses and recordings play once.
+  a.previewClassSound(value, g in {sgImpulse, sgRecording})
+
+proc soundPreset(value: string): Preset =
+  Preset(group: "Sound", label: "Sound object (" & value & ")", detail: value, tag: "SNDG",
+         fields: @[("OSD/Class", value)])
+
+proc applySound(a: App, value: string, g: SoundGroup) =
+  ## A Sound Browser click: the selected Sound objects play value (one undo
+  ## step); with none selected, it's only picked.
+  a.soundCurrent = value
+  let sounds = a.selection.filterIt(it.tag == "SNDG")
+  if sounds.len == 0: return
+  if g notin SoundObjectGroups:
+    a.say(value & ": " & soundGroupNote(g).toLowerAscii & ". A Sound object plays looping ambients and recordings.", true)
+    return
+  for f in sounds[0].fields:
+    if f.path == "OSD/Class" and f.attr.len == 0:
+      let before = a.pushCount
+      a.commitFieldAll(sounds, f, value)
+      if a.pushCount != before:
+        a.say(&"Gave {sounds.len} Sound object(s) the sound {value}")
+      return
+
+proc placeSound(a: App, value: string) =
+  if a.proj == nil: return
+  if a.addPreset(soundPreset(value), a.placeAtView) != nil: a.say "Placed a Sound object playing " & value
+
+proc soundTree(a: App, value: string, group: SoundGroup): MenuNode =
+  ## Right click on a Sound Browser row.
+  result = newMenuRoot()
+  let playing = soundPlaying(value)
+  let fits = group in SoundObjectGroups
+  let sounds = a.selection.countIt(it.tag == "SNDG")
+  result.item(if playing: "Stop" else: "Play", action = proc() = a.previewBrowserSound(value, group))
+  result.sep()
+  result.item(if sounds > 1: &"Give the {sounds} selected Sound objects" else: "Give the selected Sound object",
+              enabled = fits and sounds > 0, action = proc() = a.applySound(value, group))
+  result.item("Place a Sound object", enabled = fits and a.proj != nil, action = proc() = a.placeSound(value))
+  result.sep()
+  result.item("Copy name", action = proc() =
+    setClipboardString(value)
+    a.say "Copied " & value)
+  if group != sgImpulse:
+    result.item("Duplicate as new ambient...", enabled = a.proj != nil and not a.busy,
+                action = proc() = a.duplicateAmbient(value))
+  if isProjectAmbient(value):
+    result.item("Edit ambient...", enabled = not a.busy, action = proc() = a.editAmbient(value))
+
+proc drawSoundBrowser(a: App, br: Rect) =
+  ## Every sound the level can name, in folding lists: drag a looping ambient
+  ## or a recording into a view to place a Sound object playing it, click one
+  ## to give it to the selected Sound objects, the play button (or a double
+  ## click) to listen.
+  let ui = a.ui
+  let importW = ui.textSize("Import").x + 20
+  let newW = ui.textSize("New ambient").x + 20
+  let importR = rect(br.x + br.w - importW - 4, br.y + 2, importW, 22)
+  let newR = rect(importR.x - 4 - newW, br.y + 2, newW, 22)
+  ui.sectionTitle(rect(br.x, br.y, br.w, 26),
+                  ui.ellipsize("Drag into a view, or click to give the selected Sound objects",
+                               max(0'f32, newR.x - br.x - 12), FontSmall))
+  if ui.textButton("sound.new", newR, "New ambient") and a.proj != nil and not a.busy: a.newAmbientSound()
+  ui.tip(newR, "Make an ambient sound of this level's own from recordings")
+  if ui.textButton("sound.import", importR, "Import") and a.dialog == nil and a.proj != nil and not a.busy:
+    a.dialog = startDialog(dkOpenFiles, "sounds", "Import sounds", getHomeDir(), @SoundFormats, "Sounds")
+  ui.tip(importR, "Import sound files as recordings of this level (any format ffmpeg reads)")
+  discard ui.textField("sound.filter", rect(br.x + 8, br.y + 32, max(40'f32, br.w - 80), 26), a.soundFilter,
+                       "Search sounds...")
+  let usedR = rect(br.x + br.w - 64, br.y + 32, 56, 26)
+  if ui.textButton("sound.used", usedR, "Used"): a.soundUsedOnly = not a.soundUsedOnly
+  if a.soundUsedOnly: ui.border(usedR, colAccent, 2)
+  ui.tip(usedR, "Only the sounds the level's objects and music use")
+  if a.proj == nil: return
+  let list = rect(br.x, br.y + 64, br.w, max(0'f32, br.h - 64))
+  let now = epochTime()
+  if a.soundListAt == 0 or now - a.soundListAt > 2:
+    a.soundListAt = now
+    a.soundList = a.soundCatalog.soundEntries
+  let used = a.soundUses
+  let filter = a.soundFilter.strip
+  # The current sound: the selected Sound objects' (as the Texture Browser's faces), else the one picked.
+  var current = a.soundCurrent.soundKey
+  for o in a.selection:
+    if o.tag == "SNDG":
+      current = o.soundClass.soundKey
+      break
+  var members: array[SoundGroup, seq[int]]
+  for i, e in a.soundList:
+    if a.soundUsedOnly and used[e.value.soundKey] == 0: continue
+    if matchesFilter(filter, e.value, e.note): members[e.group].add i
+  const HeadH = 24'f32
+  const SoundRowH = 24'f32
+  # Layout first (for the scroll range), drawing below.
+  type Item = tuple[y: float32, group: SoundGroup, entry: int]   # entry -1: the group's header
+  var items: seq[Item]
+  var top = 2'f32
+  for g in SoundGroup:
+    if members[g].len == 0: continue
+    items.add (top, g, -1)
+    top += HeadH + 2
+    if g in a.soundOpen or filter.len > 0:
+      for i in members[g]:
+        items.add (top, g, i)
+        top += SoundRowH
+      top += 4
+  let contentH = top + 8
+  if ui.hover(list) and not ui.scrollConsumed:
+    a.soundScroll += ui.wheelNotches * SoundRowH * 3
+    if ui.wheelNotches != 0: ui.scrollConsumed = true
+  ui.scrollArea("sound.list", list, a.soundScroll)
+  ui.pushClip(list)
+  ui.scrollIntoView(a.soundScroll)
+  a.soundScroll = clamp(a.soundScroll, 0, max(0, contentH - list.h))
+  # One Tab stop: the arrow keys move through headers and sounds, Space/Enter
+  # fold a list or give the sound (as a click).
+  let listFocused = ui.tabStop("sound.list", list)
+  let inList = ui.mouse.inside(list)
+  var nav: seq[Rect]
+  for k, it in items:
+    let y = list.y + it.y - a.soundScroll
+    let rr = rect(list.x + 4, y, list.w - 8, (if it.entry < 0: HeadH else: SoundRowH) - 2)
+    nav.add rr
+    if rr.y + rr.h <= list.y or rr.y >= list.y + list.h: continue
+    let hov = ui.hover(rr) and inList
+    let g = it.group
+    if it.entry < 0:
+      let open = g in a.soundOpen or filter.len > 0
+      ui.rect(rr, if hov: colHover else: colPanelRaised)
+      ui.foldArrow(open, vec2(rr.x + 10, rr.y + rr.h / 2))
+      ui.textIn($g, rect(rr.x + 22, rr.y, rr.w - 22, rr.h), colText, FontSmall)
+      let tw = ui.textSize($g, FontSmall).x
+      ui.textIn($members[g].len, rect(rr.x + 30 + tw, rr.y, rr.w, rr.h), colTextDim, FontSmall)
+      ui.tip(rr, soundGroupNote(g))
+      if hov and ui.pressed() and filter.len == 0:
+        ui.consumeClick()
+        a.soundCursor = k
+        if open: a.soundOpen.excl g else: a.soundOpen.incl g
+      continue
+    let e = a.soundList[it.entry]
+    let key = e.value.soundKey
+    let n = used[key]
+    let on = soundPlaying(e.value)
+    ui.rect(rr, if key == current: colAccentDim elif hov: colHover else: colPanelRaised)
+    if ui.iconButton("sound.play." & e.value, rect(rr.x + 1, rr.y, rr.h, rr.h), if on: "stop16" else: "play16",
+                     if on: "Stop the preview" else: "Listen to it", focusable = false):
+      a.previewBrowserSound(e.value, g)
+    var note = e.note
+    if n > 0: note.add (if note.len > 0: " · " else: "") & $n & "× in level"
+    let nw = if note.len > 0: min(rr.w * 0.45'f32, ui.textSize(note, FontSmall).x + 12) else: 0'f32
+    let tx = rr.x + rr.h + 6
+    ui.textIn(ui.ellipsize(e.value, rr.x + rr.w - nw - tx - 4, FontSmall), rect(tx, rr.y, rr.x + rr.w - nw - tx, rr.h),
+              colText, FontSmall)
+    if note.len > 0:
+      ui.textIn(ui.ellipsize(note, nw - 6, FontSmall), rect(rr.x + rr.w - nw, rr.y, nw - 6, rr.h),
+                if e.note.len > 0: colAccent else: colTextDim, FontSmall, h = RightAlign)
+    ui.tip(rr, e.value & ": " & soundGroupNote(g) & (if e.note.len > 0: " (" & e.note & ")" else: ""))
+    if hov and ui.pressed():
+      ui.consumeClick()
+      a.soundCursor = k
+      a.soundPress = (true, e.value, g, ui.mouse)
+      if a.soundClick.value == e.value and now - a.soundClick.at < 0.4:
+        a.previewBrowserSound(e.value, g)
+        a.soundClick = ("", 0.0)
+      else: a.soundClick = (e.value, now)
+    if hov and ui.pressed(MouseRight):
+      a.soundCursor = k
+      a.ctx = CtxMenu(pos: ui.mouse, view: -1, face: -1, sound: e.value, soundGroup: ord(g))
+      a.ctxPending = true
+    if a.soundPress.on and a.soundPress.value == e.value:
+      if ui.window.buttonDown[MouseLeft] and (ui.mouse - a.soundPress.at).length > 4:
+        # Dragged out of the browser: a Sound object follows the mouse in the views.
+        a.soundPress.on = false
+        if g in SoundObjectGroups: a.startPlacing(soundPreset(e.value))
+        else: a.say(e.value & ": " & soundGroupNote(g).toLowerAscii &
+                    ". Only looping ambients and recordings make Sound objects.", true)
+      elif ui.window.buttonReleased[MouseLeft]:
+        a.soundPress.on = false
+        if hov: a.applySound(e.value, g)
+  # A press that ended without anything (released elsewhere) is over.
+  if not ui.window.buttonDown[MouseLeft]: a.soundPress.on = false
+  if items.len == 0:
+    ui.textIn(if a.soundList.len == 0: "No sounds: level 0 wasn't found in " & a.cfg.gameData
+              elif a.soundUsedOnly and filter.len == 0: "The level's objects use no sound"
+              else: "No sound matches", rect(list.x + 12, list.y + 4, list.w - 24, 22), colTextDim, FontSmall)
+  discard ui.listNav("sound.list", list, nav, a.soundCursor)
+  if listFocused and a.soundCursor in 0 ..< nav.len:
+    ui.cursorRing(nav[a.soundCursor])
+    if ui.navActivate("sound.list"):
+      let it = items[a.soundCursor]
+      if it.entry < 0:
+        if filter.len == 0:
+          if it.group in a.soundOpen: a.soundOpen.excl it.group else: a.soundOpen.incl it.group
+      else: a.applySound(a.soundList[it.entry].value, it.group)
+  ui.popClip()
+  ui.scrollbar("sound.list", list, a.soundScroll, contentH)
 
 # --- inspector: files ---------------------------------------------------------------------
 
@@ -5861,17 +6934,82 @@ proc drawIssues(a: App, body: Rect) =
 
 # --- dock ------------------------------------------------------------------------------------
 
+const
+  LockableTabs = {pkProperties, pkClasses}  ## Tabs with a lock: they stop following the selection.
+  TabLockW = 18'f32                         ## The room the lock takes in such a tab.
+
 proc tabRects(a: App, n: DockNode): seq[Rect] =
-  ## The tabs of a panel stack, as its tab bar draws them.
+  ## The tabs of a panel stack, as its tab bar draws them. When they don't fit,
+  ## the widest give up room first, so every tab stays in sight (its label cut short).
+  var widths: seq[float32]
+  for t in n.tabs: widths.add a.ui.textSize($t).x + 20 + (if t in LockableTabs: TabLockW else: 0)
+  let room = n.r.w - 12
+  var total = 0'f32
+  for w in widths: total += w
+  if total > room and widths.len > 0:
+    var order = toSeq(0 ..< widths.len)
+    order.sort(proc(i, j: int): int = cmp(widths[i], widths[j]))
+    var left = room
+    for k, i in order:
+      let lock = if n.tabs[i] in LockableTabs: TabLockW else: 0'f32
+      widths[i] = max(min(widths[i], left / float32(order.len - k)), lock + 24)
+      left -= widths[i]
   var x = n.r.x + 6
-  for t in n.tabs:
-    let w = a.ui.textSize($t).x + 20
+  for w in widths:
     result.add rect(x, n.r.y, w, DockTabH)
     x += w
 
+proc propsPage(a: App): PropsLock =
+  ## What Properties shows now (its lock keeps that): a group picked in the
+  ## Map tab, objects or the level; kind plNone for faces and vertex handles,
+  ## which can't be locked.
+  if a.propsLock.kind != plNone: return a.propsLock
+  let g = a.pickedGroup
+  if g != 0: return PropsLock(kind: plGroup, group: g)
+  if a.geo != nil and a.tool in {toolVertex, toolEdge, toolFace} and a.selHandles.len > 0: return
+  let sel = a.selection
+  if sel.len > 0: return PropsLock(kind: plObjects, objs: sel)
+  if a.geo != nil and a.selectedFaceSet.len > 0: return
+  PropsLock(kind: plLevel)
+
+proc tabLocked(a: App, t: PanelKind): bool =
+  if t == pkProperties: a.propsLock.kind != plNone else: a.classLock
+
+proc toggleTabLock(a: App, t: PanelKind) =
+  ## The lock on a Properties or Classes tab. Unlocked, the panel shows the
+  ## selection again (the Classes page follows the selected object's class).
+  if t == pkProperties:
+    if a.propsLock.kind != plNone:
+      a.propsLock = PropsLock()
+      a.propsScroll = 0
+    else:
+      a.propsLock = a.propsPage
+  else:
+    a.classLock = not a.classLock
+    if a.classLock: a.classLockFollow = nil
+    else: a.classFor = nil   # The selection's class opens again (classFollows).
+
+proc tabLockTip(a: App, t: PanelKind): string =
+  if t == pkProperties:
+    case a.propsLock.kind
+    of plNone:
+      if a.propsPage.kind == plNone: "Lock: keep showing what's selected (objects, a group or the level; " &
+                                     "not faces or vertices) whatever you select next"
+      else: "Lock: keep showing what's selected now, whatever you select next"
+    of plObjects: "Locked on " & (if a.propsLock.objs.len == 1: typeName(a.propsLock.objs[0].tag) & " #" &
+                                    $a.propsLock.objs[0].id
+                                  else: $a.propsLock.objs.len & " objects") &
+                  ": click to show the selection again"
+    of plGroup: "Locked on group " & a.groupName(a.propsLock.group) & ": click to show the selection again"
+    of plLevel: "Locked on the level: click to show the selection again"
+  elif a.classLock: "Locked on " & a.className.classLabel & ": click to follow the selected object's class again"
+  else: "Lock: keep this class open whatever you select next"
+
 proc dockTabBar(a: App, n: DockNode) =
   ## A stack's tabs: click one to bring it to the front, drag one to move the
-  ## panel. One Tab stop; Left/Right switch tabs while it has keyboard focus.
+  ## panel, right click the bar to add a panel to it. Properties and Classes
+  ## tabs have a lock. One Tab stop; Left/Right switch tabs while it has
+  ## keyboard focus.
   let ui = a.ui
   let bar = rect(n.r.x, n.r.y, n.r.w, DockTabH)
   ui.rect(bar, colPanel)
@@ -5883,15 +7021,30 @@ proc dockTabBar(a: App, n: DockNode) =
     let t = n.tabs[k]
     let sel = n.active == k
     let moving = a.dockDragging and a.dockPress.kind == t
+    var label = tr
+    if t in LockableTabs:
+      label = rect(tr.x, tr.y, tr.w - TabLockW, tr.h)
+      let lr = rect(tr.x + tr.w - TabLockW - 6, tr.y + (tr.h - 22) / 2, 22, 22)
+      let locked = a.tabLocked(t)
+      let can = locked or t == pkProperties and a.propsPage.kind != plNone or
+                t == pkClasses and a.className.len > 0
+      if ui.iconButton("dock.lock." & $t, lr, if locked: "lock16" else: "unlock16", a.tabLockTip(t),
+                       enabled = can and not a.dockDragging, toggled = locked, focusable = false):
+        a.toggleTabLock(t)
     if ui.hover(tr) and ui.pressed():
       n.active = k
       ui.navId = id
       a.dockPress = (true, t, ui.mouse)
       ui.consumeClick()
-    ui.textIn($t, tr, if moving: colTextDisabled elif sel: colText else: colTextDim, h = CenterAlign)
+    let shown = ui.ellipsize($t, label.w - 12)
+    ui.textIn(shown, label, if moving: colTextDisabled elif sel: colText else: colTextDim, h = CenterAlign)
+    if shown != $t: ui.tip(label, $t)
     if sel: ui.rect(rect(tr.x + 4, tr.y + tr.h - 2, tr.w - 8, 2), colAccent)
     if sel and focused: ui.cursorRing(rect(tr.x + 1, tr.y + 2, tr.w - 2, tr.h - 4))
   ui.rect(rect(bar.x, bar.y + bar.h - 1, bar.w, 1), colBorder)
+  if ui.hover(bar) and ui.pressed(MouseRight) and not a.dockDragging:
+    a.ctx = CtxMenu(pos: ui.mouse, view: -1, face: -1, dockLeaf: n)
+    a.ctxPending = true
 
 proc dockTarget(a: App, area: Rect): (DockNode, DockZone, int) =
   ## Where the dragged tab would go if released now: a stack's tabs (at an
@@ -5959,6 +7112,7 @@ proc drawDockNode(a: App, n: DockNode) =
   of pkEntityBrowser: a.drawEntityBrowser(body)
   of pkTextureBrowser: a.drawTextureBrowser(body)
   of pkTextureCollections: a.drawTextureCollections(body)
+  of pkSoundBrowser: a.drawSoundBrowser(body)
   of pkConsole: a.drawConsole(body)
   of pkIssues: a.drawIssues(body)
   of pkScripts: a.drawScripts(body)
@@ -5980,6 +7134,17 @@ proc drawPanels*(a: App, area: Rect) =
   ## them, over a side of a stack or of the whole layout it splits that.
   let ui = a.ui
   if a.dockDragging: ui.captured = true   # Nothing under the drag reacts.
+  let sel = a.selection
+  if sel != a.tabSelSeen:
+    a.tabSelSeen = sel
+    # Objects none of which has a class the Classes page can show: when Classes
+    # shares a stack with Properties, Properties comes to the front (not while
+    # Classes is locked, which keeps it on its class).
+    if sel.len > 0 and not a.classLock and not sel.anyIt(it.tag in ["CHAR", "PART"]):
+      let l = a.dock.leafOf(pkClasses)
+      if l != nil and l.activeTab == pkClasses and pkProperties in l.tabs:
+        l.active = l.tabs.find(pkProperties)
+  a.classFollows()
   a.drawDockNode(a.dock)
   if a.ambientEdit == nil: a.drawFieldDrop()   # Over every panel: Properties and Classes both have such fields.
   a.drawScriptPopups()
@@ -6050,6 +7215,21 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
   if w.shiftDown: held.incl 's'
   if w.alt: held.incl 'a'
   if held == {}: return
+  if a.overScriptEditor:
+    # The Scripts panel's editor: its own gestures, not the views'.
+    if held == {'c'}:
+      result.add @[("LMB", "Declaration: list its uses"), ("LMB", "Use: go to its declaration"),
+                   ("LMB", "Object name: select it"), ("Wheel", "Text size")]
+      result.add @[("D", "Select the next occurrence too"), ("T", "Swap the selections' texts")]
+    elif held == {'s'}:
+      result.add @[("F12", "List the uses of the name at the cursor")]
+    elif held == {'c', 's'}:
+      result.add @[("D", "Duplicate the cursors' lines"), ("Up/Down", "Move the cursors' lines up / down")]
+    elif held == {'a'}:
+      result.add @[("LMB", "Add a cursor"), ("Drag", "Add a selection")]
+    elif held == {'c', 'a'}:
+      result.add @[("Up/Down", "Add a cursor above / below")]
+    return
   let vi = if a.hoverView >= 0: a.hoverView else: a.activeView
   let in3D = vi >= 0 and a.views[vi].cam.kind == vk3D
   let noTool = a.tool == toolSelect
@@ -6074,8 +7254,10 @@ proc modifierHints(a: App): seq[seq[KeyHint]] =
   elif held == {'s'}:
     if drawing: mouse = @[("Drag", "Square " & ($a.shape).toLowerAscii)]
     elif moving: mouse = @[("Drag", "Lock to one axis")]
+    elif a.drag.kind == dkScaleObj: mouse = @[("Drag", "Scale along all three axes")]
     else:
       mouse = @[("LMB", "Select face"), ("Dbl", "Select all faces of a piece")]
+      if a.objScaleShown: mouse.add ("Drag", "Furniture gizmo handle: scale all three axes")
       if noTool and pieces: mouse.add ("Drag", "Selected brush's face: extrude")
       if noTool and a.selFaces.len > 0 and not a.hasNodeSelection: mouse.add ("Drag", "Paint select faces")
       if a.tool == toolBrush and in3D: mouse.add ("Drag", "On the polygon: raise it into a brush")
@@ -6216,7 +7398,7 @@ proc drawStatus*(a: App) =
   let r = rect(0, ui.size.y - StatusHeight, ui.size.x, StatusHeight)
   # Holding a modifier shows what it does instead of the status.
   if a.window.focused and a.proj != nil and not a.menuSys.isOpen and not a.modalOpen and
-     ui.focusId.len == 0:
+     (ui.focusId.len == 0 or ui.focusId == "scripts.edit"):
     let hints = a.modifierHints()
     if hints.len > 0:
       a.keyHintBar(r, hints)
@@ -6391,7 +7573,7 @@ proc drawWelcome*(a: App, area: Rect) =
 
   # From scratch: a floor and a player start, like a new map in TrenchBroom.
   if ui.radioButton("welcome.scratch", vec2(rx, ly), "From scratch", a.newKind == nkScratch): pick(nkScratch)
-  ui.text("A floor and a player start. Textures come from the levels you pick.",
+  ui.text("A floor and a player start. Textures come from the levels you pick, or later.",
           vec2(ix, ly + 24), colTextDim, FontSmall)
   ly += 48
   let tw = floor((iw - 6) * 0.55)
@@ -6399,12 +7581,16 @@ proc drawWelcome*(a: App, area: Rect) =
   ui.text("Textures from", vec2(ix, ly), colTextDim, FontSmall)
   ui.text("Sky", vec2(ix + tw + 6, ly), colTextDim, FontSmall)
   if a.newTexLevel > 0 and levels.len > 0 and a.newTexLevel notin levels: a.newTexLevel = 0
-  var texItems = @["All game levels"]
+  # None: an untextured floor; textures come later from Texture Collections
+  # (game levels, picture files, folders).
+  var texItems = @["All game levels", "None (add them later)"]
   for n in levels: texItems.add "Level " & $n
-  let texLabel = if a.newTexLevel > 0: "Level " & $a.newTexLevel else: texItems[0]
+  let texLabel = if a.newTexLevel > 0: "Level " & $a.newTexLevel elif a.newTexLevel < 0: texItems[1]
+                 else: texItems[0]
   let ti = a.dropdown("welcome.tex", rect(ix, ly + 18, tw, 28), texLabel, texItems)
   if ti == 0: a.newTexLevel = 0
-  elif ti > 0: a.newTexLevel = levels[ti - 1]
+  elif ti == 1: a.newTexLevel = -1
+  elif ti > 1: a.newTexLevel = levels[ti - 2]
   var skyItems = @["None"]
   for s in Skies: skyItems.add s
   let si = a.dropdown("welcome.sky", rect(ix + tw + 6, ly + 18, sw, 28),
@@ -6569,6 +7755,8 @@ proc drawSettings*(a: App) =
     y += 32
     section("Grid")
     discard sliderRow("grid", "Opacity", e.gridOpacity, 0, 1, 0.01, pct(e.gridOpacity))
+    discard sliderRow("gridthick", "Thickness", e.gridThickness, MinGridThickness, MaxGridThickness, 0.5,
+                      &"{e.gridThickness:.1f}")
     ui.textIn("Color", rect(x, y, LabelW, 26), colText)
     if ui.focusId != GridColorId and not pickerOpen(GridColorId):
       a.fieldText[GridColorId] = fmtRgb(e.gridColor)
@@ -6670,7 +7858,13 @@ proc drawSettings*(a: App) =
 proc drawNamePrompt*(a: App) =
   ## The group name prompt: Enter or OK runs it with the name, Esc or Cancel
   ## doesn't. An empty name does nothing (TrenchBroom's queryGroupName).
-  if a.namePrompt == nil: return
+  if a.namePrompt == nil:
+    # The keyboard goes back a frame after closing: the prompt runs before the
+    # panels, so the Enter or Esc that closed it would reach them too.
+    if a.namePromptBack.len > 0:
+      a.ui.focusId = a.namePromptBack
+      a.namePromptBack = ""
+    return
   let ui = a.ui
   let firstStop = ui.tabStops.len
   ui.sk.pushLayer(PopupsLayer)

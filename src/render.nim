@@ -17,7 +17,7 @@ type
     pos: Vec3
     uv: Vec2
     col: array[4, uint8]
-    nrm: Vec3                      ## Face normal (level geometry only; picks the grid's plane).
+    nrm: Vec3                      ## Face normal (level geometry: picks the grid's plane); models: vertex normal.
     untint: array[4, uint8]        ## Face.untint (255 minus the tint; zero = none): Unlit shows the tint.
 
   DrawRange = object
@@ -50,26 +50,39 @@ type
     layer: Layer
     index, face, corner: int32
 
+  FogLook* = object
+    ## Oni's fog as its OpenGL renderer applies it: linear in the projected
+    ## depth z (its gluPerspective-style projection, near plane 2), from start
+    ## to end (Bungie's gl_engine.c, glFogf with z scaled by 65535).
+    on*: bool
+    color*: Vec3
+    start*, finish*, near*, far*: float32
+
   Renderer* = ref object
     levelProg, flatProg: GLuint
     uLevelMvp, uLevelTex, uLevelUseTex, uLevelLight, uLevelTint, uLevelAlphaTest: GLint
-    uLevelGrid, uLevelGridSize, uLevelGridColor, uLevelGridAlpha, uLevelBrightness: GLint
+    uLevelGrid, uLevelGridSize, uLevelGridColor, uLevelGridAlpha, uLevelGridThickness, uLevelBrightness: GLint
     uLevelSkyBlend, uLevelSkyTint, uLevelSkyGain: GLint
     skyPass: bool                  ## drawMesh is drawing the sky.
+    fog*: FogLook                  ## Realtime preview's fog (setFog); off unless shown.
+    fogNow: bool                   ## The draws being made now take it (level, models, particles).
+    uLevelFog, uLevelFogColor, uLevelFogParams, uSpriteFog, uSpriteFogColor, uSpriteFogParams: GLint
     uLevelFacing, uLevelViewDir: GLint
+    uOniLit, uNormalMat, uOniDir, uOniColor, uOniAmbient: GLint
     uFlatMvp: GLint
     layers: array[Layer, MeshLayer]
     models: Table[string, MeshLayer]   ## Model path -> uploaded mesh (empty if unreadable).
     modelInstances*: seq[ModelInstance]  ## Per frame: models to draw.
     textures: Table[string, (GLuint, bool)]   ## path -> (texture, has alpha)
     brightTextures: Table[string, bool]       ## path -> TrenchBroom's "bright material" test
+    textureLumas: Table[string, float32]      ## path -> luma of its average color (0..1)
     modelTextures: seq[string]     ## Texture paths the uploaded models use.
     dynVao, dynVbo: GLuint
     lines*: seq[FlatVert]          ## Depth-tested lines (object boxes).
     tris*: seq[FlatVert]           ## Translucent fills (selection), no depth write.
     overlayTris*: seq[FlatVert]    ## Fills drawn on top (tool feedback), under overlayLines.
     overlayLines*: seq[FlatVert]   ## Drawn on top (selection outlines, tool feedback).
-    gridLines*: seq[FlatVert]      ## Per 2D view; drawn behind everything.
+    gridLines*: seq[FlatVert]      ## Per 2D view, as triangles (lines with a width); drawn behind everything.
     fullbright: bool               ## Vertex colors ignored (set per view from its RenderMode).
     showTint: bool                 ## With fullbright: faces in their tint instead of white (Unlit).
     uLevelShowTint: GLint
@@ -84,6 +97,7 @@ type
     liveShown: bool                ## The animated colors are on the GPU (not the baked ones).
     grid3D*: float32               ## Grid size drawn on 3D faces; 0 = hidden.
     gridAlpha*: float32            ## Opacity of the 3D grid lines (render/Grid/Alpha).
+    gridThickness*: float32        ## Grid line width in pixels, 2D and 3D views.
     brightness*: float32           ## Multiplies the 3D view's colors (render/Brightness).
     linearFilter: bool             ## Textures' current filter (setTextureFilter).
     geometryVersion*: int          ## Geometry.version last uploaded.
@@ -103,6 +117,8 @@ type
     cavityProg, cavityVao, cavityFbo, cavityDepth: GLuint
     cavitySize: (int32, int32)     ## cavityDepth's size.
     uCavityDepth, uCavityOrigin, uCavityPixel, uCavityProj, uCavityNearFar: GLint
+    uvProg, uvVao, uvVbo: GLuint   ## The Face tab's UV view (drawUvTexture); made on first use.
+    uUvTex, uUvBrightness, uUvBack: GLint
 
   DirArrow* = object
     ## An entity's direction, in the translation gizmo's arrow shape (sized per view).
@@ -131,6 +147,7 @@ type
     col*: array[4, uint8]
     tex*: string                   ## TGA path.
     additive*, flare*: bool        ## Added to what's behind; drawn over the level (lens flare).
+    sky*: bool                     ## DrawAsSky: never fogged, like the sky.
     edgeFade*, oneSided*: bool     ## Fades out seen edge-on, between edgeMin and edgeMax.
     edgeMin*, edgeMax*: float32
 
@@ -142,6 +159,7 @@ type
     tex*: string                   ## TGA path.
     additive*: bool
     wrap*: bool                    ## Its texture repeats (models); contrails clamp like sprites.
+    sky*: bool                     ## DrawAsSky: never fogged.
 
   SpriteVert = object
     pos: Vec3
@@ -170,17 +188,33 @@ layout(location = 2) in vec4 aCol;
 layout(location = 3) in vec3 aNrm;
 layout(location = 4) in vec4 aUntint;
 uniform mat4 uMvp;
+uniform int uOniLit;        // Models: lit per vertex as Oni lights them (thumbs.nim, oniShade).
+uniform mat3 uNormalMat;    // Their normals to world space.
+uniform vec3 uOniDir[2];    // Toward each light.
+uniform float uOniColor[2];
+uniform float uOniAmbient;
 out vec2 vUv;
 out vec4 vCol;
 out vec3 vTint;
 out vec3 vPos;
+out float vDepth;
 // flat: interpolating a 45-degree face's normal flips the grid's plane
 // choice (a.x vs a.z) from pixel to pixel.
 flat out vec3 vNrm;
 void main() {
   gl_Position = uMvp * vec4(aPos, 1.0);
+  vDepth = gl_Position.w;   // Distance along the view (perspective w).
   vUv = aUv;
   vCol = aCol;
+  if (uOniLit == 1) {
+    vec3 n = uNormalMat * aNrm;
+    float s = uOniAmbient;
+    if (dot(n, n) > 1e-12) {
+      n = normalize(n);
+      for (int i = 0; i < 2; i++) s += max(dot(n, uOniDir[i]), 0.0) * uOniColor[i];
+    }
+    vCol.rgb *= floor(min(s * 255.0, 255.0) + 0.5) / 255.0;
+  }
   vTint = 1.0 - aUntint.rgb;
   vPos = aPos;
   vNrm = aNrm;
@@ -192,6 +226,7 @@ in vec2 vUv;
 in vec4 vCol;
 in vec3 vTint;
 in vec3 vPos;
+in float vDepth;
 flat in vec3 vNrm;
 uniform sampler2D uTex;
 uniform int uUseTex;
@@ -204,57 +239,78 @@ uniform int uGrid;
 uniform float uGridSize;
 uniform vec3 uGridColor;
 uniform float uGridAlpha;   // TrenchBroom's render/Grid/Alpha (default 0.5).
+uniform float uGridThickness; // Line width in pixels.
 uniform float uBrightness;  // TrenchBroom's render/Brightness.
 uniform int uFacing;        // Solid mode: each face's brightness follows its angle to the view.
 uniform vec3 uViewDir;
 uniform int uSkyBlend;      // The sky's blend mode (skygrade.nim), -1 for anything else.
 uniform vec3 uSkyTint;
 uniform float uSkyGain;
+uniform int uFog;           // Realtime preview's fog, as Oni draws it (FogLook).
+uniform vec3 uFogColor;
+uniform vec4 uFogParams;    // Start, end (projected depth), Oni's near and far planes.
+
+float oniFog(float d) {
+  // How much of the color stays: Oni's projected z at view depth d, then
+  // OpenGL's linear fog between start and end.
+  float n = uFogParams.z;
+  float f = uFogParams.w;
+  float z = (f + n) / (f - n) - 2.0 * f * n / ((f - n) * max(d, 1e-4));
+  float s = uFogParams.x;
+  float e = uFogParams.y;
+  if (e <= s) return z < e ? 1.0 : 0.0;
+  return clamp((e - z) / (e - s), 0.0, 1.0);
+}
 out vec4 fragColor;
 
-// The 3D face grid of TrenchBroom 2025.4 (Face.fragsh + Grid.fragsh), with
-// master's line width cap (see grid()): a major line every 64 units, and finer grids fading into the next coarser one
-// where they would alias.
+// The 3D face grid, after TrenchBroom 2025.4 (Face.fragsh + Grid.fragsh): a major
+// line every 64 units, and finer grids fading into the next coarser one. Unlike
+// TrenchBroom, the lines are uGridThickness pixels wide at any distance (as in the
+// 2D views), fully opaque across that width with a one-pixel antialiased edge.
+// TrenchBroom's lines (2 pixels with a wider soft edge) never reached full strength
+// up close, and stayed 2 pixels while the grid shrank to 4 pixels far away, so the
+// lines covered the faces there. Here a grid step is only drawn while its lines stay
+// at least GridMinSpacing line widths apart on screen; finer ones fade out.
 
-float softStripes(float value, float ratio, float stripeSize) {
-  float mainVal = value * ratio;
-  float edge = fwidth(value) * ratio * 2.0;
-  float mValue = 1.0 / (64.0 * ratio);
-  float triMajor = abs(2.0 * fract(mainVal * mValue) - 1.0);
-  float isMajor = step(1.0 - mValue, triMajor);
-  float intensity = isMajor * 0.7 + 0.85;
-  float triangle = abs(2.0 * fract(mainVal) - 1.0);
-  return smoothstep(stripeSize - edge, stripeSize + edge, triangle) * intensity;
+const float GridMinSpacing = 8.0;   // Grid step at least this many line widths on screen.
+
+float gridAxis(float v, float g, float cell, float w) {
+  // Coverage of the lines of one axis: v the world coordinate, g the world units per
+  // pixel across those lines, cell the grid step, w the line width in pixels.
+  float dist = abs(fract(v / cell + 0.5) - 0.5) * cell / max(g, 1e-6);
+  float wide = max(w, 1.0);
+  float cover = clamp(wide * 0.5 + 0.5 - dist, 0.0, 1.0) * min(w, 1.0);
+  // A major line where the nearest line falls on a multiple of 64.
+  float isMajor = step(abs(fract(v / 64.0 + 0.5) - 0.5) * 64.0, cell * 0.5);
+  return cover * (isMajor * 0.7 + 0.85);
 }
 
-float gridLines(vec2 c, float ratio, float ratio2, float lineWidth, float blend) {
-  float s = 1.0 - lineWidth * ratio;
-  float s2 = 1.0 - lineWidth * ratio2;
-  float g = max(softStripes(c.x, ratio, s), softStripes(c.y, ratio, s));
-  float g2 = max(softStripes(c.x, ratio2, s2), softStripes(c.y, ratio2, s2));
-  return mix(g, g2, blend) * 0.5;
+float gridLevel(vec2 c, vec2 g, float cell, float w) {
+  return max(gridAxis(c.x, g.x, cell, w), gridAxis(c.y, g.y, cell, w));
 }
+
+// Normals closer than this count as a tie when picking the grid's plane (about 0.3
+// degrees either side of 45). A wall at exactly 45 degrees has |x| == |z|, and float
+// noise in each face's normal flipped the choice from face to face, so the lines
+// jumped between the pieces of one wall. Noise reaches ~0.004 on sliver triangles;
+// 1e-2 left no touching coplanar faces disagreeing in any project (tmp/gridtie).
+const float GridAxisTie = 1e-2;
 
 float grid(vec3 p, vec3 n) {
-  float pixelWorld = max(length(dFdx(p)), length(dFdy(p)));
-  float minGridSize = 2.0 * pixelWorld;
-  // 2025.4 draws lines a fixed 0.5 units wide, which is a few pixels at Quake
-  // scale but several times that at Oni's (the camera sits much closer in
-  // world units). TrenchBroom master caps the width at a constant on-screen
-  // size (Face.fragsh lineWidthFactor); that cap keeps lines as thin as
-  // TrenchBroom's.
-  float lineWidthFactor = min(4.0 * pixelWorld, 1.0);
-  float lineWidth = (uGridSize < 1.0 ? 1.0 / 32.0 : (uGridSize < 4.0 ? 0.25 : 0.5)) * lineWidthFactor;
-  float minToRender = minGridSize * 2.0;
+  vec3 a = abs(n);
+  vec2 c;
+  // TrenchBroom's order; a tie goes to the later axis, as an exact tie does there.
+  if (a.x > a.y + GridAxisTie) c = a.x > a.z + GridAxisTie ? p.yz : p.xy;
+  else c = a.y > a.z + GridAxisTie ? p.xz : p.xy;
+  // World units per screen pixel across each axis's lines.
+  vec2 g = vec2(length(vec2(dFdx(c.x), dFdy(c.x))), length(vec2(dFdx(c.y), dFdy(c.y))));
+  float w = uGridThickness;
+  float minToRender = max(g.x, g.y) * GridMinSpacing * max(w, 1.0);
   float base = exp2(floor(log2(minToRender)));
   if (uGridSize > base) base = uGridSize;
   float next = 2.0 * base;
   float blend = smoothstep(base, next, minToRender);
-  vec3 a = abs(n);
-  vec2 c;
-  if (a.x > a.y) c = a.x > a.z ? p.yz : p.xy;
-  else c = a.y > a.z ? p.xz : p.xy;
-  return gridLines(c, 1.0 / base, 1.0 / next, lineWidth, blend);
+  return mix(gridLevel(c, g, base, w), gridLevel(c, g, next, w), blend) * 0.5;
 }
 
 vec3 skyGrade(vec3 c) {
@@ -279,6 +335,7 @@ void main() {
   if (uSkyBlend >= 0) fragColor.rgb = skyGrade(fragColor.rgb);
   if (uFacing == 1)
     fragColor.rgb *= mix(0.3, 0.9, abs(dot(vNrm, uViewDir)));
+  if (uFog == 1) fragColor.rgb = mix(uFogColor, fragColor.rgb, oniFog(vDepth));
   if (uGrid == 1)
     fragColor.rgb = mix(fragColor.rgb, uGridColor, grid(vPos, vNrm) * uGridAlpha);
 }
@@ -291,8 +348,10 @@ layout(location = 2) in vec4 aCol;
 uniform mat4 uMvp;
 out vec2 vUv;
 out vec4 vCol;
+out float vDepth;
 void main() {
   gl_Position = uMvp * vec4(aPos, 1.0);
+  vDepth = gl_Position.w;
   vUv = aUv;
   vCol = aCol;
 }
@@ -301,9 +360,30 @@ void main() {
 #version 410 core
 in vec2 vUv;
 in vec4 vCol;
+in float vDepth;
 uniform sampler2D uTex;
+uniform int uFog;           // Realtime preview's fog, as Oni draws it (FogLook).
+uniform vec3 uFogColor;
+uniform vec4 uFogParams;    // Start, end (projected depth), Oni's near and far planes.
+
+float oniFog(float d) {
+  // How much of the color stays: Oni's projected z at view depth d, then
+  // OpenGL's linear fog between start and end.
+  float n = uFogParams.z;
+  float f = uFogParams.w;
+  float z = (f + n) / (f - n) - 2.0 * f * n / ((f - n) * max(d, 1e-4));
+  float s = uFogParams.x;
+  float e = uFogParams.y;
+  if (e <= s) return z < e ? 1.0 : 0.0;
+  return clamp((e - z) / (e - s), 0.0, 1.0);
+}
 out vec4 fragColor;
-void main() { fragColor = texture(uTex, vUv) * vCol; }
+void main() {
+  fragColor = texture(uTex, vUv) * vCol;
+  // As fixed-function fog: the color only. Additive textures are never fogged
+  // (drawSprites turns it off for them, as Oni does).
+  if (uFog == 1) fragColor.rgb = mix(uFogColor, fragColor.rgb, oniFog(vDepth));
+}
 """
   cavityVs = """
 #version 410 core
@@ -400,6 +480,33 @@ out vec4 fragColor;
 void main() { fragColor = vCol; }
 """
 
+  uvVs = """
+#version 410 core
+// The Face tab's UV view: one quad over the view, its corners' UVs from the
+// face's mapping (affine, so interpolating them is exact).
+layout(location = 0) in vec2 aPos;
+layout(location = 1) in vec2 aUv;
+out vec2 vUv;
+void main() {
+  gl_Position = vec4(aPos, 0.0, 1.0);
+  vUv = aUv;
+}
+"""
+  uvFs = """
+#version 410 core
+uniform sampler2D uTex;
+uniform float uBrightness;
+uniform vec3 uBack;
+in vec2 vUv;
+out vec4 fragColor;
+void main() {
+  vec4 t = texture(uTex, vUv);
+  // Unlit, as the level shader draws textures (see levelFs), over the view's
+  // background where the texture is see-through.
+  fragColor = vec4(mix(uBack, min(t.rgb * uBrightness, vec3(1.0)), t.a), 1.0);
+}
+"""
+
 proc compile(kind: GLenum, src: string): GLuint =
   result = glCreateShader(kind)
   var s = src.cstring
@@ -423,7 +530,7 @@ proc textured*(m: RenderMode): bool = m in {rmDynamicLight, rmUnlit}
 proc wireframe*(m: RenderMode): bool = m in {rmWireframe, rmLitWireframe}
 
 proc newRenderer*(): Renderer =
-  result = Renderer(geometryVersion: -1, gridAlpha: 0.5, brightness: 1, linearFilter: true,
+  result = Renderer(geometryVersion: -1, gridAlpha: 0.5, gridThickness: 1, brightness: 1, linearFilter: true,
                     showTriangles: true, gridColor: vec3(1, 1, 1))
   result.levelProg = link(levelVs, levelFs)
   result.uLevelMvp = glGetUniformLocation(result.levelProg, "uMvp")
@@ -438,17 +545,29 @@ proc newRenderer*(): Renderer =
   result.uLevelGridSize = glGetUniformLocation(result.levelProg, "uGridSize")
   result.uLevelGridColor = glGetUniformLocation(result.levelProg, "uGridColor")
   result.uLevelGridAlpha = glGetUniformLocation(result.levelProg, "uGridAlpha")
+  result.uLevelGridThickness = glGetUniformLocation(result.levelProg, "uGridThickness")
   result.uLevelBrightness = glGetUniformLocation(result.levelProg, "uBrightness")
   result.uLevelSkyBlend = glGetUniformLocation(result.levelProg, "uSkyBlend")
   result.uLevelSkyTint = glGetUniformLocation(result.levelProg, "uSkyTint")
   result.uLevelSkyGain = glGetUniformLocation(result.levelProg, "uSkyGain")
   result.uLevelFacing = glGetUniformLocation(result.levelProg, "uFacing")
   result.uLevelViewDir = glGetUniformLocation(result.levelProg, "uViewDir")
+  result.uOniLit = glGetUniformLocation(result.levelProg, "uOniLit")
+  result.uNormalMat = glGetUniformLocation(result.levelProg, "uNormalMat")
+  result.uOniDir = glGetUniformLocation(result.levelProg, "uOniDir")
+  result.uOniColor = glGetUniformLocation(result.levelProg, "uOniColor")
+  result.uOniAmbient = glGetUniformLocation(result.levelProg, "uOniAmbient")
+  result.uLevelFog = glGetUniformLocation(result.levelProg, "uFog")
+  result.uLevelFogColor = glGetUniformLocation(result.levelProg, "uFogColor")
+  result.uLevelFogParams = glGetUniformLocation(result.levelProg, "uFogParams")
   result.flatProg = link(flatVs, flatFs)
   result.uFlatMvp = glGetUniformLocation(result.flatProg, "uMvp")
   result.spriteProg = link(spriteVs, spriteFs)
   result.uSpriteMvp = glGetUniformLocation(result.spriteProg, "uMvp")
   result.uSpriteTex = glGetUniformLocation(result.spriteProg, "uTex")
+  result.uSpriteFog = glGetUniformLocation(result.spriteProg, "uFog")
+  result.uSpriteFogColor = glGetUniformLocation(result.spriteProg, "uFogColor")
+  result.uSpriteFogParams = glGetUniformLocation(result.spriteProg, "uFogParams")
   result.cavityProg = link(cavityVs, cavityFs)
   result.uCavityDepth = glGetUniformLocation(result.cavityProg, "uDepth")
   result.uCavityOrigin = glGetUniformLocation(result.cavityProg, "uOrigin")
@@ -478,6 +597,18 @@ proc newRenderer*(): Renderer =
   glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(FlatVert).GLsizei,
     cast[pointer](12))
   glBindVertexArray(0)
+
+proc averageLuma(rgba: seq[uint8]): float32 =
+  ## Luma (Rec. 601) of the image's average color, 0..1, from at most ~4096 pixels.
+  let pixels = rgba.len div 4
+  if pixels == 0: return 0
+  let stride = max(1, pixels div 4096)
+  var sum: array[3, float]
+  var n = 0
+  for i in countup(0, pixels - 1, stride):
+    for c in 0 .. 2: sum[c] += rgba[i * 4 + c].float
+    inc n
+  float32((0.299 * sum[0] + 0.587 * sum[1] + 0.114 * sum[2]) / (n.float * 255))
 
 proc isBrightForGrid(rgba: seq[uint8]): bool =
   ## TrenchBroom 2025.4's gridColorForMaterial: black grid lines when the
@@ -512,6 +643,13 @@ proc setTextureFilter*(r: Renderer, linear: bool) =
       glBindTexture(GL_TEXTURE_2D, tex)
       setFilter(linear)
 
+proc forgetMissingTexture*(r: Renderer, path: string) =
+  ## A texture file that wasn't there when last looked for is read again on
+  ## the next upload (it was put back).
+  if path in r.textures and r.textures[path][0] == 0:
+    r.textures.del path
+    r.geometryVersion = -1
+
 proc texture*(r: Renderer, path: string): (GLuint, bool) =
   if path in r.textures: return r.textures[path]
   result = (0.GLuint, false)
@@ -529,6 +667,7 @@ proc texture*(r: Renderer, path: string): (GLuint, bool) =
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT.GLint)
       result = (tex, img.seeThrough)
       r.brightTextures[path] = isBrightForGrid(img.rgba)
+      r.textureLumas[path] = averageLuma(img.rgba)
     except CatchableError:
       discard
   r.textures[path] = result
@@ -710,10 +849,11 @@ proc setRooms*(r: Renderer, scene: DaeScene) =
   r.upload(lRooms, data, @[DrawRange(first: 0, count: data.len.int32)])
 
 proc model(r: Renderer, path, base, image: string): string =
-  ## The saved model, uploaded on first use, its triangles shaded by a fixed
-  ## light (the level's baked lighting doesn't reach objects). image, if
-  ## given, textures all of it (console screens show their state's texture).
-  ## Returns its key in r.models.
+  ## The saved model, uploaded on first use with its vertex normals: drawModels
+  ## lights it per vertex as Oni does (thumbs.oniShade; the level's baked
+  ## lighting doesn't reach objects). Models saved before normals were (CWM1)
+  ## take their faces' normals. image, if given, textures all of it (console
+  ## screens show their state's texture). Returns its key in r.models.
   let key = if image.len > 0: path & "|" & image else: path
   result = key
   if key in r.models: return
@@ -721,16 +861,14 @@ proc model(r: Renderer, path, base, image: string): string =
   if image.len > 0:
     mesh.images = @[image]
     for t in mesh.tris.mitems: t.tex = 0
-  let light = vec3(-0.35, 0.8, 0.5).normalize
   var byTex: OrderedTable[int, seq[LevelVert]]
   for t in mesh.tris:
-    var n = (t.p[1] - t.p[0]).cross(t.p[2] - t.p[0])
-    if n.length < 1e-12: continue
-    let shade = 0.55'f32 + 0.45'f32 * abs(n.normalize.dot(light))
+    let fn = t.faceNormal
+    if fn.length == 0: continue
+    let smooth = t.hasNormals
     for k in 0 .. 2:
-      var c = t.col[k]
-      for j in 0 .. 2: c[j] = uint8(c[j].float32 * shade)
-      byTex.mgetOrPut(t.tex, @[]).add LevelVert(pos: t.p[k], uv: t.uv[k], col: c)
+      byTex.mgetOrPut(t.tex, @[]).add LevelVert(pos: t.p[k], uv: t.uv[k], col: t.col[k],
+                                                 nrm: (if smooth: t.n[k] else: fn))
   var data: seq[LevelVert]
   var draws: seq[DrawRange]
   r.modelTextures.add mesh.images
@@ -824,6 +962,14 @@ proc clearAll*(r: Renderer) =
   r.clampedTextures.clear()
   r.geometryVersion = -1
 
+proc fogUniforms(r: Renderer, uOn, uColor, uParams: GLint, on: bool) =
+  ## The fog for the draws that follow (the program in use).
+  glUniform1i(uOn, (if on: 1 else: 0))
+  if on:
+    let f = r.fog
+    glUniform3f(uColor, f.color.x, f.color.y, f.color.z)
+    glUniform4f(uParams, f.start, f.finish, f.near, max(f.far, f.near + 1))
+
 type DrawPass = enum
   dpAll       ## Every draw in its order.
   dpSolid     ## All but the blended ones (textured).
@@ -845,6 +991,7 @@ proc drawMesh(r: Renderer, m: MeshLayer, mvp: M4, tint: Vec4, textured: bool, li
   glUniform1i(r.uLevelGrid, (if showGrid: 1 else: 0))
   glUniform1f(r.uLevelGridSize, r.grid3D)
   glUniform1f(r.uLevelGridAlpha, r.gridAlpha)
+  glUniform1f(r.uLevelGridThickness, r.gridThickness)
   glUniform1f(r.uLevelBrightness, r.brightness)
   glUniform1i(r.uLevelSkyBlend, (if r.skyPass: r.skyGrade.blend.ord.GLint else: -1))
   glUniform3f(r.uLevelSkyTint, r.skyGrade.tint[0].float32 / 255, r.skyGrade.tint[1].float32 / 255,
@@ -852,6 +999,7 @@ proc drawMesh(r: Renderer, m: MeshLayer, mvp: M4, tint: Vec4, textured: bool, li
   glUniform1f(r.uLevelSkyGain, r.skyGrade.brightness)
   glUniform1i(r.uLevelFacing, (if r.facing: 1 else: 0))
   glUniform3f(r.uLevelViewDir, r.viewDir.x, r.viewDir.y, r.viewDir.z)
+  r.fogUniforms(r.uLevelFog, r.uLevelFogColor, r.uLevelFogParams, r.fogNow and not r.skyPass)
   glActiveTexture(GL_TEXTURE0)
   glBindVertexArray(m.vao)
   var order: seq[int]
@@ -905,6 +1053,22 @@ proc drawSky(r: Renderer, cam: Camera, w, h: int32) =
   glEnable(GL_BLEND)
   glDepthMask(GL_TRUE)
 
+proc normalMatrix(m: M4): array[9, float32] =
+  ## The column-major 3x3 that turns m's (column-major 4x4) normals into
+  ## world space: the inverse transpose of its 3x3, as cofactors (the same
+  ## direction; turned back when m mirrors). The shader normalizes.
+  template a(r, c: int): float32 = m[c * 4 + r]
+  var cof: array[3, array[3, float32]]   # [row][col]
+  for r in 0 .. 2:
+    for c in 0 .. 2:
+      let (r1, r2) = ((r + 1) mod 3, (r + 2) mod 3)
+      let (c1, c2) = ((c + 1) mod 3, (c + 2) mod 3)
+      cof[r][c] = a(r1, c1) * a(r2, c2) - a(r1, c2) * a(r2, c1)
+  let det = a(0, 0) * cof[0][0] + a(0, 1) * cof[0][1] + a(0, 2) * cof[0][2]
+  let sign = if det < 0: -1'f32 else: 1'f32
+  for r in 0 .. 2:
+    for c in 0 .. 2: result[c * 3 + r] = cof[r][c] * sign
+
 proc drawModels(r: Renderer, mvp: M4, is3D, textured: bool) =
   ## Every model instance: solid in 3D, wireframe in 2D (lit = is3D, as
   ## drawMesh would draw each). The state they share is set once: a level has
@@ -919,11 +1083,21 @@ proc drawModels(r: Renderer, mvp: M4, is3D, textured: bool) =
   glUniform1i(r.uLevelGrid, 0)
   glUniform1f(r.uLevelGridSize, r.grid3D)
   glUniform1f(r.uLevelGridAlpha, r.gridAlpha)
+  glUniform1f(r.uLevelGridThickness, r.gridThickness)
   glUniform1f(r.uLevelBrightness, r.brightness)
   glUniform1i(r.uLevelSkyBlend, -1)
   glUniform1i(r.uLevelFacing, (if r.facing: 1 else: 0))
   glUniform3f(r.uLevelViewDir, r.viewDir.x, r.viewDir.y, r.viewDir.z)
   glUniform1i(r.uLevelBlend, 0)
+  r.fogUniforms(r.uLevelFog, r.uLevelFogColor, r.uLevelFogParams, r.fogNow)
+  # Lit as Oni lights models, in 3D (2D wireframe ignores vertex colors).
+  glUniform1i(r.uOniLit, (if lit: 1 else: 0))
+  var dirs = [OniLightDirs[0].x, OniLightDirs[0].y, OniLightDirs[0].z,
+              OniLightDirs[1].x, OniLightDirs[1].y, OniLightDirs[1].z]
+  var colors = OniLightColors
+  glUniform3fv(r.uOniDir, 2, dirs[0].addr)
+  glUniform1fv(r.uOniColor, 2, colors[0].addr)
+  glUniform1f(r.uOniAmbient, OniAmbient)
   glActiveTexture(GL_TEXTURE0)
   glDisable(GL_CULL_FACE)
   if not is3D: glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)
@@ -934,6 +1108,9 @@ proc drawModels(r: Renderer, mvp: M4, is3D, textured: bool) =
     if m.vao == 0: continue
     var full = mul(mvp, inst.transform)
     glUniformMatrix4fv(r.uLevelMvp, 1, GL_FALSE, full[0].addr)
+    if lit:
+      var nm = normalMatrix(inst.transform)
+      glUniformMatrix3fv(r.uNormalMat, 1, GL_FALSE, nm[0].addr)
     if is3D: glUniform4f(r.uLevelTint, inst.tint.x, inst.tint.y, inst.tint.z, inst.tint.w)
     else:
       let c = inst.wire
@@ -952,6 +1129,7 @@ proc drawModels(r: Renderer, mvp: M4, is3D, textured: bool) =
       if useTex: glBindTexture(GL_TEXTURE_2D, d.tex)
       glDrawArrays(GL_TRIANGLES, d.first, d.count)
   if not is3D: glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
+  glUniform1i(r.uOniLit, 0)   # The level and the sky share the program.
   glBindVertexArray(0)
 
 proc drawFlat(r: Renderer, verts: seq[FlatVert], mode: GLenum, mvp: M4) =
@@ -1105,6 +1283,12 @@ proc drawSprites(r: Renderer, cam: Camera, mvp: M4) =
   var mm = mvp
   glUniformMatrix4fv(r.uSpriteMvp, 1, GL_FALSE, mm[0].addr)
   glUniform1i(r.uSpriteTex, 0)
+  # Lens flares, sky particles and additive textures are drawn unfogged in the
+  # game: Oni turns GL fog off for any texture with the additive flag
+  # (0x40d6d8, Bungie's gl_set_textures "force fog off!"), else the black of
+  # an additive texture would add the fog color and show the whole quad.
+  var curFog = r.fogNow
+  r.fogUniforms(r.uSpriteFog, r.uSpriteFogColor, r.uSpriteFogParams, curFog)
   glActiveTexture(GL_TEXTURE0)
   glBindVertexArray(r.spriteVao)
   glBindBuffer(GL_ARRAY_BUFFER, r.spriteVbo)
@@ -1118,7 +1302,12 @@ proc drawSprites(r: Renderer, cam: Camera, mvp: M4) =
     glBufferData(GL_ARRAY_BUFFER, verts.len * sizeof(SpriteVert), verts[0].addr, GL_STREAM_DRAW)
     glDrawArrays(GL_TRIANGLES, 0, verts.len.GLsizei)
     verts.setLen 0
-  proc use(ps: int, tex: GLuint, additive: bool) =
+  proc use(ps: int, tex: GLuint, additive: bool, fogged: bool) =
+    let fogOn = r.fogNow and fogged
+    if fogOn != curFog:
+      flush()
+      curFog = fogOn
+      r.fogUniforms(r.uSpriteFog, r.uSpriteFogColor, r.uSpriteFogParams, curFog)
     if ps != curPass or tex != curTex:
       flush()
       if ps != curPass:
@@ -1136,7 +1325,7 @@ proc drawSprites(r: Renderer, cam: Camera, mvp: M4) =
       let t = r.particleTris[i - ns]
       let tex = if t.wrap: r.texture(t.tex)[0] else: r.spriteTexture(t.tex)
       if tex == 0: continue
-      use(ps, tex, t.additive)
+      use(ps, tex, t.additive, not (t.sky or t.additive))
       for k in 0 .. 2: verts.add SpriteVert(pos: t.p[k], uv: t.uv[k], col: t.col[k])
       continue
     let sp = r.sprites[i]
@@ -1144,7 +1333,7 @@ proc drawSprites(r: Renderer, cam: Camera, mvp: M4) =
     if tex == 0: continue
     var (ok, c, uvs, keep) = spriteQuad(sp, cam.pos, right, up)
     if not ok: continue
-    use(ps, tex, sp.additive)
+    use(ps, tex, sp.additive, not (sp.flare or sp.sky or sp.additive))
     var col = sp.col
     col[3] = uint8(col[3].float32 * keep)
     if sp.mode == 8:
@@ -1224,6 +1413,9 @@ proc drawView*(r: Renderer, cam: Camera, x, y, w, h: int32, fbHeight: int32,
   let (textured, wire) = (mode.textured, mode.wireframe)
   r.fullbright = mode in {rmUnlit, rmSolid}
   r.showTint = mode == rmUnlit
+  # Realtime preview's fog, in the textured modes: on what the game fogs (the
+  # level, objects, particles), not the sky or what only the editor draws.
+  let fogged = is3D and textured and r.fog.on
   proc wireLayer(tris, edges: Layer, tint: Vec4, lit: bool) =
     ## A layer's wireframe: its triangles, or its face outlines (showTriangles off).
     if r.showTriangles:
@@ -1235,7 +1427,7 @@ proc drawView*(r: Renderer, cam: Camera, x, y, w, h: int32, fbHeight: int32,
 
   if not is3D and r.gridLines.len > 0:
     glDisable(GL_DEPTH_TEST)
-    r.drawFlat(r.gridLines, GL_LINES, mvp)
+    r.drawFlat(r.gridLines, GL_TRIANGLES, mvp)
   if is3D and opts.sky and textured:
     r.drawSky(cam, w, h)
   glEnable(GL_DEPTH_TEST)
@@ -1252,7 +1444,9 @@ proc drawView*(r: Renderer, cam: Camera, x, y, w, h: int32, fbHeight: int32,
     r.facing = mode == rmSolid
     r.viewDir = cam.forward
     r.camPos = cam.pos
+    r.fogNow = fogged
     r.drawLayer(lGeometry, mvp, vec4(1, 1, 1, 1), textured, grid = true, pass = dpSolid)
+    r.fogNow = false
     r.facing = false
     r.cullBack = false
     glDisable(GL_POLYGON_OFFSET_FILL)
@@ -1269,7 +1463,9 @@ proc drawView*(r: Renderer, cam: Camera, x, y, w, h: int32, fbHeight: int32,
   if opts.models and r.modelInstances.len > 0:
     if not wire:
       glDisable(GL_BLEND)
+      r.fogNow = fogged
       r.drawModels(mvp, true, textured)
+      r.fogNow = false
       glEnable(GL_BLEND)
     else:
       if not is3D: glDisable(GL_DEPTH_TEST)
@@ -1285,7 +1481,9 @@ proc drawView*(r: Renderer, cam: Camera, x, y, w, h: int32, fbHeight: int32,
     glPolygonOffset(1, 1)
     r.facing = mode == rmSolid
     r.viewDir = cam.forward
+    r.fogNow = fogged
     r.drawLayer(lGeometry, mvp, vec4(1, 1, 1, 1), textured, grid = true, pass = dpBlended)
+    r.fogNow = false
     r.facing = false
     glDisable(GL_POLYGON_OFFSET_FILL)
     glDepthMask(GL_TRUE)
@@ -1301,7 +1499,10 @@ proc drawView*(r: Renderer, cam: Camera, x, y, w, h: int32, fbHeight: int32,
     glEnable(GL_DEPTH_TEST)
     glDepthMask(GL_TRUE)
 
-  if is3D and not wire: r.drawSprites(cam, mvp)
+  if is3D and not wire:
+    r.fogNow = fogged
+    r.drawSprites(cam, mvp)
+    r.fogNow = false
 
   if not wire and r.layers[lPreview].vao != 0:
     # Brushes being created: textured and see-through (their edges are overlay lines).
@@ -1333,6 +1534,61 @@ proc drawView*(r: Renderer, cam: Camera, x, y, w, h: int32, fbHeight: int32,
   glDisable(GL_SCISSOR_TEST)
   glDisable(GL_DEPTH_TEST)
   glUseProgram(0)
+
+proc textureLuma*(r: Renderer, path: string): float32 =
+  ## Luma of a texture's average color (0..1), loading it if need be; 0 when it can't be.
+  discard r.texture(path)
+  r.textureLumas.getOrDefault(path, 0)
+
+proc drawUvTexture*(r: Renderer, path: string, view, clip: tuple[x, y, w, h: int32],
+                    uvs: array[4, Vec2], back: Vec3): bool =
+  ## Fills view (GL pixels, origin bottom left) with the texture, clipped to
+  ## clip. uvs are its corners' texture coordinates: bottom left, bottom
+  ## right, top right, top left. False when the texture can't be loaded.
+  let (tex, _) = r.texture(path)
+  if tex == 0 or view.w <= 0 or view.h <= 0 or clip.w <= 0 or clip.h <= 0: return false
+  if r.uvProg == 0:
+    r.uvProg = link(uvVs, uvFs)
+    r.uUvTex = glGetUniformLocation(r.uvProg, "uTex")
+    r.uUvBrightness = glGetUniformLocation(r.uvProg, "uBrightness")
+    r.uUvBack = glGetUniformLocation(r.uvProg, "uBack")
+    glGenVertexArrays(1, r.uvVao.addr)
+    glGenBuffers(1, r.uvVbo.addr)
+    glBindVertexArray(r.uvVao)
+    glBindBuffer(GL_ARRAY_BUFFER, r.uvVbo)
+    glEnableVertexAttribArray(0)
+    glVertexAttribPointer(0, 2, cGL_FLOAT, GL_FALSE, 16, nil)
+    glEnableVertexAttribArray(1)
+    glVertexAttribPointer(1, 2, cGL_FLOAT, GL_FALSE, 16, cast[pointer](8))
+    glBindVertexArray(0)
+  let corners = [vec2(-1, -1), vec2(1, -1), vec2(1, 1), vec2(-1, 1)]
+  var data: array[16, float32]
+  for k in 0 .. 3:
+    data[k * 4] = corners[k].x
+    data[k * 4 + 1] = corners[k].y
+    data[k * 4 + 2] = uvs[k].x
+    data[k * 4 + 3] = uvs[k].y
+  glViewport(view.x, view.y, view.w, view.h)
+  glEnable(GL_SCISSOR_TEST)
+  glScissor(clip.x, clip.y, clip.w, clip.h)
+  glDisable(GL_DEPTH_TEST)
+  glDisable(GL_CULL_FACE)
+  glDisable(GL_BLEND)
+  glUseProgram(r.uvProg)
+  glActiveTexture(GL_TEXTURE0)
+  glBindTexture(GL_TEXTURE_2D, tex)
+  glUniform1i(r.uUvTex, 0)
+  glUniform1f(r.uUvBrightness, r.brightness)
+  glUniform3f(r.uUvBack, back.x, back.y, back.z)
+  glBindVertexArray(r.uvVao)
+  glBindBuffer(GL_ARRAY_BUFFER, r.uvVbo)
+  glBufferData(GL_ARRAY_BUFFER, sizeof(data), data[0].addr, GL_STREAM_DRAW)
+  glDrawArrays(GL_TRIANGLE_FAN, 0, 4)
+  glBindVertexArray(0)
+  glUseProgram(0)
+  glBindTexture(GL_TEXTURE_2D, 0)
+  glDisable(GL_SCISSOR_TEST)
+  true
 
 proc endViews*(fbWidth, fbHeight: int32) =
   ## Restores the state the UI drawer expects.

@@ -7,7 +7,8 @@ import silky, vmath, bumpy, pixie
 import ui, dialogs, menutree, pictures, skyconvert, skyfit
 import crashlog
 import collada, levelobjects, project, jobs, camera, render, geometry, geomops, objtemplates, tga,
-  presets, library, fieldchoices, lighting, files, scriptedit, particlesim
+  presets, library, fieldchoices, lighting, files, scriptedit, particlesim, modelimport,
+  importedmodels
 from music import setMusicVolume, setProjectAmbients
 import ambients
 
@@ -27,8 +28,13 @@ const
   MinTexThumb* = 32'f32            ## Texture browser tile sizes Ctrl+wheel zooms between.
   MaxTexThumb* = 256'f32
   DefaultTexThumb* = 56'f32
+  MinUvViewH* = 120'f32            ## Heights the Face tab's UV view can be dragged to.
+  MaxUvViewH* = 1200'f32
+  DefaultUvViewH* = 260'f32
+  MaxUvGrid* = 16                  ## Grid lines per texture repeat (TrenchBroom's Grid X/Y range).
   CodeFontSizes* = [9, 10, 11, 12, 13, 14, 16, 18, 20, 22, 24, 28, 32]  ## Scripts editor text sizes Ctrl+wheel steps through.
   DefaultCodeFontSize* = 14
+  SpotMarkTime* = 4.0             ## Seconds a spot the views were sent to (App.spotMarks) stays marked.
   GeometryLayer* = "GEOM"
   MaxGeometryUndo = 80
 
@@ -47,7 +53,7 @@ type
   PanelKind* = enum
     pkViewport = "Viewport", pkProperties = "Properties", pkClasses = "Classes", pkMap = "Map", pkFiles = "Files",
     pkEntityBrowser = "Entity Browser", pkTextureBrowser = "Texture Browser",
-    pkTextureCollections = "Texture Collections",
+    pkTextureCollections = "Texture Collections", pkSoundBrowser = "Sound Browser",
     pkConsole = "Console", pkIssues = "Issues", pkScripts = "Scripts"
 
   DockNode* = ref object
@@ -75,7 +81,8 @@ type
   DragKind* = enum
     dkNone, dkMove, dkBox, dkLook, dkOrbit, dkPan, dkDraw, dkHandles, dkExtrude, dkRotate,
     dkScale, dkClipPoint, dkPaint, dkPaintFaces, dkSlide, dkSplit, dkStamp, dkRotateCenter,
-    dkClipNew, dkAssembleRect, dkAssembleDup, dkPlace, dkPaintTexture, dkGizmo, dkBoxFace, dkSelRect, dkCut, dkIgnore
+    dkClipNew, dkAssembleRect, dkAssembleDup, dkPlace, dkPaintTexture, dkGizmo, dkBoxFace, dkSelRect, dkCut, dkIgnore,
+    dkScaleObj
 
   Press* = object
     ## A left button press in a map view: a click until it moves 2 pixels,
@@ -89,7 +96,7 @@ type
   PreviewPart* = enum
     ## What Realtime preview plays (right click its button to choose).
     ppLights = "Animated lighting", ppSounds = "Sound objects", ppMusic = "Level music",
-    ppParticles = "Particles"
+    ppParticles = "Particles", ppFog = "Fog"
   EditorOnlyPart* = enum
     ## What the Editor-only button shows (right click it to choose): things
     ## the game never draws.
@@ -114,6 +121,11 @@ type
     ambient*: string                   ## Opened on a sound list's ambient: duplicating or editing it.
     ambientPick*: proc(v: string)      ## ...and that list's field, which a duplicate's name goes in.
     texture*: string                   ## Opened on a Texture Browser tile: its texture.
+    importedModel*: string             ## Opened on an entity browser tile of an imported model: its folder.
+    sound*: string                     ## Opened on a Sound Browser row: its sound.
+    soundGroup*: int                   ## ...and which of its lists it's in (SoundGroup).
+    dockLeaf*: DockNode                ## Opened on a panel stack's tab bar: that stack.
+    scripts*: bool                     ## Opened on the Scripts panel's text.
 
   DragPiece* = object
     ## Extrude-type drags: one piece with faces on the dragged face's plane.
@@ -139,11 +151,14 @@ type
     lastDelta*: Vec3
     built*: bool                       ## Extrude / slide / split / stamp / cut: geometry rebuilt yet...
     builtMove*: Vec3                   ## ...for this move (it starts over from geoBefore, so unbaked).
-    planeNormal*: Vec3
+    planeNormal*: Vec3                 ## Extrude / split / stamp across a plane: its normal.
+    extrudeLine*: bool                 ## Extrude / slide / split / stamp: the distance is the point
+                                       ## on startWorld + axis*s nearest the mouse ray (TrenchBroom).
     vertical*: bool
     moved*: bool
     objs*: seq[LevelObject]
     startPose*: seq[(Vec3, Vec3)]
+    startScales*: seq[Vec3]            ## Furniture scale gizmo: each of objs' scale at the start.
     objBefore*: seq[string]
     geoBefore*: Geometry
     startPoints*: Table[int32, Vec3]   ## Moving geometry: original positions.
@@ -158,6 +173,8 @@ type
     axis*: Vec3                        ## Rotate: axis; extrude: face normal; gizmo: arrow axis.
     along*: float32                    ## Gizmo: where the press was along the arrow's line.
     onPlane*: bool                     ## Gizmo: a square was grabbed; axis is its plane's normal.
+    axisIdx*: int                      ## Gizmo / rotate ring: which of frame's axes is dragged.
+    frame*: array[3, Vec3]             ## Gizmo: its axes at the press (world or the object's own).
     face*: int                         ## Extrude / slide: the dragged face; box face: 0..5 (boxHandles).
     boxStart*: seq[(Vec3, Vec3)]       ## Box faces: each of objs' volumeRange at the start.
     boxBase*: seq[Vec3]                ## Box faces: each of objs' position at the start.
@@ -232,6 +249,7 @@ type
     ambient*: array[3, int]
     softShadows*: float
     skyGrade*: SkyGrade
+    fog*: Fog
 
   VisState* = object
     ## What is hidden or locked.
@@ -246,12 +264,26 @@ type
     faces*: HashSet[int]
     lastFace*: int
 
+  PropsLockKind* = enum
+    plNone,                            ## Not locked: Properties shows the selection.
+    plObjects,                         ## These objects.
+    plGroup,                           ## A group picked in the Map tab.
+    plLevel                            ## The level (nothing was selected).
+
+  PropsLock* = object
+    ## Properties' lock (the lock on its tab): what it keeps showing, whatever
+    ## gets selected.
+    kind*: PropsLockKind
+    objs*: seq[LevelObject]
+    group*: int32
+
   TexCollection* = object
     ## Textures the Texture Browser can list: the level's own (id "level"), the
     ## ones imported into the project ("custom"), or another game level's
     ## ("game:<n>"), which are copied into the project when first used.
     id*, name*: string
-    level*: int                  ## Game level; 0 for the project's own.
+    level*: int                  ## Game level; 0 for the project's own, -1 for a picture file or folder.
+    source*: string              ## The picture file or folder (level -1).
     dir*: string
     ready*: bool                 ## Its textures are there (a game level's are extracted first).
     textures*: seq[string]
@@ -353,6 +385,46 @@ type
     done*: seq[proc()]              ## Run when it's made.
     job*: Job                       ## nil until it starts.
 
+  UvTool* = enum
+    ## What a drag in the Face tab's UV view does (TrenchBroom's Uv*Tool).
+    utNone, utOffset, utOrigin, utScale, utRotate, utShear, utEdge, utPan, utResize
+
+  UvDrag* = object
+    kind*: UvTool
+    face*: int
+    geo*: Geometry
+    version*: int                   ## geo.version after its last change (another edit cancels it).
+    before*: Geometry               ## For the undo step.
+    uvs*: seq[Vec2]                 ## The face's UVs when it began.
+    map*: UvAffine                  ## Their mapping then.
+    mouse*: Vec2                    ## Where it began (UI units).
+    axes*: array[2, bool]           ## The axes it works on (origin, scale and shear handles).
+    lines*: array[2, float]         ## Scale and shear: the grabbed grid lines' U and V.
+    origin*: Vec2                   ## The origin handle then (face coordinates).
+    center*: Vec2                   ## Pan: the camera then.
+    height*: float32                ## Resize: the view's height then.
+    grab*: seq[int]                 ## Edge: the face outline's edges it moves (two from a corner)...
+    corner*: int                    ## ...the corner grabbed, or -1...
+    outA*: array[4, float]          ## ...and the outline drawn over the still texture:
+    outB*: array[2, float]          ## p' = outA·p + outB (face coordinates).
+    changed*: bool
+
+  UvView* = object
+    ## The Face tab's UV view (TrenchBroom's UvView and UvViewHelper): one
+    ## face seen from the front, its texture spread over the whole view.
+    geo*: Geometry                  ## With face: what it shows; the camera and origin
+    face*: int                      ## reset when either changes.
+    fitted*: bool                   ## zoom was worked out for a view of real size.
+    center*: Vec2                   ## Camera: the face coordinates at the view's middle,
+    zoom*, fitZoom*: float32        ## UI units per world unit, and the one framing the face.
+    origin*: Vec2                   ## The origin handle (face coordinates): scale and rotate pivot.
+    grid*: array[2, int]            ## Grid lines per texture repeat along U and V (Grid X, Y).
+    height*: float32                ## Of the view (the strip under it resizes it).
+    drag*: UvDrag
+    lastFrame*: int                 ## App.frameNo it was last drawn in.
+    originSet*: bool                ## origin was placed on the face shown.
+    normal*: Vec3                   ## That face's normal when the camera framed it.
+
   App* = ref object
     window*: Window
     sk*: Silky
@@ -383,6 +455,7 @@ type
     gridIndex*: int
     snap*: bool
     uvLock*: bool
+    gizmoLocal*: bool               ## Gizmo arrows and rotate rings on the selected object's own axes.
     showGrid*: bool
     opts*: ViewOptions
     layerHidden*: HashSet[string]
@@ -398,6 +471,22 @@ type
     dock*: DockNode                 ## The panel layout (dock.nim).
     dockPress*: tuple[on: bool, kind: PanelKind, at: Vec2]  ## A press on a panel's tab.
     dockDragging*: bool             ## That tab is being dragged to another place.
+    propsLock*: PropsLock           ## Properties' tab lock.
+    soundFilter*: string            ## Sound Browser: the search,
+    soundScroll*: float32
+    soundCursor*: int               ## ...its keyboard cursor (a row),
+    soundOpen*: set[SoundGroup]     ## ...the lists unfolded,
+    soundUsedOnly*: bool            ## ...only the sounds the level uses,
+    soundCurrent*: string           ## ...the sound picked last,
+    soundPress*: tuple[on: bool, value: string, group: SoundGroup, at: Vec2]  ## ...a press on a row,
+    soundClick*: tuple[value: string, at: float]  ## ...and the last click (a second one soon after plays it).
+    soundList*: seq[SoundEntry]     ## Its rows, read again every few seconds (soundListAt).
+    soundListAt*: float
+    soundUsed*: CountTable[string]  ## Lower-case sound values the level's objects and music use.
+    soundUsedStamp*: (int, int, int, string)
+    classLock*: bool                ## Classes' tab lock: the class shown stays, whatever gets selected.
+    classLockFollow*: LevelObject   ## While it's on: the last object whose class would have opened.
+    tabSelSeen*: seq[LevelObject]   ## Selected objects as of the last frame the panels drew.
     viewsArea*: Rect                ## The map views' area this frame (empty: Viewport not shown).
     log*: seq[LogLine]
     logDropped*: int                ## Lines trimmed off the top: a selection counts from the first ever.
@@ -424,6 +513,7 @@ type
     menuTree*: MenuNode             ## This frame's menu bar tree.
     menuOpenedAt*: float            ## When the open menus opened, else 0.
     focusLostAt*: float             ## When the window lost focus, else 0.
+    animUntil*: float               ## Frames come at the display's rate until then (short animations).
     settingsOpen*: bool
     mcpPortIssue*: string           ## Why the MCP server's port can't be used ("" = it can).
     crashReport*: string            ## Report of a crash in an earlier run, until the next launch.
@@ -454,6 +544,8 @@ type
     particleAutoBuild*: bool        ## Level 0's particles were extracted for it.
     particleLevelJob*: string       ## The oni folder whose decal textures were looked for.
     dupFlashAt*: float              ## When Ctrl+D last duplicated in place: the selection's lines flash white.
+    spotMarks*: seq[Vec3]           ## Places with no object of their own the views were sent to (a level particle a
+    spotMarksAt*: float             ## script names): marked in the views for SpotMarkTime seconds from then.
     sceneKey*: string               ## Realtime sound: "" (off), "extracting" (level 0's sounds) or "playing".
     windowTitle*: string            ## What updateWindowTitle last set.
     savePrompt*: proc()             ## Unsaved-changes prompt is up; runs this after Yes or No.
@@ -464,7 +556,7 @@ type
     newName*: string
     newLevel*: int
     newKind*: NewKind               ## Welcome screen: from scratch, a copy of game level newLevel or a preview of it.
-    newTexLevel*: int               ## New empty level: textures from this game level (0 = all).
+    newTexLevel*: int               ## New empty level: textures from this game level (0 = all, -1 = none).
     newSky*: string                 ## New empty level: sky ("" = none).
     dialog*: Dialog
     pendingSave*: (string, string)  ## (dialog purpose, folder) of a Save As waiting for a job.
@@ -488,6 +580,7 @@ type
     lastTime*: float
     texFrames*: Table[int, TexFrame] ## Face tab: selected faces' texture mappings,
     texFramesFor*: tuple[geo: Geometry, version: int, faces: seq[int]]  ## valid for this geometry and selection.
+    uvView*: UvView                 ## The Face tab's UV view.
     faceUndo*: tuple[label: string, geo: Geometry, version, depth: int, faces: seq[int]]
                                     ## Last live Face tab edit; more of the same merge into its undo step.
     shade*: array[3, float]
@@ -512,6 +605,8 @@ type
     rotAxis*: int                   ## Rotate tool Apply: 0 X, 1 Y, 2 Z.
     scaleText*: string
     scaleBySize*: bool
+    objScaleText*: string           ## Scale tool's factors for furniture (scaleObjects).
+    modelImportDir*: string         ## Where File > Import > Models as furniture last took a file.
     shape*: ShapeKind
     shapeSides*: float
     shapeSteps*: float
@@ -537,6 +632,8 @@ type
     texAlphaOnly*: bool             ## Texture Browser: only textures with see-through pixels.
     texThumb*: float32              ## Texture browser tile size (pixels); Ctrl+wheel zooms it.
     codeFontSize*: int              ## Scripts editor text size (one of CodeFontSizes); Ctrl+wheel zooms it.
+    scriptSoundAutoplay*: bool      ## Scripts panel: Ctrl+click on a sound plays it at once in the sound player.
+    scriptSoundVolume*: float       ## Scripts panel's sound player volume (Oni's 0..1, as a script's volume argument).
     showObjectNames*: bool
     browserPress*: (int, Vec2)      ## Entity browser: preset pressed (-1 = none) and where.
     presets*: seq[Preset]           ## Entity browser: built in, then the library's.
@@ -547,6 +644,8 @@ type
     soundImportPick*: proc(v: string)   ## The sound field whose Import sound... dialog is open.
     browserOpen*: HashSet[string]   ## Entity browser: expanded groups.
     entityFilter*: string
+    mapFilter*: string              ## Map tab search: a part of a row's name, or #id.
+    mapFilterSeen*: string          ## mapFilter as of the Map tab's last frame.
     entityPreview*: float           ## Entity browser preview size: 0 = list, up to 1, in steps of 1/8.
     previewStamp: string            ## Library build the loaded previews are from.
     previewTried: HashSet[string]   ## Preview atlas keys loaded or missing.
@@ -591,6 +690,7 @@ type
     linkSigs*: Table[int32, LinkSig] ## Linked groups as of the last sync.
     namePrompt*: proc(name: string) ## Group name prompt is up; runs this after OK.
     namePromptTitle*, namePromptText*: string
+    namePromptBack*: string           ## Focus id the prompt gives the keyboard back to when it closes.
     skyImportDir*: string           ## The sky folder popup is up for this folder ("" = closed).
     skyImportFiles*: seq[string]    ## Its pictures.
     skyImportSides*: seq[int]       ## Index into SkySides per picture, -1 = not used.
@@ -617,10 +717,13 @@ type
     camAnim*: CamAnim
     texCollections*: seq[TexCollection]  ## Every collection there is (refreshCollections).
     texGroup*: bool                 ## Texture Browser: headed by collection (TrenchBroom's Group).
+    texClosed*: HashSet[string]     ## Texture Browser: folded collection groups (collection ids).
     collAvailable*, collEnabled*: HashSet[string]  ## Texture Collections: selected rows.
     collScroll*: array[2, float32]  ## ...and their lists' scroll.
     showDirections*: bool           ## Entities show where they point.
     showGizmos*: bool               ## Entities draw their gizmos (boxes, light shapes, arrows, volumes).
+    overlaysOpen*: bool             ## The Overlays popover (tool options strip, right end) is open.
+    overlaysUnsaved*: bool          ## It changed a.cfg; saved once no drag or picker is on.
     gizmoHidden*: HashSet[string]   ## Object types left out of them (right click the Gizmos button).
     showEditorOnly*: bool           ## The Editor-only button: Invisible faces and objects' Notes...
     editorOnlyParts*: set[EditorOnlyPart]  ## ...which of them (never empty).
@@ -1051,6 +1154,66 @@ proc setPose*(a: App, o: LevelObject, pos, rot: Vec3, moveGeometry = true) =
   o.rot = rot
   o.syncToNode()
 
+proc canScale*(o: LevelObject): bool = o.tag in ScaleTags
+
+proc setScale*(a: App, o: LevelObject, s: Vec3) =
+  ## Sets a furniture's scale (ScaleField) and rescales the geometry it owns.
+  if not o.canScale: return
+  var s = s
+  for i in 0 .. 2: s[i] = clamp(s[i], MinScale, MaxScale)
+  if s == o.scale: return
+  if a.geo != nil and o.objectCode != -1:
+    a.geo.scaleObjectGeometry(o.objectCode, o.pos, o.rot, o.scale, s)
+  o.scale = s
+  o.syncToNode()
+
+proc canTint*(a: App, o: LevelObject): bool =
+  ## Furniture with geometry: its Tint row is the tint of the faces it owns.
+  o.tag == "FURN" and a.hasGeometry(o)
+
+proc objectTints*(a: App, o: LevelObject): seq[array[3, uint8]] =
+  ## The different tints of the faces o owns (at most 32).
+  for fi in a.ownedFaces(o):
+    let t = a.geo.faces[fi].tint
+    if t notin result:
+      result.add t
+      if result.len >= 32: return
+
+proc setObjectTint*(a: App, o: LevelObject, c: array[3, int], ch = -1): bool =
+  ## Tints every face o owns (ch: only that channel; -1 all three). Each face
+  ## keeps its own tint in the geometry, so the game gets it like a face's
+  ## Tint. False when nothing changed.
+  for fi in a.ownedFaces(o):
+    var t = a.geo.faces[fi].tint
+    for k in 0 .. 2:
+      if ch < 0 or ch == k: t[k] = uint8(clamp(c[k], 0, 255))
+    if t != a.geo.faces[fi].tint:
+      a.geo.faces[fi].tint = t
+      result = true
+  if result: a.geo.bump()
+
+proc objectFlags*(a: App, o: LevelObject): tuple[any, all: uint32] =
+  ## Surface flags of the faces o owns: set on at least one face, set on all.
+  result.all = not 0'u32
+  var have = false
+  for fi in a.ownedFaces(o):
+    let f = a.geo.faces[fi].flags
+    result.any = result.any or f
+    result.all = result.all and f
+    have = true
+  if not have: result.all = 0
+
+proc setObjectFlag*(a: App, o: LevelObject, bit: uint32, on: bool): bool =
+  ## Sets or clears a surface flag on every face o owns, as the Face tab's
+  ## flags do. False when nothing changed.
+  for fi in a.ownedFaces(o):
+    let f = a.geo.faces[fi].flags
+    let n = if on: f or bit else: f and not bit
+    if n != f:
+      a.geo.faces[fi].flags = n
+      result = true
+  if result: a.geo.bump()
+
 proc look*(o: LevelObject): tuple[half: Vec3, lift: float32, col: array[4, uint8]] =
   ## Marker box for an object: half extents, height of its center, color.
   case o.tag
@@ -1270,7 +1433,8 @@ proc geoCmd*(label: string, before, after: Geometry): Cmd =
 
 proc projSettings*(p: Project): ProjSettings =
   ProjSettings(title: p.title, sky: p.sky, music: p.music, musicVolume: p.musicVolume,
-               autoBake: p.autoBake, ambient: p.ambient, softShadows: p.softShadows, skyGrade: p.skyGrade)
+               autoBake: p.autoBake, ambient: p.ambient, softShadows: p.softShadows, skyGrade: p.skyGrade,
+               fog: p.fog)
 
 proc editProject*(a: App, label: string, before: ProjSettings, merge = "") =
   ## After a change to the level's settings: saves them and leaves an undo
@@ -1354,8 +1518,8 @@ proc applyCmd(a: App, c: Cmd, undo: bool) =
     let s = if undo: c.projBefore else: c.projAfter
     if s.music != p.music: a.musicUndone = true
     elif s.musicVolume != p.musicVolume: setMusicVolume(s.musicVolume)
-    (p.title, p.sky, p.music, p.musicVolume, p.autoBake, p.ambient, p.softShadows, p.skyGrade) =
-      (s.title, s.sky, s.music, s.musicVolume, s.autoBake, s.ambient, s.softShadows, s.skyGrade)
+    (p.title, p.sky, p.music, p.musicVolume, p.autoBake, p.ambient, p.softShadows, p.skyGrade, p.fog) =
+      (s.title, s.sky, s.music, s.musicVolume, s.autoBake, s.ambient, s.softShadows, s.skyGrade, s.fog)
     p.save()
   of ckVisibility: a.setVis(if undo: c.visBefore else: c.visAfter)
   of ckGeometry, ckSelect: discard
@@ -1376,27 +1540,38 @@ proc applyCmd(a: App, c: Cmd, undo: bool) =
   if c.hasSel: a.setSel(if undo: c.selBefore else: c.selAfter)
   a.fieldObj = nil
 
+proc restoreTextures*(a: App)
+proc dropUnusedAdopted*(a: App): seq[string]
+
+proc undoTextures(a: App): string =
+  ## After an undo or redo: copies the faces need back, unused copies gone.
+  a.restoreTextures()
+  let gone = a.dropUnusedAdopted()
+  if gone.len > 0: result = " (removed the unused texture " & gone.join(", ") & ")"
+
 proc undo*(a: App) =
   if a.undoStack.len == 0: return
   let c = a.undoStack.pop
   a.applyCmd(c, undo = true)
+  let note = a.undoTextures()
   inc objEpoch
   a.storeLinkSigs()
   a.redoStack.add c
   a.selRecorded = a.currentSel
   a.selSeenPush = a.pushCount
-  a.say "Undo " & c.label
+  a.say "Undo " & c.label & note
 
 proc redo*(a: App) =
   if a.redoStack.len == 0: return
   let c = a.redoStack.pop
   a.applyCmd(c, undo = false)
+  let note = a.undoTextures()
   inc objEpoch
   a.storeLinkSigs()
   a.undoStack.add c
   a.selRecorded = a.currentSel
   a.selSeenPush = a.pushCount
-  a.say "Redo " & c.label
+  a.say "Redo " & c.label & note
 
 proc plural(n: int, one, many: string): string = &"{n} " & (if n == 1: one else: many)
 
@@ -1441,12 +1616,18 @@ proc texturePath*(a: App, name: string): string =
   if name.startsWith("_marker"): a.proj.markersDir / name & ".tga"
   else: a.proj.imagesDir / name & ".tga"
 
+proc collectionCopy*(a: App, name: string): string =
+  ## The texture's image in a collection outside the level (a game level's or
+  ## a picture collection's, enabled or not), else "".
+  for c in a.texCollections:
+    if c.ready and c.level != 0 and fileExists(c.dir / name & ".tga"): return c.dir / name & ".tga"
+
 proc textureFile*(a: App, name: string): string =
   ## Where a listed texture's image is: the project's, or else a collection's.
   result = a.texturePath(name)
   if fileExists(result): return
-  for c in a.texCollections:
-    if c.ready and c.level != 0 and fileExists(c.dir / name & ".tga"): return c.dir / name & ".tga"
+  let copy = a.collectionCopy(name)
+  if copy.len > 0: return copy
 
 proc refreshCollections*(a: App) =
   ## Rereads what each collection holds; the textures of enabled ones get
@@ -1468,6 +1649,16 @@ proc refreshCollections*(a: App) =
       for f in walkFiles(c.dir / "*.tga"): c.textures.add f.splitFile.name
       c.textures.sort
     a.texCollections.add c
+  for src in p.textureSources:
+    # A picture file or a folder of them, turned into textures in the cache.
+    let name = if dirExists(src) or not fileExists(src) and src.splitFile.ext.len == 0: src.lastPathPart & "/"
+               else: src.extractFilename
+    var c = TexCollection(id: SourcePrefix & src, name: name, level: -1, dir: sourceTexturesDir(src),
+                          ready: sourceTexturesReady(src), source: src)
+    if c.ready:
+      for f in walkFiles(c.dir / "*.tga"): c.textures.add f.splitFile.name
+      c.textures.sort
+    a.texCollections.add c
   a.thumbsLoaded = false
 
 proc enabledTextures*(a: App): seq[(string, int)] =
@@ -1485,13 +1676,93 @@ proc adoptTexture*(a: App, name: string) =
   if name in a.textures or a.proj == nil: return
   let dst = a.texturePath(name)
   try:
-    if not fileExists(dst): copyFile(a.textureFile(name), dst)
+    let src = a.textureFile(name)
+    if not fileExists(dst):
+      createDir(dst.parentDir)   # A level made with no textures has no env/images yet.
+      copyFile(src, dst)
+      # Recorded: the copy goes again once no face uses it (dropUnusedAdopted).
+      if src != dst and not name.startsWith("_marker") and name notin a.proj.adoptedTextures:
+        a.proj.adoptedTextures.add name
+        a.proj.save()
     a.textures.add name
     a.textures.sort
+    # From a picture file or folder: it's one of the level's custom textures now.
+    for c in a.texCollections:
+      if c.level < 0 and src.parentDir == c.dir and name notin a.proj.customTextures:
+        a.proj.customTextures.add name
+        a.proj.save()
+        break
     let keep = a.thumbsLoaded
     a.refreshCollections()
     a.thumbsLoaded = keep   # It has its thumbnail already.
   except CatchableError as e: a.say("Could not copy texture " & name & ": " & e.msg, true)
+
+var savedTexPath: string
+var savedTexTime: Time
+var savedTex: HashSet[string]
+
+proc savedTextures(a: App): (bool, HashSet[string]) =
+  ## The textures the faces in geometry.json use, as last saved; false when
+  ## it can't be read.
+  let path = a.proj.geometryPath
+  if not fileExists(path): return (true, initHashSet[string]())
+  try:
+    let t = getLastModificationTime(path)
+    if path != savedTexPath or t != savedTexTime:
+      var s: HashSet[string]
+      for f in loadGeometry(path).faces: s.incl f.texture
+      (savedTexPath, savedTexTime, savedTex) = (path, t, s)
+    result = (true, savedTex)
+  except CatchableError:
+    result = (false, initHashSet[string]())
+
+proc dropUnusedAdopted*(a: App): seq[string] =
+  ## Removes the copies adoptTexture made that no face uses, in the geometry
+  ## being edited or in the saved one, and that a collection still has (a face
+  ## that takes one again gets it back: restoreTextures). Returns their names.
+  if a.proj == nil or a.geo == nil or a.proj.adoptedTextures.len == 0: return
+  var used: HashSet[string]
+  for f in a.geo.faces: used.incl f.texture
+  let unused = a.proj.adoptedTextures.filterIt(it notin used)
+  if unused.len == 0: return
+  let (ok, saved) = a.savedTextures
+  if not ok: return
+  for t in unused:
+    if t in saved or a.collectionCopy(t).len == 0: continue
+    try: removeFile(a.texturePath(t))
+    except OSError as e:
+      a.say("Could not remove the texture " & t & ": " & e.msg, true)
+      continue
+    result.add t
+  if result.len == 0: return
+  let gone = result.toHashSet
+  a.proj.adoptedTextures.keepItIf(it notin gone)
+  a.proj.customTextures.keepItIf(it notin gone)
+  a.proj.save()
+  a.textures.keepItIf(it notin gone)
+  let keep = a.thumbsLoaded
+  a.refreshCollections()
+  a.thumbsLoaded = keep   # The collections' tiles show the same thumbnails.
+
+var restoredGeo: Geometry
+var restoredVersion = -1
+
+proc restoreTextures*(a: App) =
+  ## Faces with a texture the level has no copy of (a Redo after the copy
+  ## went, a paste) get the copy back from a collection.
+  if a.proj == nil or a.geo == nil: return
+  if restoredGeo == a.geo and restoredVersion == a.geo.version: return
+  (restoredGeo, restoredVersion) = (a.geo, a.geo.version)
+  let known = a.textures.toHashSet
+  var missing: HashSet[string]
+  for f in a.geo.faces:
+    if f.texture notin known and f.texture != "NONE" and not f.texture.startsWith("_marker") and
+       not f.isMarkerFace and not f.isInvisibleFace:
+      missing.incl f.texture
+  for t in missing:
+    if fileExists(a.texturePath(t)) or a.collectionCopy(t).len > 0:
+      a.adoptTexture(t)
+      a.rend.forgetMissingTexture(a.texturePath(t))
 
 proc density*(a: App, tex: string): float32 =
   if tex notin a.densities: a.densities[tex] = a.geo.textureDensity(tex)
@@ -1619,7 +1890,15 @@ proc loadLayout*(a: App) =
     # Saved before Texture Collections existed: it goes with the Texture Browser.
     let l = a.dock.leafOf(pkTextureBrowser)
     if l != nil and a.dock.leafOf(pkTextureCollections) == nil: l.tabs.add pkTextureCollections
+  if j{"dockVersion"}.getInt < 3:
+    # Saved before the Sound Browser existed: it goes with the other browsers.
+    for k in [pkEntityBrowser, pkTextureBrowser]:
+      let l = a.dock.leafOf(k)
+      if l != nil and a.dock.leafOf(pkSoundBrowser) == nil: l.tabs.add pkSoundBrowser
   a.texGroup = j{"textureGroup"}.getBool(true)
+  if j{"textureGroupsClosed"} != nil and j["textureGroupsClosed"].kind == JArray:
+    a.texClosed.clear()
+    for g in j["textureGroupsClosed"]: a.texClosed.incl g.getStr
   a.entityBrowserH = j{"entityBrowserH"}.getFloat(a.entityBrowserH).float32
   a.classListFolded = j{"classListFolded"}.getBool(false)
   if j{"classFolded"} != nil and j["classFolded"].kind == JArray:
@@ -1628,6 +1907,8 @@ proc loadLayout*(a: App) =
   a.entityPreview = clamp(j{"entityPreviewSize"}.getFloat(a.entityPreview), 0, 1)
   a.texThumb = clamp(j{"texThumb"}.getFloat(a.texThumb), MinTexThumb, MaxTexThumb).float32
   if j{"codeFontSize"}.getInt in CodeFontSizes: a.codeFontSize = j{"codeFontSize"}.getInt
+  a.scriptSoundAutoplay = j{"scriptSoundAutoplay"}.getBool(false)
+  a.scriptSoundVolume = clamp(j{"scriptSoundVolume"}.getFloat(1.0), 0, 1)
   a.flySpeed = clamp(j{"flySpeed"}.getFloat(a.flySpeed), MinFlySpeed, MaxFlySpeed).float32
   for m in RenderMode:
     if $m == j{"renderMode"}.getStr: a.opts.mode = m
@@ -1638,6 +1919,12 @@ proc loadLayout*(a: App) =
         if $p == n.getStr: parts.incl p
     if parts != {}: a.previewParts = parts
   a.showGizmos = j{"gizmos"}.getBool(a.showGizmos)
+  a.uvLock = j{"uvLock"}.getBool(a.uvLock)
+  a.gizmoLocal = j{"gizmoLocal"}.getBool(a.gizmoLocal)
+  a.uvView.height = clamp(j{"uvViewHeight"}.getFloat(a.uvView.height), MinUvViewH, MaxUvViewH).float32
+  let ug = j{"uvGrid"}
+  if ug != nil and ug.kind == JArray and ug.len == 2:
+    for i in 0 .. 1: a.uvView.grid[i] = clamp(ug[i].getInt(1), 1, MaxUvGrid)
   if j{"gizmosHidden"} != nil and j["gizmosHidden"].kind == JArray:
     a.gizmoHidden.clear()
     for n in j["gizmosHidden"]: a.gizmoHidden.incl n.getStr
@@ -1656,6 +1943,12 @@ proc loadLayout*(a: App) =
     a.winPos = ivec2(w{"x"}.getInt.int32, w{"y"}.getInt.int32)
     a.winSize = ivec2(w{"width"}.getInt.int32, w{"height"}.getInt.int32)
     a.winMaximized = w{"maximized"}.getBool
+  if j{"soundGroupsOpen"} != nil and j["soundGroupsOpen"].kind == JArray:
+    a.soundOpen = {}
+    for n in j["soundGroupsOpen"]:
+      for g in SoundGroup:
+        if $g == n.getStr: a.soundOpen.incl g
+  a.soundUsedOnly = j{"soundUsedOnly"}.getBool(a.soundUsedOnly)
   if j.hasKey("entityGroupsOpen"):
     a.browserOpen.clear()
     for g in j["entityGroupsOpen"]: a.browserOpen.incl g.getStr
@@ -1666,12 +1959,15 @@ proc saveLayout*(a: App) =
   try:
     createDir(layoutPath().parentDir)
     writeFile(layoutPath(), pretty(%*{"layout": $a.layout, "splitX": a.splitX, "splitY": a.splitY,
-      "dock": a.dock.toJson, "dockVersion": 2, "textureGroup": a.texGroup, "entityBrowserH": a.entityBrowserH,
+      "dock": a.dock.toJson, "dockVersion": 3, "textureGroup": a.texGroup,
+      "textureGroupsClosed": a.texClosed.toSeq.sorted, "entityBrowserH": a.entityBrowserH,
       "classListFolded": a.classListFolded, "classFolded": a.classFolded.toSeq.sorted,
-      "entityPreviewSize": a.entityPreview, "texThumb": a.texThumb, "codeFontSize": a.codeFontSize, "entityGroupsOpen": a.browserOpen.toSeq.sorted,
+      "entityPreviewSize": a.entityPreview, "texThumb": a.texThumb, "codeFontSize": a.codeFontSize, "scriptSoundAutoplay": a.scriptSoundAutoplay, "scriptSoundVolume": a.scriptSoundVolume, "entityGroupsOpen": a.browserOpen.toSeq.sorted,
+      "soundGroupsOpen": a.soundOpen.toSeq.mapIt($it), "soundUsedOnly": a.soundUsedOnly,
       "flySpeed": a.flySpeed, "renderMode": $a.opts.mode,
       "realtimePreview": a.previewParts.toSeq.mapIt($it),
       "gizmos": a.showGizmos, "gizmosHidden": a.gizmoHidden.toSeq.sorted,
+      "uvLock": a.uvLock, "gizmoLocal": a.gizmoLocal, "uvViewHeight": a.uvView.height, "uvGrid": a.uvView.grid,
       "editorOnly": a.showEditorOnly, "editorOnlyParts": a.editorOnlyParts.toSeq.mapIt($it),
       "notesRange": a.notesRange,
       "realtimeSoundVolume": a.previewSoundVolume, "realtimeMusicVolume": a.previewMusicVolume, "window": {"x": a.winPos.x, "y": a.winPos.y,
@@ -1946,6 +2242,13 @@ proc loadProject*(a: App, p: Project) =
   a.particleRestart = true
   a.classFor = nil
   a.classTextFor = nil
+  a.propsLock = PropsLock()
+  a.classLock = false
+  a.classLockFollow = nil
+  a.tabSelSeen.setLen 0
+  a.soundListAt = 0
+  a.soundUsedStamp = (-1, -1, -1, "")
+  a.soundPress.on = false
   a.clearSelection()
   a.groups.setLen 0
   a.openGroups.setLen 0
@@ -1999,6 +2302,24 @@ proc loadProject*(a: App, p: Project) =
       (if a.geo != nil: &", {a.geo.faces.len} faces in {a.geo.pieces.len} pieces" else: "")
 
 proc nextFreeProjectDir*(a: App): string
+
+proc spawnPoints*(a: App): seq[LevelObject] =
+  ## The level's player placements, in the order Oni walks them (the first is Konoko's own).
+  for o in a.objects:
+    if o.isSpawnPoint: result.add o
+
+proc playSpawn*(a: App): LevelObject =
+  ## The placement chosen as Play's debug spawn point, nil for the usual pick (or when it's
+  ## gone or no longer a player placement).
+  if a.proj == nil or a.proj.startSpawn == 0: return
+  for o in a.objects:
+    if o.id == a.proj.startSpawn: return (if o.isSpawnPoint: o else: nil)
+
+proc spawnLabel*(o: LevelObject, points: int): string =
+  ## Play's spawn point dropdown; points: how many the level has (two or more: Arklite picks one).
+  if o != nil: &"Spawn: #{o.id} {o.label}"
+  elif points >= 2: "Spawn: random"
+  else: "Spawn: default"
 
 proc saveProject*(a: App) =
   if a.proj == nil: return
@@ -2205,10 +2526,11 @@ var
 proc blocksView(f: Face): bool {.nimcall.} =
   f.isLit and (f.flags and gfTransparent) == 0
 
-proc focusPoints(a: App): (seq[FocusPoint], seq[bool]) =
-  ## Points of the selection to see, and per face whether it can't get in the
-  ## way (it's selected, hidden, or belongs to a selected object).
+proc focusPoints(a: App, extra: seq[Vec3] = @[]): (seq[FocusPoint], seq[bool]) =
+  ## Points of the selection (and extra) to see, and per face whether it can't
+  ## get in the way (it's selected, hidden, or belongs to a selected object).
   var pts: seq[FocusPoint]
+  for p in extra: pts.add FocusPoint(pos: p)
   var owned: HashSet[int32]
   for o in a.selection:
     let (lo, hi) = o.pickBox
@@ -2269,7 +2591,7 @@ proc hiddenFrom*(a: App, p, eye: Vec3, owner = 0'i32): bool =
     if (owner != 0 and f.objectId == owner) or not a.faceVisible(fi): continue
     if focusGeo.normal(f).dot(n) < 0 or (f.flags and gfTwoSided) != 0: return true
 
-proc focusView(a: App, lo, hi: Vec3): (Vec3, float32, float32) =
+proc focusView(a: App, lo, hi: Vec3, extra: seq[Vec3] = @[]): (Vec3, float32, float32) =
   ## Where the 3D camera sees the box lo..hi framed with nothing in front of
   ## it: (position, yaw, pitch). Costs per spot: anything hidden first, then a
   ## turn away from the current view, then coming closer than the full frame.
@@ -2286,7 +2608,7 @@ proc focusView(a: App, lo, hi: Vec3): (Vec3, float32, float32) =
     c - Camera(yaw: yaw, pitch: pitch).forward * dist
   if a.geo == nil or a.geo.faces.len == 0: return (spot(here.yaw, here.pitch, far), here.yaw, here.pitch)
   a.ensureFocusGrid
-  let (pts, skip) = a.focusPoints
+  let (pts, skip) = a.focusPoints(extra)
   if pts.len == 0: return (spot(here.yaw, here.pitch, far), here.yaw, here.pitch)
   var best = Inf.float32
   var res = (spot(here.yaw, here.pitch, far), here.yaw, here.pitch)
@@ -2365,12 +2687,17 @@ proc updateCamAnim*(a: App) =
   (an.shownFocus, an.shownZoom) = (a.focus2D, a.zoom2D)
   if raw >= 1: an.on = false
 
-proc frameSelection*(a: App) =
-  let (ok, lo, hi) = a.selectionBounds
+proc frameSelection*(a: App, extra: seq[Vec3] = @[]) =
+  ## Frames the selection, and the points extra with it (places with no object).
+  var (ok, lo, hi) = a.selectionBounds
+  for p in extra:
+    lo = (if ok: min(lo, p - vec3(2)) else: p - vec3(2))
+    hi = (if ok: max(hi, p + vec3(2)) else: p + vec3(2))
+    ok = true
   if not ok:
     a.animateCameras(proc() = a.frameAll())
     return
-  let (pos, yaw, pitch) = a.focusView(lo, hi)
+  let (pos, yaw, pitch) = a.focusView(lo, hi, extra)
   a.animateCameras(proc() =
     a.frameBox(lo, hi)
     for i in 0 .. 3:
@@ -2447,6 +2774,17 @@ proc selectedFaceSet*(a: App): HashSet[int] =
     for i in a.facesOfPiece(p): result.incl i
   for i in a.selFaces:
     if i in 0 ..< a.geo.faces.len: result.incl i
+
+proc toggleGizmoLocal*(a: App) =
+  ## World or local gizmo axes, kept between sessions like UV lock.
+  a.gizmoLocal = not a.gizmoLocal
+  a.saveLayout()
+  a.say "Gizmo axes: " & (if a.gizmoLocal: "local (the selected object's own)" else: "world")
+
+proc toggleUvLock*(a: App) =
+  ## UV lock is kept between sessions (TrenchBroom's Editor/UV lock): saved at once.
+  a.uvLock = not a.uvLock
+  a.saveLayout()
 
 proc holdTextures*(a: App, faces: HashSet[int]): TexHold =
   ## With UV lock off, notes each face's shift, scale and rotation on its world
@@ -2751,6 +3089,78 @@ proc addObject*(a: App, tag: string, pos: Vec3): LevelObject =
   o.selected = true
   o
 
+proc addOwnedGeometry(a: App, o: LevelObject, prefab: Geometry) =
+  ## prefab's faces, in object space, become o's geometry (one new piece).
+  let m = objectMatrix(o.pos, o.rot)
+  let base = a.geo.points.len.int32
+  let piece = a.geo.pieces.len.int32
+  for q in prefab.points: a.geo.points.add m * q
+  a.geo.pieces.add Piece()
+  for f in prefab.faces:
+    var nf = f
+    for v in nf.verts.mitems: v += base
+    nf.objectId = o.objectCode
+    nf.piece = piece
+    a.geo.faces.add nf
+  a.geo.bump()
+
+proc addProjectTextures(a: App, names: seq[string]) =
+  ## Textures now in env/images that the Texture Browser and views don't know yet.
+  var added = false
+  for t in names:
+    if t notin a.textures and fileExists(a.proj.imagesDir / t & ".tga"):
+      a.textures.add t
+      added = true
+  if added:
+    a.textures.sort
+    a.thumbsLoaded = false
+
+proc addImportedModel*(a: App, r: ImportedModel, pos: Vec3): LevelObject =
+  ## A model from File > Import > Models as furniture (modelimport.nim): a new
+  ## furniture object owning the model's faces, as one undo step. Nil (and a
+  ## message) when the level can't take geometry. Leaves the selection alone.
+  if a.geo == nil:
+    a.say("This project has no editable geometry, so it can't take " & r.name, true)
+    return nil
+  let geoBefore = a.geo.clone
+  let o = a.newObject("FURN", pos, furnitureXml(r.name))
+  a.addOwnedGeometry(o, r.geo)
+  a.addProjectTextures(r.textures)
+  a.push Cmd(label: "Import " & r.name, kind: ckAdd, objs: @[o],
+             indices: @[o.file.list.findChild(o.node)], geoBefore: geoBefore, geoAfter: a.geo.clone)
+  o
+
+proc importedTextures(a: App, p: Preset, prefab: Geometry): seq[string] =
+  ## Copies an imported model's textures into the project (as custom
+  ## textures), each under its own name unless the project has a different
+  ## picture by that name: then name_2 and so on, and prefab's faces follow.
+  var renamed: Table[string, string]
+  var added = false
+  for t in p.textures:
+    let src = p.imported / t & ".tga"
+    if not fileExists(src): continue
+    let bytes = readFile(src)
+    var name = t
+    var n = 2
+    while fileExists(a.proj.imagesDir / name & ".tga") and readFile(a.proj.imagesDir / name & ".tga") != bytes:
+      name = t & "_" & $n
+      inc n
+    if not fileExists(a.proj.imagesDir / name & ".tga"):
+      createDir(a.proj.imagesDir)
+      writeFile(a.proj.imagesDir / name & ".tga", bytes)
+      if name notin a.proj.customTextures: a.proj.customTextures.add name
+      added = true
+    if name != t: renamed[t] = name
+    result.add name
+  for f in prefab.faces.mitems:
+    if f.texture in renamed: f.texture = renamed[f.texture]
+  if added:
+    # In the Custom textures collection, as the import put them.
+    a.addProjectTextures(result)
+    a.refreshCollections()
+    if "custom" notin a.proj.textureCollections: a.proj.textureCollections.add "custom"
+    a.proj.save()
+
 proc addPreset*(a: App, p: Preset, pos: Vec3): LevelObject =
   ## Places a preset from the entity browser, with the geometry, textures and
   ## files it brings. Nil (and a message) when the level can't take it.
@@ -2762,8 +3172,12 @@ proc addPreset*(a: App, p: Preset, pos: Vec3): LevelObject =
   if p.prefab.len > 0:
     try: prefab = loadGeometry(p.prefabPath)
     except CatchableError as e:
-      a.say("Could not read " & p.label & " from the entity library: " & e.msg, true)
+      a.say("Could not read " & p.label & " from the entity " &
+            (if p.imported.len > 0: "browser's imported models: " else: "library: ") & e.msg, true)
       return nil
+  # An imported model's textures, by the name they have here.
+  var textures = p.textures
+  if p.imported.len > 0 and prefab != nil: textures = a.importedTextures(p, prefab)
   let geoBefore = if prefab != nil: a.geo.clone else: nil
   let o = a.newObject(p.tag, pos, p.presetXml)
   if o.tag == "CHAR":
@@ -2772,32 +3186,14 @@ proc addPreset*(a: App, p: Preset, pos: Vec3): LevelObject =
   if o.tag == "DOOR" and p.doorCenter.len > 0:
     o.node.xpath("OSD/Center").setText(fmtVec3(objectMatrix(pos, o.rot) * parseVec3(p.doorCenter)))
   if prefab != nil:
-    # The faces, in object space, become the object's geometry.
-    let m = objectMatrix(pos, o.rot)
-    let base = a.geo.points.len.int32
-    let piece = a.geo.pieces.len.int32
-    for q in prefab.points: a.geo.points.add m * q
-    a.geo.pieces.add Piece()
-    for f in prefab.faces:
-      var nf = f
-      for v in nf.verts.mitems: v += base
-      nf.objectId = o.objectCode
-      nf.piece = piece
-      a.geo.faces.add nf
-    a.geo.bump()
-    var added = false
-    for t in p.textures:
+    a.addOwnedGeometry(o, prefab)
+    for t in (if p.imported.len > 0: @[] else: p.textures):
       let src = libraryImages() / t & ".tga"
       let dst = a.proj.imagesDir / t & ".tga"
       if not fileExists(dst) and fileExists(src):
         createDir(a.proj.imagesDir)
         copyFile(src, dst)
-      if t notin a.textures and fileExists(dst):
-        a.textures.add t
-        added = true
-    if added:
-      a.textures.sort
-      a.thumbsLoaded = false
+    a.addProjectTextures(textures)
   for f in p.oniFiles:
     let src = libraryOni() / f
     let dst = a.proj.oniDir / f
@@ -2821,8 +3217,14 @@ proc loadPresets*(a: App) =
   a.presets = builtinPresets()
   try: a.presets.add loadLibrary()
   except CatchableError as e: a.say("Could not read the entity library: " & e.msg, true)
+  a.presets.add loadImported()
   # Atlas entries can't be replaced: a rebuilt library's previews get new keys.
   a.previewStamp = libraryStamp()
+
+proc refreshImported*(a: App) =
+  ## The entity browser's imported models after one was added or removed.
+  a.presets.keepItIf(it.imported.len == 0)
+  a.presets.add loadImported()
 
 proc presetsCurrent*(a: App): bool =
   ## False once the library was rebuilt (by another Catwalk) since loadPresets.
@@ -2831,7 +3233,8 @@ proc presetsCurrent*(a: App): bool =
 proc previewKey*(a: App, p: Preset): string =
   ## The preset's preview in the UI atlas ("" = it has none); see loadPreviews.
   let k = p.thumbKey
-  if k.len > 0 and a.previewStamp.len > 0: "ent:" & a.previewStamp & ":" & k else: ""
+  if p.imported.len > 0: "ent:" & k
+  elif k.len > 0 and a.previewStamp.len > 0: "ent:" & a.previewStamp & ":" & k else: ""
 
 proc loadPreviews*(a: App, wanted: seq[Preset]) =
   ## Adds the previews the entity browser shows to the UI atlas, once each.
@@ -2842,7 +3245,7 @@ proc loadPreviews*(a: App, wanted: seq[Preset]) =
     if key.len == 0 or key in a.previewTried: continue
     let path = p.thumbPath
     # Missing while the previews are still being rendered: try again later.
-    if not fileExists(path) and not hasPreviews(): continue
+    if not fileExists(path) and p.imported.len == 0 and not hasPreviews(): continue
     a.previewTried.incl key
     if not fileExists(path): continue
     try:
@@ -2883,13 +3286,26 @@ proc findIssues*(a: App, extra: seq[(Severity, string)] = @[]) =
   if a.geo != nil:
     var known = toHashSet(a.textures)
     var missing: CountTable[string]
+    var untextured = 0
+    var firstUntextured = -1
     for i, f in a.geo.faces:
       if f.verts.len < 3:
         a.issues.add Issue(severity: sevError, text: &"Face {i}: fewer than three corners", face: i)
-      elif not (f.isMarkerFace or f.isInvisibleFace) and f.texture notin known and f.texture != "NONE":
+      elif f.texture == "NONE":
+        # As Build counts them: every face that doesn't become a marker.
+        if markerMaterial(f).len == 0:
+          inc untextured
+          if firstUntextured < 0: firstUntextured = i
+      elif f.isMarkerFace or f.isInvisibleFace: discard
+      elif f.texture notin known:
         missing.inc f.texture
     for t, n in missing:
       a.issues.add Issue(severity: sevWarning, text: &"Texture {t} ({n} faces): no image in env/images", face: -1)
+    if untextured > 0:
+      # A level made with no textures: they come from Texture Collections.
+      a.issues.add Issue(severity: sevWarning, face: firstUntextured,
+        text: &"{untextured} face(s) have no texture yet, and Build needs one on each: enable a " &
+              "collection in Texture Collections and give them one from the Texture Browser")
     for fp in a.geo.faceProblems:
       a.issues.add Issue(severity: fp.severity, text: &"{fp.faceRef.capitalizeAscii}: {fp.text}", face: fp.face, corner: fp.corner)
   for (sev, l) in extra:

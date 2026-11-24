@@ -755,6 +755,17 @@ proc ambArgs(ambient: string, impulse = false): AmbArgs =
     # level has the sounds, so they're silent in the game too.
     raise newException(IOError, ambient & " has no audio in any level (cut from Oni; silent in game too)")
 
+proc soundKnown*(name: string, impulse: bool): bool =
+  ## There's an ambient (or impulse) of that name to play: level 0's, the
+  ## project's or a rec_ recording. True while level 0's sounds aren't
+  ## extracted yet (playing it extracts them, then says if it isn't one).
+  let n = name.strip.toLowerAscii
+  if n.len == 0: return false
+  if not impulse and n in projectAmbients: return true
+  if n.startsWith(RecordingPrefix): return fileExists(recordingWav(splitRecording(n)[0]))
+  let m = manifest()
+  m == nil or m[if impulse: "impulses" else: "ambients"]{n} != nil
+
 type AmbientInfo* = object
   treshold*: int        ## At most this many of it play at once (0x4821f0).
   minOcclusion*: float  ## Walls between a Sphere sound and the listener turn it down no further.
@@ -774,9 +785,12 @@ proc ambientInfo*(ambient: string): AmbientInfo =
   result = AmbientInfo(treshold: amb{"treshold"}.getInt(3), minOcclusion: amb{"minocc"}.getFloat,
                        canPan: amb{"pan"}.getBool)
 
+proc pauseClip*()
+
 proc play(key, ambient: string, volume, pitch: float, realtime = false, impulse = false) =
   ## Starts previewing a level 0 ambient or impulse; raises IOError when it can't.
   stopPreview()
+  pauseClip()   # one preview at a time: the Scripts panel's player keeps its place
   let player = playerCommand()
   if player.len == 0: raise newException(IOError, NoPlayer)
   let args = PlayArgs(player: player, amb: ambArgs(ambient, impulse), realtime: realtime,
@@ -801,6 +815,171 @@ proc setPreviewGains*(music, sounds: float) =
 proc playSound*(ambient: string, volume, pitch: float, impulse = false) =
   ## A Sound object's ambient at its level, or a class's sound.
   play("sound:", ambient, volume, pitch, impulse = impulse)
+
+# --- a clip: one sound rendered whole, played from any point -----------------------
+#
+# The Scripts panel's sound player needs a length and a position to seek to,
+# which an ambient playing live doesn't have (its sounds are picked at random
+# as it goes, and it loops). A clip is one run of it rendered once, as a
+# PlayOnce ambient: its InSound, one sound of each base track and the detail
+# sounds over them (an impulse: one sound of its group). It plays at the
+# Sound objects volume, like the sound fields' previews, times its own volume.
+
+const
+  MaxClipSeconds = 300       ## A clip ends here at the latest (music runs minutes).
+  DetailOnlySeconds = 30     ## A detail-only ambient never ends by itself.
+
+type ClipArgs = object
+  player: seq[string]
+  data: ptr UncheckedArray[int16]   ## clipData's samples; it's left alone while this plays.
+  frames, start: int
+
+var
+  clipData: seq[int16]       ## The loaded clip, interleaved stereo at Rate.
+  clipStop: Atomic[int]
+  clipActive: Atomic[int]
+  clipPid: Atomic[int]
+  clipFd: Atomic[int]        ## The player's stdin while it plays (what's still queued in it).
+  clipWritten: Atomic[int]   ## Frames sent to the player.
+  clipThread: Thread[ClipArgs]
+  clipStarted: bool
+  clipPausedAt: int          ## Where the clip is when it's not playing (frames).
+  clipVolumeMilli: Atomic[int] ## The player's own volume (Oni's 0..1, before the dB curve), milli.
+
+clipVolumeMilli.store(1000)
+
+proc setClipVolume*(v: float) =
+  ## Applies to what's sent from then on (a chunk and the pipe: ~0.2 s).
+  clipVolumeMilli.store(int(clamp(v, 0.0, 1.0) * 1000))
+
+proc renderClip(name: string, impulse: bool): seq[int16] =
+  var args = ambArgs(name, impulse)
+  args.once = true
+  var amb = initAmb(args)
+  amb.setMaster(1)
+  var rng = initRand()
+  let cap = (if amb.detailOnly: DetailOnlySeconds else: MaxClipSeconds) * Rate
+  var frames = 0
+  while not amb.done and frames < cap:
+    var l, r = 0.0
+    amb.mix(rng, 1, l, r)
+    result.add clamp(int(l), -32768, 32767).int16
+    result.add clamp(int(r), -32768, 32767).int16
+    inc frames
+  # The voices start their next sound a frame late: no silent tail of zeros.
+  var n = result.len div 2
+  while n > 0 and result[2 * n - 1] == 0 and result[2 * n - 2] == 0: dec n
+  result.setLen(2 * n)
+
+proc clipLoop(args: ClipArgs) {.thread.} =
+  var o: Sink
+  try:
+    o = openSink(args.player, clipPid.addr, lowLatency = true)
+    when not defined(windows): clipFd.store(o.fd)
+    var buf = newSeq[int16](ChunkFrames * 2)
+    var f = args.start
+    while clipStop.load == 0 and f < args.frames:
+      let n = min(ChunkFrames, args.frames - f)
+      buf.setLen(n * 2)
+      # Volumes multiply before the dB curve, as Oni's do.
+      let gain = dbGain((sceneGainMilli.load / 1000) * (clipVolumeMilli.load / 1000))
+      for k in 0 ..< n * 2: buf[k] = clamp(int(args.data[f * 2 + k].float * gain), -32768, 32767).int16
+      if not o.feed(buf, clipStop.addr): break
+      f += n
+      clipWritten.store(f)
+    o.endInput()
+    if f >= args.frames: o.drain(clipStop.addr)
+  except CatchableError: discard
+  clipFd.store(-1)
+  o.close()
+  clipPid.store(0)
+  clipActive.store(0)
+
+when not defined(windows):
+  var FionRead {.importc: "FIONREAD", header: "<sys/ioctl.h>".}: uint
+    ## Bytes waiting in a pipe (either end, on Linux).
+
+proc clipFrames(): int = clipData.len div 2
+
+proc clipPlaying*(): bool = clipStarted and clipActive.load != 0
+
+proc clipFramesAt(): int =
+  ## The frame being heard: what was sent, less what still waits in the pipe.
+  if not clipPlaying():
+    # Started and gone by itself: it played to the end.
+    return if clipStarted: clipFrames() else: clipPausedAt
+  var queued = 0
+  when defined(windows):
+    queued = ChunkFrames * 2
+  else:
+    let fd = clipFd.load
+    if fd >= 0:
+      var n: cint
+      if ioctl(fd.FileHandle, FionRead, n.addr) == 0: queued = n.int div 4
+  clamp(clipWritten.load - queued, 0, clipFrames())
+
+proc clipLength*(): float = clipFrames() / Rate   ## Seconds.
+proc clipPosition*(): float = clipFramesAt() / Rate
+
+proc joinClip() =
+  if not clipStarted: return
+  clipStop.store(1)
+  when not defined(windows):
+    let pid = clipPid.load
+    if pid > 0: discard posix.kill(pid.Pid, SIGTERM)
+  joinThread(clipThread)
+  clipStarted = false
+
+proc pauseClip*() =
+  ## Stops the sound, keeping the place (where it was heard).
+  if not clipStarted: return
+  let at = clipFramesAt()
+  let ended = clipActive.load == 0
+  joinClip()
+  clipPausedAt = if ended: clipFrames() else: at
+
+proc stopClip*() =
+  ## Stops the sound and goes back to its start.
+  joinClip()
+  clipPausedAt = 0
+
+proc playClip*() =
+  ## Plays the clip from where it is (from the start once it played to the
+  ## end); raises IOError when there's no audio player.
+  if clipPlaying() or clipFrames() == 0: return
+  if clipStarted: clipPausedAt = clipFrames()   # it played to the end by itself
+  joinClip()
+  stopPreview()
+  let player = playerCommand()
+  if player.len == 0: raise newException(IOError, NoPlayer)
+  if clipPausedAt >= clipFrames(): clipPausedAt = 0
+  let args = ClipArgs(player: player, data: cast[ptr UncheckedArray[int16]](clipData[0].addr),
+                      frames: clipFrames(), start: clipPausedAt)
+  clipStop.store(0)
+  clipWritten.store(clipPausedAt)
+  clipFd.store(-1)
+  clipActive.store(1)
+  createThread(clipThread, clipLoop, args)
+  clipStarted = true
+
+proc seekClip*(seconds: float) =
+  ## Moves the place; a playing clip goes on from there.
+  let playing = clipPlaying()
+  joinClip()
+  clipPausedAt = clamp(int(seconds * Rate), 0, clipFrames())
+  if playing: playClip()
+
+proc loadClip*(name: string, impulse: bool) =
+  ## Renders a sound (ambient, impulse or rec_ recording) as the clip, at its
+  ## start; raises IOError when it can't be played.
+  stopClip()
+  let data = renderClip(name, impulse)
+  if data.len == 0: raise newException(IOError, name & " has no audio")
+  clipData = data
+
+proc unloadClip*() =
+  stopClip()
+  clipData = @[]
 
 # --- the level's Sound objects (realtime preview) ---------------------------------
 #

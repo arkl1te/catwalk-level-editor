@@ -495,6 +495,40 @@ proc wrapText*(ui: Ui, s: string, width: float32, maxLines: int, font = FontMain
       line = next
   if line.len > 0: result.add ui.ellipsize(line, width, font)
 
+proc wrapCode*(ui: Ui, s: string, width: float32, font = FontMono, indent = 0'f32): seq[Slice[int]] =
+  ## Byte ranges of `s` split into lines no wider than `width` (lines after the
+  ## first get `indent` less), never ellipsized. Breaks at spaces outside
+  ## brackets ({..}, [..], (..), "..", so a parameter stays whole) or after a
+  ## comma first, at
+  ## any space when one piece is still too wide, and between characters when
+  ## a single word is.
+  var start = 0
+  while start < s.len:
+    let room = width - (if result.len > 0: indent else: 0'f32)
+    if ui.textSize(s[start .. ^1], font).x <= room:
+      result.add start .. s.high
+      break
+    var outer, anySpace = -1
+    var depth = 0
+    var quoted = false
+    for i in start ..< s.len:
+      let c = s[i]
+      if c == '"': quoted = not quoted
+      elif not quoted and c in {'{', '[', '('}: inc depth
+      elif not quoted and c in {'}', ']', ')'}: depth = max(0, depth - 1)
+      elif c == ' ' and i > start:
+        if ui.textSize(s[start ..< i], font).x > room: break
+        anySpace = i
+        if (depth == 0 or s[i - 1] == ',') and not quoted: outer = i
+    var stop = if outer > start: outer elif anySpace > start: anySpace else: -1
+    if stop < 0:
+      # One word wider than the line: as many characters as fit (at least one).
+      stop = start + 1
+      while stop < s.len and s[stop] != ' ' and ui.textSize(s[start .. stop], font).x <= room: inc stop
+    result.add start ..< stop
+    start = stop
+    while start < s.len and s[start] == ' ': inc start
+
 proc focusRing*(ui: Ui, r: Rect) =
   ## Keyboard focus marker around a widget, shown after Tab was used.
   if ui.navVisible: ui.border(rect(r.x - 3, r.y - 3, r.w + 6, r.h + 6), colAccent)

@@ -18,7 +18,7 @@ proc defaultDock*(): DockNode =
   dockSplit(true, 0.78,
     dockSplit(false, 0.82, dockLeaf(pkViewport), dockLeaf(pkConsole, pkIssues)),
     dockSplit(false, 0.55, dockLeaf(pkProperties, pkMap, pkFiles, pkClasses),
-              dockLeaf(pkEntityBrowser, pkTextureBrowser, pkTextureCollections)))
+              dockLeaf(pkEntityBrowser, pkTextureBrowser, pkTextureCollections, pkSoundBrowser)))
 
 proc isLeaf*(n: DockNode): bool = n.kids.len == 0
 
@@ -103,6 +103,7 @@ proc showPanel*(a: App, kind: PanelKind) =
     of pkEntityBrowser: @[pkTextureBrowser, pkProperties, pkMap, pkFiles]
     of pkTextureBrowser: @[pkEntityBrowser, pkProperties, pkMap, pkFiles]
     of pkTextureCollections: @[pkTextureBrowser, pkEntityBrowser, pkProperties, pkMap]
+    of pkSoundBrowser: @[pkEntityBrowser, pkTextureBrowser, pkProperties, pkMap, pkFiles]
     of pkClasses: @[pkFiles, pkMap, pkProperties]
     of pkScripts: @[]
     else: @[pkProperties, pkClasses, pkMap, pkFiles, pkEntityBrowser, pkTextureBrowser]
@@ -119,6 +120,21 @@ proc showPanel*(a: App, kind: PanelKind) =
     v.splitNode(kind, dzRight)
     v.frac = 0.55
   else: a.dock.splitNode(kind, dzRight)
+
+proc addPanelTo*(a: App, kind: PanelKind, target: DockNode) =
+  ## A panel stack's tab bar menu, Add panel: kind becomes the stack's front
+  ## tab, coming from wherever it is (or from closed).
+  if target == nil or target notin a.dock.leaves:
+    a.showPanel(kind)
+    return
+  let i = target.tabs.find(kind)
+  if i >= 0:
+    target.active = i
+  elif a.dock.leafOf(kind) != nil:
+    a.dropPanel(kind, target, dzTabs, target.tabs.len)
+  else:
+    target.tabs.add kind
+    target.active = target.tabs.high
 
 proc hidePanel*(a: App, kind: PanelKind) =
   if kind != pkViewport: a.takeTab(kind)

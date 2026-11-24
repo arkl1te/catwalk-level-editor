@@ -18,6 +18,7 @@ Catwalk's aim is to make Oni levels as easy to build as Quake maps.
 - **TrenchBroom's tools**: brushes, vertex, edge, face, clip, rotate and scale, CSG, groups and linked groups. Faces can be cut, extended, joined and separated.
 - **Groups that spin** in the game, particles included.
 - **An Entity Browser** of ready-made characters, weapons, power-ups, furniture, doors, consoles, turrets and particles, with previews of their models. Drag one into the level.
+- **Your own models as furniture**: OBJ, glTF and Collada files (Blender's included), kept in the Entity Browser.
 - **Every object's fields** in Properties: characters, flags, triggers, consoles, sounds and the rest, with lists of the values the game knows.
 - **Character and particle classes** edited for this level only, with a live particle preview in the views.
 - **Textures**: the game's own by collection, and your own pictures up to 1024×1024.

@@ -1,7 +1,7 @@
 ## What Catwalk's MCP tools do (mcp.nim is the transport). pollMcp runs at the
 ## start of a frame, on the main thread, so tools use the same procs the menus do.
 
-import std/[algorithm, base64, json, math, os, sets, strformat, strutils, tables]
+import std/[algorithm, base64, json, math, os, sequtils, sets, strformat, strutils, tables]
 import vmath, bumpy, pixie
 import appstate, camera, geometry, geomops, jobs, levelobjects, mcp, objtemplates, panels,
        project, screenshot, viewtools
@@ -10,7 +10,8 @@ const
   DefaultLimit = 200
   MaxLimit = 5000
   ReadOnlyTools = ["status", "log", "list_projects", "list_menu", "list_objects", "get_object",
-                   "list_pieces", "get_faces", "list_textures", "screenshot"]
+                   "list_pieces", "get_faces", "list_textures", "screenshot", "list_scripts",
+                   "read_script"]
 
 proc fail(msg: string) = raise newException(McpError, msg)
 
@@ -148,7 +149,7 @@ proc runMenuTool(a: App, j: JsonNode): JsonNode =
 
 proc objectJson(o: LevelObject): JsonNode =
   %*{"tag": o.tag, "id": o.id, "name": o.label, "pos": arr(o.pos), "rot": arr(o.rot),
-     "hidden": o.hidden, "selected": o.selected}
+     "scale": arr(o.scale), "hidden": o.hidden, "selected": o.selected}
 
 proc listObjects(a: App, j: JsonNode): JsonNode =
   a.needProject()
@@ -172,6 +173,15 @@ proc getObject(a: App, j: JsonNode): JsonNode =
   var fields = newJObject()
   for f in o.fields: fields[f.fieldKey] = %f.value
   result["fields"] = fields
+  if a.canTint(o):
+    # One tint, or the faces' different ones.
+    var tints = newJArray()
+    for t in a.objectTints(o): tints.add %*[t[0].int, t[1].int, t[2].int]
+    result["tint"] = if tints.len == 1: tints[0] else: tints
+    # Surface flags on every face it owns, and those only some of them have.
+    let (any, all) = a.objectFlags(o)
+    result["flags"] = %flagsText(all and not DerivedFlags)
+    result["flagsMixed"] = %flagsText((any and not all) and not DerivedFlags)
 
 proc setObject(a: App, j: JsonNode): JsonNode =
   a.needProject()
@@ -191,6 +201,21 @@ proc setObject(a: App, j: JsonNode): JsonNode =
   for (f, v) in changes: o.setField(f, v)
   o.syncFromNode()
   a.setPose(o, pos, rot)
+  if j.hasKey("scale"):
+    if not o.canScale: fail &"{o.tag} objects don't scale (furniture does)"
+    a.setScale(o, j.vecArg("scale"))
+  if j.hasKey("tint"):
+    let t = j{"tint"}
+    if not a.canTint(o): fail &"{o.tag} {o.id} has no tint (furniture with geometry does)"
+    if t.kind != JArray or t.len != 3: fail "tint must be [r, g, b]"
+    discard a.setObjectTint(o, [t[0].getInt, t[1].getInt, t[2].getInt])
+  if j.hasKey("flags"):
+    if not a.canTint(o): fail &"{o.tag} {o.id} has no surface flags (furniture with geometry does)"
+    for name, on in j{"flags"}.getFields:
+      let bit = parseFlags(name)
+      if bit == 0 or (bit and DerivedFlags) != 0 or name notin FlagNames.mapIt(it[0]):
+        fail "Unknown surface flag " & name
+      discard a.setObjectFlag(o, bit, on.getBool)
   a.push editCmd("Edit object", @[o], before, geoBefore, a.geo)
   o.objectJson
 
@@ -265,7 +290,9 @@ proc getFaces(a: App, j: JsonNode): JsonNode =
     let f = g.faces[fi]
     var corners = newJArray()
     for v in f.verts: corners.add arr(g.points[v])
-    var row = %*{"face": fi, "piece": f.piece, "corners": corners, "normal": arr(g.normal(f)),
+    var uvs = newJArray()
+    for uv in f.uvs: uvs.add %*[uv.x, uv.y]
+    var row = %*{"face": fi, "piece": f.piece, "corners": corners, "uvs": uvs, "normal": arr(g.normal(f)),
                  "texture": f.texture, "flags": f.flags.flagsText}
     if f.scriptId != 0: row["script_id"] = %f.scriptId
     if f.objectId != -1: row["object_id"] = %f.objectId
@@ -379,6 +406,43 @@ proc screenshotTool(a: App, id, j: JsonNode, reqId: int) =
       else: blocks.add %*{"type": "text", "text": $b}
     answerMcp(reqId, $rpcResult(id, %*{"content": blocks, "isError": false}))
 
+proc listScripts(a: App): JsonNode =
+  a.needProject()
+  result = newJArray()
+  for v in a.scriptViews():
+    var errors, warnings = 0
+    for p in v.problems:
+      if p.error: inc errors else: inc warnings
+    var row = %*{"file": v.rel, "open": v.open, "unsaved": v.dirty, "errors": errors, "warnings": warnings}
+    if v.active:
+      row["shown"] = %true
+      row["caret"] = %[v.caret.line + 1, v.caret.col + 1]
+    if v.changedOnDisk: row["changed_on_disk"] = %true
+    result.add row
+
+proc readScript(a: App, j: JsonNode): JsonNode =
+  a.needProject()
+  var file = j{"file"}.getStr
+  if file.len == 0:
+    for v in a.scriptViews():
+      if v.active: file = v.path
+    if file.len == 0: fail "No script tab is shown: give file (list_scripts names them)"
+  let views = a.scriptViews(file, text = true)
+  if views.len == 0: fail "No script " & file & " in this level (list_scripts names them)"
+  let v = views[0]
+  let first = clamp(j{"from_line"}.getInt(1), 1, max(1, v.lines.len))
+  let last = clamp(j{"to_line"}.getInt(v.lines.len), first, max(1, v.lines.len))
+  var text = ""
+  for i in first .. last:
+    if i <= v.lines.len: text.add &"{i:>5}  {v.lines[i - 1]}\n"
+  var problems = newJArray()
+  for p in v.problems:
+    problems.add %*{"line": p.line, "col": p.col, "severity": (if p.error: "error" else: "warning"), "text": p.msg}
+  result = %*{"file": v.rel, "open": v.open, "unsaved": v.dirty, "lines": v.lines.len,
+              "shown_lines": [first, last], "text": text, "problems": problems}
+  if v.open: result["caret"] = %[v.caret.line + 1, v.caret.col + 1]
+  if v.changedOnDisk: result["changed_on_disk"] = %true
+
 proc callTool(a: App, name: string, j: JsonNode): JsonNode =
   case name
   of "start_catwalk": %*{"running": true, "note": "Already running: use open_project"}
@@ -417,9 +481,22 @@ proc callTool(a: App, name: string, j: JsonNode): JsonNode =
     for (name, items) in a.menus: menuJson(items, name, acc)
     acc
   of "run_menu": a.runMenuTool(j)
+  of "list_scripts": a.listScripts()
+  of "read_script": a.readScript(j)
   of "list_objects": a.listObjects(j)
   of "get_object": a.getObject(j)
   of "create_object": a.createObject(j)
+  of "import_model":
+    a.needGeometry()
+    if a.busy: fail "Busy: " & a.job.title
+    var paths: seq[string]
+    for p in j{"paths"}.getElems:
+      let f = p.getStr.expandTilde
+      if not fileExists(f): fail "No such file: " & f
+      paths.add f.absolutePath
+    if paths.len == 0: fail "paths is required"
+    a.importModels(paths, if j.hasKey("pos"): j.vecArg("pos") else: vec3(0, 0, 0), j.hasKey("pos"))
+    a.status
   of "set_object": a.setObject(j)
   of "list_pieces": a.listPieces(j)
   of "get_faces": a.getFaces(j)
